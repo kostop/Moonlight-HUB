@@ -88,7 +88,13 @@ public static class Cli
                     foreach (var m in DisplayManager.GetModes(rest[1])) P(m.ToString());
                     return 0;
                 }
-                P("用法: modes | modes add WxH@Hz | modes list \\\\.\\DISPLAYn");
+                if (rest[0] == "remove" && rest.Count > 1 && int.TryParse(rest[1], out var ri))
+                {
+                    var (ok, msg) = ParsecModes.Remove(ri);
+                    P(msg);
+                    return ok ? 0 : 2;
+                }
+                P("用法: modes | modes add WxH@Hz | modes remove <index> | modes list \\\\.\\DISPLAYn");
                 return 1;
 
             case "vdd":
@@ -341,8 +347,18 @@ public static class Cli
             case "hold":
                 Hold(hub, hold > 0 ? hold : 30);
                 return 0;
+            case "replug":
+                {
+                    var slot = rest.Count > 1 ? int.Parse(rest[1]) : 0;
+                    hub.Instances.PollAsync().GetAwaiter().GetResult();
+                    hub.Engine.Progress += s => Console.WriteLine("  " + s);
+                    var (ok, msg) = hub.Engine.ReplugAsync(slot, "命令行").GetAwaiter().GetResult();
+                    P(msg);
+                    PrintDisplays(DisplayManager.Enumerate().Where(d => d.IsParsec).ToList());
+                    return ok ? 0 : 2;
+                }
             default:
-                P("用法: vdd status|add [--hold s]|remove <slot>|removeall|hold --hold s");
+                P("用法: vdd status|add [--hold s]|remove <slot>|removeall|replug <slot>|hold --hold s");
                 return 1;
         }
     }

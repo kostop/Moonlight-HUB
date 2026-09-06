@@ -28,9 +28,9 @@ public static class ParsecModes
                 if (!int.TryParse(name, out var index)) continue;
                 using var key = root.OpenSubKey(name);
                 if (key == null) continue;
-                var w = key.GetValue("width") as int?;
-                var h = key.GetValue("height") as int?;
-                var hz = key.GetValue("hz") as int?;
+                var w = ReadInt(key, "width");
+                var h = ReadInt(key, "height");
+                var hz = ReadInt(key, "hz");
                 if (w is > 0 && h is > 0 && hz is > 0) list.Add(new ParsecCustomMode(index, w.Value, h.Value, hz.Value));
             }
         }
@@ -42,6 +42,60 @@ public static class ParsecModes
     }
 
     public static bool Exists(int width, int height, int hz) => Read().Any(m => m.Width == width && m.Height == height && m.Hz == hz);
+
+    /// <summary>Other tools (ParsecVDisplay) may store the values as strings or QWORDs.</summary>
+    private static int? ReadInt(RegistryKey key, string name)
+    {
+        return key.GetValue(name) switch
+        {
+            int i => i,
+            long l => (int)l,
+            string s when int.TryParse(s.Trim(), out var p) => p,
+            _ => null
+        };
+    }
+
+    /// <summary>Compact fingerprint of the whole table (used to notice changes made by the user or other tools).</summary>
+    public static string Signature() => string.Join(",", Read().Select(m => $"{m.Width}x{m.Height}@{m.Hz}"));
+
+    /// <summary>Refresh rates registered for a resolution: what the driver publishes once the display is (re-)plugged.</summary>
+    public static List<int> RegisteredRates(int width, int height)
+        => Read().Where(m => m.Width == width && m.Height == height).Select(m => m.Hz).Distinct().OrderBy(r => r).ToList();
+
+    /// <summary>Refresh rates Windows exposes right now for a resolution on a display (empty while it is switched off).</summary>
+    public static List<int> ExposedRates(string? gdiName, int width, int height)
+        => string.IsNullOrEmpty(gdiName)
+            ? new List<int>()
+            : DisplayManager.GetModes(gdiName, width, height).Where(m => m.Orientation == 0).Select(m => m.RefreshRate).Distinct().OrderBy(r => r).ToList();
+
+    /// <summary>Rates usable now (exposed) or after a re-plug (registered).</summary>
+    public static List<int> AvailableRates(string? gdiName, int width, int height)
+        => ExposedRates(gdiName, width, height).Union(RegisteredRates(width, height)).OrderBy(r => r).ToList();
+
+    /// <summary>
+    /// True when the mode table Windows sees for a virtual display no longer matches the registry (a registered rate is
+    /// not exposed, or an exposed custom rate has been deleted). The driver only re-reads the table for a freshly plugged
+    /// monitor, so the display has to be removed and added again.
+    /// </summary>
+    public static bool NeedsReplug(DisplayInfo d, int width, int height)
+    {
+        if (!d.IsParsec || !d.IsReady) return false;
+        var registered = RegisteredRates(width, height);
+        if (registered.Count == 0) return false;
+        var exposed = ExposedRates(d.GdiName, width, height);
+        if (registered.Except(exposed).Any()) return true;
+        // custom resolutions only exist through the registry: an exposed rate that is no longer registered is stale
+        return !IsBuiltInResolution(width, height) && exposed.Except(registered).Any();
+    }
+
+    private static readonly HashSet<(int, int)> BuiltIn = new()
+    {
+        (4096, 2160), (3840, 2160), (3440, 1440), (2560, 1600), (2560, 1440), (1920, 1440), (1920, 1200), (1920, 1080),
+        (1680, 1050), (1600, 900), (1440, 900), (1366, 768), (1280, 1024), (1280, 800), (1280, 720), (1024, 768), (800, 600)
+    };
+
+    /// <summary>Resolutions the Parsec driver publishes without any registry entry.</summary>
+    public static bool IsBuiltInResolution(int width, int height) => BuiltIn.Contains((width, height));
 
     /// <summary>Registers a mode; when not elevated, spawns an elevated copy of the hub to do it.</summary>
     public static (bool Ok, string Message) EnsureRegistered(int width, int height, int hz)

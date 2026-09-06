@@ -80,10 +80,14 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
                 var row = Ui.Row(Ui.Pill($"#{m.Index}", "muted"), new TextBlock { Text = m.ToString(), Width = 200, VerticalAlignment = VerticalAlignment.Center });
                 var del = Ui.B("删除", (_, _) =>
                 {
-                    var (ok, msg) = ParsecModes.Remove(m.Index);
-                    if (!ok) _window.Toast("删除失败", msg, true);
-                    _modeSignature = string.Empty;
-                    Refresh();
+                    Ui.RunAsync(_window, async () =>
+                    {
+                        var (ok, msg) = ParsecModes.Remove(m.Index);
+                        if (!ok) throw new InvalidOperationException(msg);
+                        var note = await Hub.Engine.RefreshModesAsync("删除了自定义模式").ConfigureAwait(false);
+                        _window.Toast("自定义模式", $"已删除 {m}。{note}");
+                        _ = Dispatcher.BeginInvoke(() => { _modeSignature = string.Empty; Invalidate(); });
+                    });
                 }, "GhostButton");
                 del.Padding = new Thickness(8, 3, 8, 3);
                 row.Children.Add(del);
@@ -150,11 +154,15 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
             _window.Toast("参数无效", "请输入有效的宽、高和刷新率", true);
             return;
         }
-        Ui.RunAsync(_window, () => Task.Run(() =>
+        Ui.RunAsync(_window, async () =>
         {
             var (ok, msg) = ParsecModes.EnsureRegistered(w, h, hz);
             if (!ok) throw new InvalidOperationException(msg);
-            Dispatcher.BeginInvoke(() => { _modeSignature = string.Empty; Refresh(); });
-        }), "自定义模式", $"已注册 {w}×{h}@{hz}Hz。已存在的虚拟屏需要重新添加才会看到新模式。");
+            _ = Dispatcher.BeginInvoke(() => { _modeSignature = string.Empty; Refresh(); });
+            // the driver only publishes the table for a freshly plugged monitor: re-plug idle displays now, streaming ones later
+            var note = await Hub.Engine.RefreshModesAsync("注册了新模式").ConfigureAwait(false);
+            _window.Toast("自定义模式", $"已注册 {w}×{h}@{hz}Hz。{note}");
+            _ = Dispatcher.BeginInvoke(Invalidate);
+        });
     }
 }

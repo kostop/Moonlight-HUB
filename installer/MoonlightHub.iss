@@ -9,7 +9,9 @@
 #define MyAppPublisher "kostop"
 #define MyAppURL "https://github.com/kostop/Moonlight-HUB"
 #define MyAppExeName "MoonlightHub.exe"
-#define SourceDir "..\dist"
+#ifndef SourceDir
+  #define SourceDir "..\dist"
+#endif
 
 [Setup]
 AppId={{7C3E5F2A-9B41-4E8B-9C5D-2F0A6D3C1B77}

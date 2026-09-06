@@ -101,6 +101,7 @@ public sealed class Watchdog : IDisposable
     private DateTime _lastAdapterCheckUtc = DateTime.MinValue;
     private readonly Dictionary<int, int> _captureMismatchTicks = new();
     private DateTime _lastCredentialCheckUtc = DateTime.MinValue;
+    private DateTime _lastModeSyncUtc = DateTime.MinValue;
 
     /// <summary>Last known PnP status of the Parsec adapter (only refreshed while the driver cannot be opened).</summary>
     public string AdapterStatus { get; private set; } = string.Empty;
@@ -307,6 +308,24 @@ public sealed class Watchdog : IDisposable
             }
         }
 
+        // 4c2) config changed while a session was running (e.g. a refresh-rate pick): restart once the instance is idle
+        foreach (var id in _state.ExpectedInstances)
+        {
+            var spec = _settings.Instance(id);
+            if (spec == null || !spec.Enabled) continue;
+            var rt = _instances.Get(spec);
+            if (rt.State == InstanceState.Streaming) { _lastStreamingUtc[id] = DateTime.UtcNow; continue; }
+            if (!rt.ConfigDirty || !rt.IsAlive || _engine.IsBusy) continue;
+            if (_instances.StreamingClientAddresses(spec).Count > 0) continue;
+            if ((DateTime.UtcNow - _lastStreamingUtc.GetValueOrDefault(id, DateTime.MinValue)) < TimeSpan.FromSeconds(10)) continue; // let Sunshine finish its own revert first
+            if ((DateTime.UtcNow - _instanceLastRestart.GetValueOrDefault(id, DateTime.MinValue)) < TimeSpan.FromSeconds(45)) continue;
+            _instanceLastRestart[id] = DateTime.UtcNow;
+            Log.Info($"实例 {id} 空闲，重启以应用串流期间更新的配置");
+            notes.Add($"重启实例 {id}（配置已更新）");
+            _ = Task.Run(() => _instances.RestartAsync(spec));
+            break; // one per tick
+        }
+
         // 4d) stand-by mode: switch idle virtual displays off; restart instances whose config changed once they are idle
         if (health.IdleOff)
         {
@@ -345,6 +364,27 @@ public sealed class Watchdog : IDisposable
                     if (_engine.DetachIdleVirtualDisplay(d, "无客户端连接")) notes.Add($"虚拟屏 #{spec.Slot + 1} 待机");
                     _activeSinceUtc.Remove(d.GdiName);
                 }
+            }
+        }
+
+        // 4e) driver mode table: re-plug virtual displays whose registered modes changed, once nobody streams them
+        if (profile.VirtualCount > 0 && (DateTime.UtcNow - _lastModeSyncUtc) > TimeSpan.FromSeconds(30) && !_engine.IsBusy)
+        {
+            _lastModeSyncUtc = DateTime.UtcNow;
+            foreach (var spec in profile.VirtualDisplays.Take(profile.VirtualCount))
+            {
+                var d = health.Displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot);
+                if (d == null) continue;
+                var pending = _engine.IsReplugPending(spec.Slot) || (d.IsReady && _engine.NeedsReplug(profile, spec, d));
+                if (!pending) continue;
+                if (_engine.IsSpecStreaming(spec))
+                {
+                    if (!_engine.IsReplugPending(spec.Slot)) _engine.RequestReplug(spec.Slot, "驱动模式表与注册表不一致");
+                    continue;
+                }
+                notes.Add($"重新插拔虚拟屏 #{spec.Slot + 1}（刷新驱动模式表）");
+                _ = _engine.ReplugAsync(spec.Slot, "驱动模式表已更新且当前空闲");
+                break; // one at a time
             }
         }
 
@@ -407,7 +447,7 @@ public sealed class Watchdog : IDisposable
             }
             if (!okResolution) return false;
             // refresh rate: accept the profile value, the compose override, or the rate the client asked for
-            var accepted = new HashSet<int> { spec.RefreshRate };
+            var accepted = new HashSet<int> { spec.RefreshRate, _engine.TargetHz(profile, spec, d) };
             if (profile.ComposeRefreshRate > 0) accepted.Add(Math.Max(profile.ComposeRefreshRate, spec.RefreshRate));
             if (profile.MatchClientFps && spec.InstanceId > 0 && _state.LastClientFps.TryGetValue(spec.InstanceId, out var cf)) accepted.Add(cf);
             if (profile.MatchClientFps && spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var cm2)) accepted.Add(cm2.Fps);

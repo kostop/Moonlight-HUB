@@ -31,7 +31,7 @@
                     </StackPanel>
                 </Grid>
                 <CheckBox x:Name="KeepMainBox" Content="「仅主屏」模式下保留实例 1 串流主屏" Margin="0,10,0,0" />
-                <CheckBox x:Name="MatchFpsBox" Content="自动把虚拟屏刷新率切换为客户端请求的帧率（需存在对应模式，例如 2000×1200@90）" Margin="0,4,0,0" />
+                <CheckBox x:Name="MatchFpsBox" Content="跟随客户端帧率：客户端请求的帧率高于上面的刷新率时自动提高（没有正好的模式时选它的倍数或更高的一档，例如只注册了 120Hz 时 60/90fps 都用 120Hz）" Margin="0,4,0,0" />
                 <CheckBox x:Name="RememberPosBox" Content="记住在 Windows 显示设置里手动摆放的虚拟屏位置" Margin="0,4,0,0" />
                 <CheckBox x:Name="MatchResBox" Content="自动把虚拟屏分辨率设为客户端请求的分辨率（竖屏请求在开启预旋转时自动转为横屏，如 1200×2000 → 2000×1200）" Margin="0,4,0,0" />
                 <CheckBox x:Name="IdleOffBox" Content="没有 Moonlight 连接时自动关闭副屏（保持已连接但停用；客户端连接时由 Sunshine 自动启用，断开 3 秒后还原）" Margin="0,4,0,0" />

@@ -62,7 +62,10 @@ public sealed class Profile
     public bool KeepMainInstance { get; set; } = true;
     /// <summary>Virtual display refresh rate is raised to this value while the stream fps stays the same (0 = same as stream).</summary>
     public int ComposeRefreshRate { get; set; }
-    /// <summary>Switch the virtual display refresh rate to the fps a connected Moonlight client asks for (when such a mode exists).</summary>
+    /// <summary>
+    /// Raise the virtual display refresh rate to the fps a connected Moonlight client asks for. The per-display value is
+    /// the floor; the result is snapped to a rate the driver actually has (exact, else a multiple, else the next higher one).
+    /// </summary>
     public bool MatchClientFps { get; set; } = true;
     /// <summary>When the user drags a virtual display in Windows display settings, remember that position for this profile.</summary>
     public bool RememberManualPosition { get; set; } = true;
@@ -256,6 +259,10 @@ public sealed class HubState
     public Dictionary<int, ClientMode> LastClientMode { get; set; } = new();
     /// <summary>Display-device options written to each instance's config by the last apply.</summary>
     public Dictionary<int, DdOptions> InstanceDd { get; set; } = new();
+    /// <summary>Virtual display slots whose driver mode table changed while a client was streaming; re-plugged once idle.</summary>
+    public List<int> PendingReplugSlots { get; set; } = new();
+    /// <summary>Refresh rates Windows last exposed per virtual display slot and resolution ("slot:WxH"): lets a switched-off (stand-by) display be configured without turning it on.</summary>
+    public Dictionary<string, List<int>> ExposedRates { get; set; } = new();
 
     public static HubState Load()
     {

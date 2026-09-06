@@ -69,19 +69,84 @@ public sealed class ProfileEngine
         return (spec.Width, spec.Height);
     }
 
-    /// <summary>Target refresh rate for a virtual display: compose override &gt; last client fps (if that mode exists) &gt; profile value.</summary>
+    /// <summary>
+    /// Target refresh rate for a virtual display. The profile value is the floor, "follow client fps" raises it to the
+    /// client's frame rate and the compose override raises it further; the result is snapped to a rate the driver has
+    /// (registered in the registry or exposed by Windows right now): the exact rate, else the smallest multiple of it,
+    /// else the next higher rate, else the highest one available.
+    /// </summary>
     private int ResolveHz(Profile profile, VirtualDisplaySpec spec, string? gdiName, int width, int height)
+        => SnapHz(DesiredHz(profile, spec), KnownRates(spec.Slot, gdiName, width, height));
+
+    /// <summary>The rate the user configured themselves (profile value raised by the compose override), independent of any client.</summary>
+    private static int ExplicitHz(Profile profile, VirtualDisplaySpec spec)
+        => profile.ComposeRefreshRate > 0 ? Math.Max(profile.ComposeRefreshRate, spec.RefreshRate) : Math.Max(1, spec.RefreshRate);
+
+    /// <summary>
+    /// Refresh rates the driver really publishes for a slot at a resolution. Read from Windows while the display is on;
+    /// remembered in the state file so a stand-by display can be configured without switching it on; before the first
+    /// observation the registry table is the best guess. Registered-but-unpublished rates are deliberately excluded:
+    /// asking Windows or Sunshine for one of those fails (a failed Sunshine display config lands the session on the
+    /// primary display) — they become usable after the re-plug that NeedsReplug() schedules.
+    /// </summary>
+    private List<int> KnownRates(int slot, string? gdiName, int width, int height)
     {
-        var hz = spec.RefreshRate;
-        var clientFps = 0;
-        if (spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var mode) && mode.Fps > 0) clientFps = mode.Fps;
-        else if (spec.InstanceId > 0 && _state.LastClientFps.TryGetValue(spec.InstanceId, out var f) && f > 0) clientFps = f;
-        if (profile.MatchClientFps && clientFps > 0)
+        var key = $"{slot}:{width}x{height}";
+        if (!string.IsNullOrEmpty(gdiName))
         {
-            if (gdiName == null || DisplayManager.HasMode(gdiName, width, height, clientFps)) hz = clientFps;
+            var rates = ParsecModes.ExposedRates(gdiName, width, height);
+            if (rates.Count > 0)
+            {
+                lock (_state)
+                {
+                    if (!_state.ExposedRates.TryGetValue(key, out var old) || !old.SequenceEqual(rates))
+                    {
+                        _state.ExposedRates[key] = rates;
+                        _state.Save();
+                    }
+                }
+                return rates;
+            }
         }
+        lock (_state)
+        {
+            if (_state.ExposedRates.TryGetValue(key, out var cached) && cached.Count > 0) return cached.ToList();
+        }
+        return ParsecModes.RegisteredRates(width, height);
+    }
+
+    private int DesiredHz(Profile profile, VirtualDisplaySpec spec)
+    {
+        var hz = Math.Max(1, spec.RefreshRate);
+        var clientFps = ClientFps(spec);
+        if (profile.MatchClientFps && clientFps > 0) hz = Math.Max(hz, clientFps);
         if (profile.ComposeRefreshRate > 0) hz = Math.Max(profile.ComposeRefreshRate, hz);
         return hz;
+    }
+
+    /// <summary>Frame rate the client of this display's instance asked for last (0 = unknown).</summary>
+    private int ClientFps(VirtualDisplaySpec spec)
+    {
+        if (spec.InstanceId <= 0) return 0;
+        if (_state.LastClientMode.TryGetValue(spec.InstanceId, out var mode) && mode.Fps > 0) return mode.Fps;
+        if (_state.LastClientFps.TryGetValue(spec.InstanceId, out var f) && f > 0) return f;
+        return 0;
+    }
+
+    public static int SnapHz(int desired, IReadOnlyCollection<int> available)
+    {
+        if (available.Count == 0 || available.Contains(desired)) return desired;
+        var multiple = available.Where(r => r > desired && r % desired == 0).OrderBy(r => r).FirstOrDefault();
+        if (multiple > 0) return multiple;
+        var higher = available.Where(r => r > desired).OrderBy(r => r).FirstOrDefault();
+        return higher > 0 ? higher : available.Max();
+    }
+
+    /// <summary>Refresh rate the engine will set for this spec (used by the watchdog's layout check and the UI).</summary>
+    public int TargetHz(Profile profile, VirtualDisplaySpec spec, DisplayInfo? display)
+    {
+        var (w, h) = ResolveResolution(profile, spec, display?.GdiName);
+        return ResolveHz(profile, spec, display?.GdiName, w, h);
     }
 
     private int ResolveHz(Profile profile, VirtualDisplaySpec spec, string? gdiName)
@@ -125,6 +190,12 @@ public sealed class ProfileEngine
 
         if (!DisplayManager.HasMode(display.GdiName, w, h, hz))
         {
+            if (ParsecModes.RegisteredRates(w, h).Contains(hz))
+            {
+                // registered but not published yet: the driver needs a re-plug, which must wait until nobody streams
+                RequestReplug(display.ParsecSlot, $"模式 {w}x{h}@{hz} 已注册但驱动尚未发布");
+                return false;
+            }
             var (cw, ch) = HostResolutionFor(instanceId, mode);
             Log.Info($"客户端请求 {mode}（虚拟屏应为 {cw}x{ch}@{mode.Fps}），但 {display.GdiName} 没有这个模式。可在“虚拟屏”页注册自定义模式 {cw}x{ch}@{mode.Fps}");
             return false;
@@ -156,8 +227,12 @@ public sealed class ProfileEngine
     {
         if (!profile.IdleOff || profile.Mode is ProfileMode.Clone or ProfileMode.MainOnly) return DdOptions.Disabled;
         var (w, h) = ResolveResolution(profile, spec, gdiName);
-        int? manualHz = profile.MatchClientFps ? null : spec.RefreshRate;
-        if (profile.ComposeRefreshRate > 0) manualHz = Math.Max(profile.ComposeRefreshRate, spec.RefreshRate);
+        var hz = ResolveHz(profile, spec, gdiName, w, h);
+        // "automatic" makes Sunshine ask the driver for the client's fps itself; that is only safe when the rate we
+        // resolved is exactly that fps (the mode exists and nothing raises it). Otherwise pin the resolved rate so the
+        // driver is never asked for a mode it does not have (the session would start on the primary display).
+        var clientFps = ClientFps(spec);
+        int? manualHz = profile.MatchClientFps && clientFps > 0 && hz == clientFps ? null : hz;
         var configuration = profile.Mode == ProfileMode.VirtualOnly ? "ensure_only_display" : "ensure_active";
         return new DdOptions(configuration, w, h, manualHz, RevertOnDisconnect: true, RevertDelayMs: 3000);
     }
@@ -243,7 +318,8 @@ public sealed class ProfileEngine
             }
 
             // ---------------------------------------------------------------- 2. reconcile virtual display count
-            var displays = ReconcileVirtualDisplays(result, want, ct);
+            var standBy = profile.IdleOff && profile.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly;
+            var displays = ReconcileVirtualDisplays(result, want, ct, standBy);
             if (displays == null)
             {
                 result.Success = false;
@@ -261,51 +337,50 @@ public sealed class ProfileEngine
                     result.Success = false;
                     return result;
                 }
-                var hz = ResolveHz(profile, spec, d.GdiName, spec.Width, spec.Height);
-                if (!DisplayManager.HasMode(d.GdiName, spec.Width, spec.Height, hz) && profile.MatchClientFps && hz != spec.RefreshRate)
-                {
-                    hz = spec.RefreshRate; // client fps mode not available: fall back to the profile value instead of prompting for UAC
-                }
                 if (!d.IsReady)
                 {
                     displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && x.IsReady), TimeSpan.FromSeconds(8));
                     d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot) ?? d;
                 }
-                if (d.IsReady && !DisplayManager.HasMode(d.GdiName, spec.Width, spec.Height, hz))
+                if (!d.IsReady) continue;
+                var (mw, mh) = ResolveResolution(profile, spec, d.GdiName);
+                // the rate the user asked for must exist in the driver table (client-fps rates are only used when present)
+                var wanted = ExplicitHz(profile, spec);
+                if (!DisplayManager.HasMode(d.GdiName, mw, mh, wanted) && !ParsecModes.RegisteredRates(mw, mh).Contains(wanted))
                 {
-                    Step(result, $"虚拟屏 #{spec.Slot + 1} 缺少模式 {spec.Width}x{spec.Height}@{hz}，注册 Parsec 自定义模式…");
-                    var (ok, msg) = ParsecModes.EnsureRegistered(spec.Width, spec.Height, hz);
+                    Step(result, $"虚拟屏 #{spec.Slot + 1} 缺少模式 {mw}x{mh}@{wanted}，注册 Parsec 自定义模式…");
+                    var (ok, msg) = ParsecModes.EnsureRegistered(mw, mh, wanted);
                     Step(result, (ok ? "✓ " : "✗ ") + msg);
-                    if (ok)
-                    {
-                        // The driver only publishes new modes for a freshly plugged monitor.
-                        Step(result, $"重新插拔虚拟屏 #{spec.Slot + 1} 以刷新模式表");
-                        _vdd.RemoveDisplay(spec.Slot);
-                        DisplayManager.WaitFor(l => !l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot), TimeSpan.FromSeconds(8));
-                        _vdd.AddDisplay();
-                        displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot), TimeSpan.FromSeconds(20));
-                        if (displays.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && !x.Active))
-                        {
-                            // Windows remembers the stand-by (inactive) state for this monitor: re-enable it explicitly
-                            DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
-                        }
-                        displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && x.IsReady), TimeSpan.FromSeconds(20));
-                        d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot);
-                        if (d == null || !d.IsReady || !DisplayManager.HasMode(d.GdiName, spec.Width, spec.Height, hz))
-                        {
-                            Step(result, $"⚠ 虚拟屏 #{spec.Slot + 1} 仍然没有 {spec.Width}x{spec.Height}@{hz}，将使用最接近的模式");
-                        }
-                    }
                 }
+                var hz = ResolveHz(profile, spec, d.GdiName, mw, mh);
+                if (!NeedsReplug(d, mw, mh)) continue; // the table Windows sees already matches the registry
+                if (IsSpecStreaming(spec))
+                {
+                    RequestReplug(spec.Slot, "驱动模式表已更新");
+                    Step(result, $"虚拟屏 #{spec.Slot + 1} 正在串流，等客户端断开后再重新插拔以刷新模式表");
+                    continue;
+                }
+                // The driver only publishes the registry modes for a freshly plugged monitor.
+                Step(result, $"重新插拔虚拟屏 #{spec.Slot + 1} 以刷新驱动模式表");
+                displays = ReplugCore(spec.Slot, result);
+                d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot);
+                if (d == null || !d.IsReady)
+                {
+                    Step(result, $"⚠ 虚拟屏 #{spec.Slot + 1} 重新插拔后尚未就绪");
+                    continue;
+                }
+                hz = ResolveHz(profile, spec, d.GdiName, mw, mh);
+                Step(result, DisplayManager.HasMode(d.GdiName, mw, mh, wanted)
+                    ? $"✓ 虚拟屏 #{spec.Slot + 1} 模式表已更新: {string.Join(", ", ParsecModes.ExposedRates(d.GdiName, mw, mh).Select(r => r + "Hz"))}，使用 {hz}Hz"
+                    : $"⚠ 虚拟屏 #{spec.Slot + 1} 仍然没有 {mw}x{mh}@{wanted}，改用 {hz}Hz");
             }
 
             // ---------------------------------------------------------------- 4. layout
             displays = DisplayManager.Enumerate();
+            displays = EnsureParsecEnabled(result, displays);
             if (displays.Any(d => d.IsParsec && !d.IsReady))
             {
-                // a re-plugged stand-by display may have come back switched off
-                DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
-                displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(12));
+                displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(8));
             }
             parsec = displays.Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).ToList();
             var physicalActive = displays.Where(d => !d.IsParsec && d.Active).ToList();
@@ -420,7 +495,7 @@ public sealed class ProfileEngine
     }
 
     // ------------------------------------------------------------------ virtual displays
-    private List<DisplayInfo>? ReconcileVirtualDisplays(ApplyResult result, int want, CancellationToken ct)
+    private List<DisplayInfo>? ReconcileVirtualDisplays(ApplyResult result, int want, CancellationToken ct, bool standBy = false)
     {
         var displays = DisplayManager.Enumerate();
         var parsec = displays.Where(d => d.IsParsec).ToList();
@@ -486,12 +561,7 @@ public sealed class ProfileEngine
         }
 
         // make sure every virtual display is attached to the desktop (stand-by displays are re-enabled for configuration)
-        if (displays.Any(d => d.IsParsec && !d.Active))
-        {
-            Step(result, "有虚拟屏未激活（待机），临时启用以便配置");
-            DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
-            displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(12));
-        }
+        displays = EnsureParsecEnabled(result, displays);
         // Windows may report an active path before the GDI name/mode is populated: settle before touching modes
         if (displays.Any(d => d.IsParsec && !d.IsReady))
         {
@@ -499,12 +569,187 @@ public sealed class ProfileEngine
         }
         if (displays.Any(d => d.IsParsec && !d.IsReady))
         {
+            if (standBy && displays.Where(d => d.IsParsec).All(d => !d.Active || d.IsReady))
+            {
+                // Sunshine enables the display itself when a client connects; keep going so its config gets updated
+                Step(result, "⚠ 待机中的虚拟屏暂时无法启用，跳过模式/布局步骤，只更新 Sunshine 配置（连接时由 Sunshine 启用）");
+                return displays;
+            }
             Step(result, "✗ 虚拟屏已激活但 Windows 尚未完成枚举（无设备名/模式）");
             result.Summary = "虚拟屏枚举未完成";
             return null;
         }
         Step(result, $"✓ 虚拟屏就绪: {string.Join(", ", displays.Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).Select(d => $"#{d.ParsecSlot + 1}={d.GdiName} {d.ModeText}"))}");
         return displays;
+    }
+
+    /// <summary>Switches connected-but-inactive Parsec displays on (explicit topology) and waits until they are enumerated.</summary>
+    private List<DisplayInfo> EnsureParsecEnabled(ApplyResult result, List<DisplayInfo> displays)
+    {
+        var inactive = displays.Where(d => d.IsParsec && !d.Active).ToList();
+        if (inactive.Count == 0) return displays;
+        Step(result, $"有 {inactive.Count} 块虚拟屏处于待机（停用），临时启用以便配置");
+        var code = DisplayManager.ActivateDisplays(inactive, displays);
+        if (code != 0)
+        {
+            Step(result, $"⚠ 显式启用失败 ({code})，改用扩展拓扑");
+            DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
+        }
+        var ready = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(15));
+        if (ready.Where(d => d.IsParsec).All(d => d.IsReady)) Step(result, "✓ 虚拟屏已启用");
+        return ready;
+    }
+
+    // ------------------------------------------------------------------ driver mode table (re-plug)
+    private readonly Dictionary<int, string> _replugDone = new();
+
+    /// <summary>True when the display should be re-plugged for the current registry table (and that was not already tried).</summary>
+    private bool NeedsReplug(DisplayInfo d, int width, int height)
+        => ParsecModes.NeedsReplug(d, width, height) && _replugDone.GetValueOrDefault(d.ParsecSlot) != ParsecModes.Signature();
+
+    public bool NeedsReplug(Profile profile, VirtualDisplaySpec spec, DisplayInfo d)
+    {
+        var (w, h) = ResolveResolution(profile, spec, d.GdiName);
+        return NeedsReplug(d, w, h);
+    }
+
+    /// <summary>True when the Sunshine instance assigned to this spec currently has a streaming session.</summary>
+    public bool IsSpecStreaming(VirtualDisplaySpec spec)
+    {
+        if (spec.InstanceId <= 0) return false;
+        var inst = _settings.Instance(spec.InstanceId);
+        return inst != null && _instances.Get(inst).State == InstanceState.Streaming;
+    }
+
+    public bool IsSlotStreaming(int slot)
+    {
+        var profile = _settings.Profile(_state.ActiveProfileId);
+        var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+        return spec != null && IsSpecStreaming(spec);
+    }
+
+    public bool IsReplugPending(int slot)
+    {
+        lock (_state) return _state.PendingReplugSlots.Contains(slot);
+    }
+
+    /// <summary>Remember that a display must be re-plugged once its client disconnects (the watchdog does it).</summary>
+    public void RequestReplug(int slot, string reason)
+    {
+        lock (_state)
+        {
+            if (_state.PendingReplugSlots.Contains(slot)) return;
+            _state.PendingReplugSlots.Add(slot);
+            _state.Save();
+        }
+        Log.Info($"虚拟屏 #{slot + 1} 需要重新插拔（{reason}），将在没有客户端串流时进行");
+    }
+
+    private void ClearPendingReplug(int slot)
+    {
+        lock (_state)
+        {
+            if (_state.PendingReplugSlots.Remove(slot)) _state.Save();
+        }
+    }
+
+    /// <summary>Removes and re-adds one virtual display so the driver rebuilds its mode table from the registry. Caller holds the busy lock.</summary>
+    private List<DisplayInfo> ReplugCore(int slot, ApplyResult? result)
+    {
+        var before = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot);
+        var wasActive = before?.Active == true;
+        _vdd.RemoveDisplay(slot);
+        DisplayManager.WaitFor(l => !l.Any(x => x.IsParsec && x.ParsecSlot == slot), TimeSpan.FromSeconds(8));
+        var index = _vdd.AddDisplay();
+        if (index != slot) Log.Warn($"重新插拔: 驱动把虚拟屏放到了槽位 {index}（原槽位 {slot}），下次应用方案时会整理槽位");
+        var displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == index), TimeSpan.FromSeconds(20));
+        if (wasActive)
+        {
+            // Windows may restore the remembered (possibly stand-by) state for this monitor: switch it back on
+            displays = EnsureParsecEnabled(result ?? new ApplyResult(), displays);
+        }
+        _replugDone[slot] = ParsecModes.Signature();
+        ClearPendingReplug(slot);
+        var after = displays.FirstOrDefault(d => d.IsParsec && d.ParsecSlot == index);
+        Log.Info($"已重新插拔虚拟屏 #{slot + 1}: {(after == null ? "未枚举到" : after.Active ? $"{after.GdiName} 可用模式 {string.Join(", ", DisplayManager.GetModes(after.GdiName).Where(m => m.Orientation == 0))}" : "待机（未激活）")}");
+        return displays;
+    }
+
+    /// <summary>
+    /// Re-plugs one virtual display outside of an apply (after the custom mode table changed) and then re-applies the
+    /// active profile so mode, position and Sunshine config match the new table. Deferred while a client streams it.
+    /// </summary>
+    public async Task<(bool Ok, string Message)> ReplugAsync(int slot, string reason)
+    {
+        if (IsSlotStreaming(slot))
+        {
+            RequestReplug(slot, reason);
+            return (false, $"虚拟屏 #{slot + 1} 正在串流，客户端断开后自动重新插拔");
+        }
+        if (!await _busy.WaitAsync(0).ConfigureAwait(false)) return (false, "另一个操作正在进行，请稍候");
+        try
+        {
+            if (!_vdd.Open()) return (false, _vdd.LastError ?? "Parsec VDD 打开失败");
+            if (!DisplayManager.Enumerate().Any(d => d.IsParsec && d.ParsecSlot == slot))
+            {
+                ClearPendingReplug(slot);
+                return (false, $"虚拟屏 #{slot + 1} 不存在");
+            }
+            Log.Info($"重新插拔虚拟屏 #{slot + 1}: {reason}");
+            CurrentStep = $"重新插拔虚拟屏 #{slot + 1}";
+            await Task.Run(() => ReplugCore(slot, null)).ConfigureAwait(false);
+        }
+        finally
+        {
+            CurrentStep = string.Empty;
+            _busy.Release();
+        }
+        var profile = _settings.Profile(_state.ActiveProfileId);
+        if (profile != null && profile.VirtualCount > slot)
+        {
+            var r = await ApplyAsync(profile).ConfigureAwait(false);
+            return (r.Success, r.Success ? $"虚拟屏 #{slot + 1} 已重新插拔，驱动模式表已更新" : r.Summary);
+        }
+        return (true, $"虚拟屏 #{slot + 1} 已重新插拔");
+    }
+
+    /// <summary>After the custom mode table changed: re-plug every present virtual display now, or once it is idle.</summary>
+    public async Task<string> RefreshModesAsync(string reason)
+    {
+        var notes = new List<string>();
+        foreach (var d in DisplayManager.Enumerate().Where(d => d.IsParsec && d.ParsecSlot >= 0).OrderBy(d => d.ParsecSlot).ToList())
+        {
+            var (_, msg) = await ReplugAsync(d.ParsecSlot, reason).ConfigureAwait(false);
+            notes.Add(msg);
+        }
+        return notes.Count == 0 ? "当前没有虚拟屏，新模式会在下次创建虚拟屏时生效" : string.Join("；", notes);
+    }
+
+    /// <summary>The user picked a refresh rate for a virtual display: store it in the active profile and apply it.</summary>
+    public async Task<(bool Ok, string Message)> SetVirtualDisplayRateAsync(int slot, int hz)
+    {
+        var profile = _settings.Profile(_state.ActiveProfileId);
+        var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+        if (profile == null || spec == null) return (false, "当前方案没有这块虚拟屏");
+        spec.RefreshRate = hz;
+        if (profile.ComposeRefreshRate > hz) profile.ComposeRefreshRate = 0;
+        _settings.Save();
+        Log.Info($"用户把虚拟屏 #{slot + 1} 的刷新率设为 {hz}Hz（记入方案「{profile.Name}」）");
+        var display = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot);
+        var (w, h) = ResolveResolution(profile, spec, display?.GdiName);
+        var published = KnownRates(slot, display?.IsReady == true ? display.GdiName : null, w, h);
+        var streaming = IsSpecStreaming(spec);
+        var r = await ApplyAsync(profile).ConfigureAwait(false);
+        if (!r.Success) return (false, r.Summary);
+        var target = TargetHz(profile, spec, DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot));
+        if (!published.Contains(hz) && ParsecModes.RegisteredRates(w, h).Contains(hz))
+        {
+            return (true, streaming
+                ? $"{hz}Hz 已记入方案；驱动要重新插拔后才提供这个模式，客户端断开后自动进行，期间先用 {target}Hz"
+                : $"{hz}Hz 已记入方案，虚拟屏已重新插拔，当前 {target}Hz");
+        }
+        if (target != hz) return (true, $"已记入方案；因跟随客户端帧率/合成刷新率，实际使用 {target}Hz");
+        return (true, $"虚拟屏 #{slot + 1} → {target}Hz");
     }
 
     // ------------------------------------------------------------------ layouts
@@ -679,12 +924,21 @@ public sealed class ProfileEngine
             var rt = _instances.Get(spec);
             if (mapping.TryGetValue(spec.Id, out var outputId) && spec.Enabled)
             {
+                var previousOutput = rt.DesiredOutputId ?? string.Empty;
                 var changed = _instances.EnsureConfig(spec, outputId, ddMap.GetValueOrDefault(spec.Id) ?? DdOptions.Disabled, out var msg);
                 var alive = rt.IsAlive || _instances.Adopt(spec);
                 var target = string.IsNullOrEmpty(outputId) ? "主屏" : outputId;
                 if (alive && !changed)
                 {
                     Step(result, $"实例 {spec.Id} ({spec.Name}, 端口 {spec.Port}) 已在运行，抓取 {target}");
+                    continue;
+                }
+                var sameOutput = string.Equals(previousOutput, outputId ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+                if (alive && sameOutput && (rt.State == InstanceState.Streaming || _instances.StreamingClientAddresses(spec).Count > 0))
+                {
+                    // never cut a running session for a display-device option change: EnsureConfig marked the runtime
+                    // ConfigDirty and the watchdog restarts the instance once the client is gone
+                    Step(result, $"实例 {spec.Id} 配置已更新，但正在串流：客户端断开后再重启生效");
                     continue;
                 }
                 Step(result, alive ? $"实例 {spec.Id} 配置变化，重启以抓取 {target}" : $"启动实例 {spec.Id} ({spec.Name}, 端口 {spec.Port}) 抓取 {target}");

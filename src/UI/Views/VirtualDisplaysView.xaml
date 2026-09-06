@@ -38,7 +38,7 @@
                         <TextBlock Text="自定义分辨率 / 刷新率" Style="{StaticResource H2}" VerticalAlignment="Center" />
                     </DockPanel>
                     <TextBlock Style="{StaticResource Muted}" Margin="0,6,0,8"
-                               Text="Parsec 驱动内置 1920×1080 等常见模式；平板的 2000×1200 需要作为自定义模式写入注册表 HKLM\SOFTWARE\Parsec\vdd。应用方案时如果缺少模式会自动请求注册。" />
+                               Text="Parsec 驱动内置 1920×1080 等常见模式；平板的 2000×1200 需要作为自定义模式写入注册表 HKLM\SOFTWARE\Parsec\vdd。应用方案时如果缺少模式会自动请求注册。驱动只在虚拟屏重新插拔时读取这张表：注册或删除模式后，Hub 会自动重新插拔空闲的虚拟屏；正在串流的虚拟屏等客户端断开后再处理。" />
                     <StackPanel x:Name="ModesPanel" />
                 </StackPanel>
             </Border>

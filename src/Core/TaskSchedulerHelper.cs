@@ -78,6 +78,14 @@ public static class TaskSchedulerHelper
         var user = WindowsIdentity.GetCurrent();
         var sid = user.User?.Value ?? string.Empty;
         var exe = Paths.ExePath;
+        // tools/update-hub.ps1 runs the new build from dist-staging for a moment and deletes that folder afterwards:
+        // the logon task must always point at the permanent dist copy.
+        var dir = Path.GetDirectoryName(exe) ?? string.Empty;
+        if (string.Equals(Path.GetFileName(dir), "dist-staging", StringComparison.OrdinalIgnoreCase))
+        {
+            var permanent = Path.Combine(Path.GetDirectoryName(dir) ?? dir, "dist", Path.GetFileName(exe));
+            if (File.Exists(permanent)) exe = permanent;
+        }
         var xml = $@"<?xml version=""1.0"" encoding=""UTF-16""?>
 <Task version=""1.4"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
   <RegistrationInfo>

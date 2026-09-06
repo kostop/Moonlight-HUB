@@ -70,8 +70,8 @@ public partial class ProfileEditorWindow : Window
                 var parts = (res.SelectedItem as string ?? string.Empty).Split('×');
                 if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h)) { vd.Width = w; vd.Height = h; }
             };
-            var rate = new ComboBox { Width = 90, Margin = new Thickness(0, 0, 8, 0) };
-            foreach (var r in Rates) rate.Items.Add($"{r} Hz");
+            var rate = new ComboBox { Width = 90, Margin = new Thickness(0, 0, 8, 0), ToolTip = "刷新率下限；开启“跟随客户端帧率”时客户端要求更高帧率会自动提高" };
+            foreach (var r in Rates.Union(ParsecModes.Read().Select(m => m.Hz)).Distinct().OrderBy(x => x)) rate.Items.Add($"{r} Hz");
             if (!rate.Items.Contains($"{vd.RefreshRate} Hz")) rate.Items.Insert(0, $"{vd.RefreshRate} Hz");
             rate.SelectedItem = $"{vd.RefreshRate} Hz";
             rate.SelectionChanged += (_, _) => { if (int.TryParse((rate.SelectedItem as string ?? "").Replace(" Hz", ""), out var r)) vd.RefreshRate = r; };

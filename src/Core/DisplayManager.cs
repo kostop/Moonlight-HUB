@@ -448,29 +448,59 @@ public static unsafe class DisplayManager
     /// </summary>
     public static int SetActiveTargets(IEnumerable<(LUID Adapter, uint Target)> targets)
     {
-        if (!QueryPaths(QDC_ALL_PATHS, out var all, out _)) return -1;
+        // Same recipe as Sunshine's libdisplaydevice (win_api_utils::makePathsForNewTopology + doSetTopology):
+        // virtual-mode-aware paths, every mode index cleared, one clone group per display, path marked active.
+        if (!QueryPaths(QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE, out var all, out _)) return -1;
         var chosen = new List<DISPLAYCONFIG_PATH_INFO>();
         var usedSources = new HashSet<string>();
+        uint group = 0;
         foreach (var (adapter, target) in targets)
         {
             var candidates = all.Where(p => p.targetInfo.adapterId.Same(adapter) && p.targetInfo.id == target && p.targetInfo.targetAvailable != 0).ToList();
             if (candidates.Count == 0) return -2;
-            var pick = candidates.FirstOrDefault(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0);
-            if ((pick.flags & DISPLAYCONFIG_PATH_ACTIVE) == 0)
+            var active = candidates.Where(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0).ToList();
+            DISPLAYCONFIG_PATH_INFO pick;
+            if (active.Count > 0)
             {
-                pick = candidates.FirstOrDefault(p => !usedSources.Contains($"{p.sourceInfo.adapterId}/{p.sourceInfo.id}"));
+                pick = active[0];
+            }
+            else
+            {
+                // lowest free source id on that adapter (closest to what Windows itself would choose)
+                var free = candidates.Where(p => !usedSources.Contains($"{p.sourceInfo.adapterId}/{p.sourceInfo.id}")).OrderBy(p => p.sourceInfo.id).ToList();
+                if (free.Count == 0) return -4;
+                pick = free[0];
             }
             usedSources.Add($"{pick.sourceInfo.adapterId}/{pick.sourceInfo.id}");
             pick.flags = DISPLAYCONFIG_PATH_ACTIVE;
-            pick.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-            pick.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-            pick.sourceInfo.statusFlags = 0;
-            pick.targetInfo.statusFlags = 0;
+            pick.sourceInfo.modeInfoIdx = (0xFFFFu << 16) | (group & 0xFFFF); // sourceModeInfoIdx = invalid, cloneGroupId = group
+            pick.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;   // desktopModeInfoIdx + targetModeInfoIdx = invalid
             chosen.Add(pick);
+            group++;
         }
         if (chosen.Count == 0) return -3;
         var arr = chosen.ToArray();
-        return SetDisplayConfig((uint)arr.Length, arr, 0, null, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+        var result = SetDisplayConfig((uint)arr.Length, arr, 0, null, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES | SDC_VIRTUAL_MODE_AWARE);
+        if (result == 31 /* ERROR_GEN_FAILURE: no database entry for this topology */)
+        {
+            result = SetDisplayConfig((uint)arr.Length, arr, 0, null, SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_VIRTUAL_MODE_AWARE | SDC_SAVE_TO_DATABASE);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Re-enables displays that are connected but switched off (stand-by) by supplying an explicit topology:
+    /// every currently active target plus the given ones. SDC_TOPOLOGY_EXTEND cannot be used for this because Windows
+    /// would just replay the database entry that recorded the display as detached.
+    /// </summary>
+    public static int ActivateDisplays(IEnumerable<DisplayInfo> toEnable, IEnumerable<DisplayInfo> currentlyActive)
+    {
+        var targets = currentlyActive.Where(d => d.Active).Select(d => (d.AdapterId, d.TargetId)).ToList();
+        foreach (var d in toEnable)
+        {
+            if (!targets.Any(t => t.AdapterId.Same(d.AdapterId) && t.TargetId == d.TargetId)) targets.Add((d.AdapterId, d.TargetId));
+        }
+        return SetActiveTargets(targets);
     }
 
     /// <summary>Polls Enumerate() until the predicate is satisfied or the timeout elapses.</summary>
