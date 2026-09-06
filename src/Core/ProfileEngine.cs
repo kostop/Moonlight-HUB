@@ -266,7 +266,12 @@ public sealed class ProfileEngine
                 {
                     hz = spec.RefreshRate; // client fps mode not available: fall back to the profile value instead of prompting for UAC
                 }
-                if (!DisplayManager.HasMode(d.GdiName, spec.Width, spec.Height, hz))
+                if (!d.IsReady)
+                {
+                    displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && x.IsReady), TimeSpan.FromSeconds(8));
+                    d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot) ?? d;
+                }
+                if (d.IsReady && !DisplayManager.HasMode(d.GdiName, spec.Width, spec.Height, hz))
                 {
                     Step(result, $"虚拟屏 #{spec.Slot + 1} 缺少模式 {spec.Width}x{spec.Height}@{hz}，注册 Parsec 自定义模式…");
                     var (ok, msg) = ParsecModes.EnsureRegistered(spec.Width, spec.Height, hz);
@@ -278,9 +283,15 @@ public sealed class ProfileEngine
                         _vdd.RemoveDisplay(spec.Slot);
                         DisplayManager.WaitFor(l => !l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot), TimeSpan.FromSeconds(8));
                         _vdd.AddDisplay();
-                        displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && x.Active), TimeSpan.FromSeconds(20));
+                        displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot), TimeSpan.FromSeconds(20));
+                        if (displays.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && !x.Active))
+                        {
+                            // Windows remembers the stand-by (inactive) state for this monitor: re-enable it explicitly
+                            DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
+                        }
+                        displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && x.IsReady), TimeSpan.FromSeconds(20));
                         d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot);
-                        if (d == null || !DisplayManager.HasMode(d.GdiName, spec.Width, spec.Height, hz))
+                        if (d == null || !d.IsReady || !DisplayManager.HasMode(d.GdiName, spec.Width, spec.Height, hz))
                         {
                             Step(result, $"⚠ 虚拟屏 #{spec.Slot + 1} 仍然没有 {spec.Width}x{spec.Height}@{hz}，将使用最接近的模式");
                         }
@@ -290,6 +301,12 @@ public sealed class ProfileEngine
 
             // ---------------------------------------------------------------- 4. layout
             displays = DisplayManager.Enumerate();
+            if (displays.Any(d => d.IsParsec && !d.IsReady))
+            {
+                // a re-plugged stand-by display may have come back switched off
+                DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
+                displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(12));
+            }
             parsec = displays.Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).ToList();
             var physicalActive = displays.Where(d => !d.IsParsec && d.Active).ToList();
             var primaryPhysical = physicalActive.FirstOrDefault(d => d.Primary) ?? physicalActive.FirstOrDefault();
@@ -326,7 +343,9 @@ public sealed class ProfileEngine
 
             // ---------------------------------------------------------------- 5. Sunshine instances
             displays = DisplayManager.Enumerate();
-            parsec = displays.Where(d => d.IsParsec && d.Active).OrderBy(d => d.ParsecSlot).ToList();
+            // present (active or stand-by) displays all have a stable device id; never drop an instance because its
+            // display happens to be switched off at this moment
+            parsec = displays.Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).ToList();
             var mapping = new Dictionary<int, string>();
             var ddMap = new Dictionary<int, DdOptions>();
             var slotOfInstance = new Dictionary<int, int>();
@@ -444,7 +463,7 @@ public sealed class ProfileEngine
                 Step(result, $"已请求添加虚拟屏 (驱动返回槽位 {index})");
                 Thread.Sleep(300);
             }
-            displays = DisplayManager.WaitFor(l => l.Count(d => d.IsParsec) >= want, TimeSpan.FromSeconds(25));
+            displays = DisplayManager.WaitFor(l => l.Count(d => d.IsParsec) >= want && l.Where(d => d.IsParsec).All(d => d.IsReady || !d.Active), TimeSpan.FromSeconds(25));
 
             if (!SlotsOk(displays))
             {
@@ -466,14 +485,25 @@ public sealed class ProfileEngine
             }
         }
 
-        // make sure every virtual display is attached to the desktop
+        // make sure every virtual display is attached to the desktop (stand-by displays are re-enabled for configuration)
         if (displays.Any(d => d.IsParsec && !d.Active))
         {
-            Step(result, "有虚拟屏未激活，切换到扩展拓扑");
+            Step(result, "有虚拟屏未激活（待机），临时启用以便配置");
             DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
-            displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.Active), TimeSpan.FromSeconds(12));
+            displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(12));
         }
-        Step(result, $"✓ 虚拟屏就绪: {string.Join(", ", displays.Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).Select(d => $"#{d.ParsecSlot + 1}={d.GdiName}"))}");
+        // Windows may report an active path before the GDI name/mode is populated: settle before touching modes
+        if (displays.Any(d => d.IsParsec && !d.IsReady))
+        {
+            displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(8));
+        }
+        if (displays.Any(d => d.IsParsec && !d.IsReady))
+        {
+            Step(result, "✗ 虚拟屏已激活但 Windows 尚未完成枚举（无设备名/模式）");
+            result.Summary = "虚拟屏枚举未完成";
+            return null;
+        }
+        Step(result, $"✓ 虚拟屏就绪: {string.Join(", ", displays.Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).Select(d => $"#{d.ParsecSlot + 1}={d.GdiName} {d.ModeText}"))}");
         return displays;
     }
 
@@ -497,6 +527,7 @@ public sealed class ProfileEngine
         {
             Step(result, "⚠ 没有激活的物理显示器，虚拟屏将自行排列");
         }
+        parsec = parsec.Where(p => p.IsReady).ToList();
         var items = new List<LayoutItem>();
         if (primary != null)
         {

@@ -47,6 +47,9 @@ public sealed class DisplayInfo
     /// <summary>Best-effort Parsec driver slot (UID 256 → 0, 257 → 1 …). Validated at runtime by ProfileEngine.</summary>
     public int ParsecSlot => IsParsec && Uid >= 256 ? Uid - 256 : -1;
 
+    /// <summary>Active and fully enumerated (GDI name and a current mode are available) — right after activation Windows can report an active path without them.</summary>
+    public bool IsReady => Active && !string.IsNullOrEmpty(GdiName) && Width > 0 && Height > 0;
+
     public string Label => IsParsec ? $"Parsec 虚拟屏 #{ParsecSlot + 1}" : (string.IsNullOrWhiteSpace(FriendlyName) ? (IsEmbeddedTechnology ? "笔记本内置屏" : "显示器") : FriendlyName);
     public string ModeText => Active ? $"{Width}×{Height} @ {RefreshRate}Hz" : "未激活";
     public string PositionText => Active ? $"({PositionX}, {PositionY})" : "-";
