@@ -1,0 +1,29 @@
+<UserControl x:Class="MoonlightHub.UI.Views.DisplaysView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="clr-namespace:MoonlightHub.UI">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+            <Border Style="{StaticResource Card}">
+                <DockPanel>
+                    <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button x:Name="ApplyLayoutBtn" Content="应用摆放" Style="{StaticResource PrimaryButton}" Click="ApplyLayout_Click" IsEnabled="False" ToolTip="把拖动后的位置写入 Windows，并记入当前方案" />
+                            <Button x:Name="ResetLayoutBtn" Content="撤销拖动" Style="{StaticResource GhostButton}" Click="ResetLayout_Click" IsEnabled="False" />
+                            <Button Content="刷新" Style="{StaticResource GhostButton}" Click="Refresh_Click" />
+                            <Button Content="扩展全部显示器" Style="{StaticResource GhostButton}" Click="Extend_Click" ToolTip="SetDisplayConfig(SDC_TOPOLOGY_EXTEND)：让所有已连接显示器都加入桌面" />
+                            <Button Content="重新应用当前方案" Style="{StaticResource GhostButton}" Click="Reapply_Click" Margin="0" />
+                        </StackPanel>
+                        <StackPanel>
+                            <TextBlock Text="桌面布局" Style="{StaticResource H2}" VerticalAlignment="Center" />
+                            <TextBlock Text="直接拖动下面的显示器方块来摆放位置（会自动吸附到相邻边），然后点“应用摆放”。" Style="{StaticResource Muted}" />
+                        </StackPanel>
+                    </DockPanel>
+                    <ui:DisplayCanvas x:Name="LayoutCanvas" Height="320" Interactive="True" />
+                </DockPanel>
+            </Border>
+            <TextBlock Text="显示器" Style="{StaticResource H2}" Margin="0,4,0,10" />
+            <StackPanel x:Name="List" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

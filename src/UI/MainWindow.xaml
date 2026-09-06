@@ -1,0 +1,94 @@
+<Window x:Class="MoonlightHub.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Moonlight Hub 副屏中心" Width="1240" Height="820" MinWidth="960" MinHeight="620"
+        Background="{StaticResource BgBrush}" WindowStartupLocation="CenterScreen"
+        FontFamily="{StaticResource UiFont}" TextOptions.TextFormattingMode="Display" UseLayoutRounding="True">
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="52" ResizeBorderThickness="6" GlassFrameThickness="0" CornerRadius="0" UseAeroCaptionButtons="False" />
+    </WindowChrome.WindowChrome>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="232" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
+
+        <!-- ===== navigation rail ===== -->
+        <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Top" Margin="20,22,20,18" Orientation="Horizontal">
+                    <Border Width="34" Height="34" CornerRadius="9" Background="{StaticResource AccentSoftBrush}">
+                        <TextBlock Text="&#xE7F4;" Style="{StaticResource Icon}" Foreground="{StaticResource AccentBrush}" HorizontalAlignment="Center" />
+                    </Border>
+                    <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="Moonlight Hub" FontWeight="SemiBold" FontSize="15" />
+                        <TextBlock Text="副屏中心" Style="{StaticResource Muted}" />
+                    </StackPanel>
+                </StackPanel>
+
+                <StackPanel DockPanel.Dock="Bottom" Margin="20,10,20,18">
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <Ellipse x:Name="VddDot" Width="8" Height="8" Fill="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                        <TextBlock x:Name="VddText" Text="Parsec VDD" Style="{StaticResource Muted}" Margin="8,0,0,0" />
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <Ellipse x:Name="WatchdogDot" Width="8" Height="8" Fill="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                        <TextBlock x:Name="WatchdogText" Text="守护" Style="{StaticResource Muted}" Margin="8,0,0,0" />
+                    </StackPanel>
+                    <TextBlock x:Name="VersionText" Text="v1.0" Style="{StaticResource Muted}" Margin="0,8,0,0" />
+                </StackPanel>
+
+                <StackPanel Margin="0,4">
+                    <RadioButton x:Name="NavOverview" Style="{StaticResource NavButton}" Tag="&#xE80F;" Content="概览" IsChecked="True" Checked="Nav_Checked" />
+                    <RadioButton x:Name="NavDisplays" Style="{StaticResource NavButton}" Tag="&#xE7F4;" Content="显示布局" Checked="Nav_Checked" />
+                    <RadioButton x:Name="NavClients" Style="{StaticResource NavButton}" Tag="&#xE8AF;" Content="客户端 / Sunshine" Checked="Nav_Checked" />
+                    <RadioButton x:Name="NavVirtual" Style="{StaticResource NavButton}" Tag="&#xE7F8;" Content="虚拟屏 (Parsec VDD)" Checked="Nav_Checked" />
+                    <RadioButton x:Name="NavTools" Style="{StaticResource NavButton}" Tag="&#xE90F;" Content="工具" Checked="Nav_Checked" />
+                    <RadioButton x:Name="NavLogs" Style="{StaticResource NavButton}" Tag="&#xE7C3;" Content="日志" Checked="Nav_Checked" />
+                    <RadioButton x:Name="NavSettings" Style="{StaticResource NavButton}" Tag="&#xE713;" Content="设置" Checked="Nav_Checked" />
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- ===== content ===== -->
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="52" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+
+            <!-- title bar -->
+            <Grid Background="{StaticResource BgBrush}">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="26,0,0,0">
+                    <TextBlock x:Name="PageTitle" Text="概览" Style="{StaticResource H1}" FontSize="18" />
+                    <Border x:Name="ProfilePill" Style="{StaticResource Pill}" Background="{StaticResource AccentSoftBrush}" Margin="14,0,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="当前方案" Style="{StaticResource Muted}" Margin="0,0,6,0" />
+                            <TextBlock x:Name="ProfileName" Text="—" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center" WindowChrome.IsHitTestVisibleInChrome="True">
+                    <Button Style="{StaticResource IconButton}" Content="&#xE921;" ToolTip="最小化到托盘" Click="Minimize_Click" Margin="0" />
+                    <Button Style="{StaticResource IconButton}" x:Name="MaxButton" Content="&#xE922;" ToolTip="最大化" Click="Maximize_Click" Margin="0" />
+                    <Button Style="{StaticResource IconButton}" Content="&#xE8BB;" ToolTip="关闭（隐藏到托盘）" Click="Close_Click" Margin="0,0,8,0" />
+                </StackPanel>
+            </Grid>
+
+            <!-- progress strip -->
+            <Border x:Name="ProgressStrip" Grid.Row="1" Background="{StaticResource AccentSoftBrush}" Padding="26,8" Visibility="Collapsed">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE895;" Style="{StaticResource Icon}" Foreground="{StaticResource AccentBrush}" Margin="0,0,10,0" />
+                        <TextBlock x:Name="ProgressText" Text="正在应用方案…" />
+                    </StackPanel>
+                    <ProgressBar IsIndeterminate="True" Margin="0,8,0,0" />
+                </StackPanel>
+            </Border>
+
+            <ContentControl x:Name="PageHost" Grid.Row="2" Margin="26,10,26,20" />
+        </Grid>
+    </Grid>
+</Window>

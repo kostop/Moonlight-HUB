@@ -1,0 +1,7 @@
+<Project>
+  <!-- Keep compiler outputs out of the Desktop folder (it is synced by Syncthing); dist/ is the only artifact kept here. -->
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>$(LOCALAPPDATA)\MoonlightHub\build\obj\</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(LOCALAPPDATA)\MoonlightHub\build\bin\</BaseOutputPath>
+  </PropertyGroup>
+</Project>

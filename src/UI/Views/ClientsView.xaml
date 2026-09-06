@@ -1,0 +1,18 @@
+<UserControl x:Class="MoonlightHub.UI.Views.ClientsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="在 Moonlight 里添加这台电脑" Style="{StaticResource H2}" />
+                    <TextBlock Style="{StaticResource Muted}" Margin="0,4,0,8"
+                               Text="每块虚拟副屏对应一个独立的 Sunshine 实例（不同端口）。实例 1 使用默认端口，直接输入 IP 即可；其他实例要在 Moonlight「手动添加电脑」里输入 IP:端口。每台平板/手机配对到自己的实例后，就能同时连接、各自显示一块副屏。" />
+                    <StackPanel x:Name="AddressPanel" />
+                </StackPanel>
+            </Border>
+            <TextBlock Text="Sunshine 实例" Style="{StaticResource H2}" Margin="0,4,0,10" />
+            <StackPanel x:Name="InstancePanel" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

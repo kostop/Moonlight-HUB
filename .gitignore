@@ -1,0 +1,11 @@
+# build outputs (the csproj redirects bin/obj outside the tree, but keep these for other machines)
+bin/
+obj/
+dist/
+dist-staging/
+release/
+*.user
+*.suo
+.vs/
+*.log
+tools/fix-paths-after-organize.ps1
