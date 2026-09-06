@@ -43,6 +43,13 @@ public sealed class Hub : IDisposable
         Instances.Changed += () => Changed?.Invoke();
         Engine.Applied += () => Changed?.Invoke();
         Watchdog.Ticked += () => Changed?.Invoke();
+
+        // restore what the last apply wrote so that any code path (CLI included) regenerates the same config
+        foreach (var rt in Instances.All)
+        {
+            if (State.InstanceDd.TryGetValue(rt.Spec.Id, out var dd)) rt.DesiredDd = dd;
+            if (State.InstanceOutputIds.TryGetValue(rt.Spec.Id, out var oid)) rt.DesiredOutputId = oid;
+        }
         Current = this;
     }
 
