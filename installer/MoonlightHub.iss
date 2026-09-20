@@ -4,7 +4,7 @@
 #define MyAppName "Moonlight Hub"
 #define MyAppNameCn "Moonlight Hub 副屏中心"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.1.0"
 #endif
 #define MyAppPublisher "kostop"
 #define MyAppURL "https://github.com/kostop/Moonlight-HUB"
@@ -32,8 +32,8 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+; The hub runs elevated (driver install / adapter restart) and ships Sunshine + the Parsec driver: install machine-wide.
+PrivilegesRequired=admin
 SetupIconFile=..\src\Assets\app.ico
 DisableProgramGroupPage=yes
 CloseApplications=yes
@@ -56,8 +56,9 @@ Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppNameCn}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli autostart on"; Flags: runhidden waituntilterminated; Tasks: autostart
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+; the logon task must belong to the interactive user, not to the (elevated) installer account: run as the original user
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli autostart on"; Flags: runhidden waituntilterminated runasoriginaluser; Tasks: autostart
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--cli shutdown"; Flags: runhidden waituntilterminated; RunOnceId: "shutdownhub"

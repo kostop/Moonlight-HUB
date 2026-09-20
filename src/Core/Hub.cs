@@ -79,7 +79,9 @@ public sealed class Hub : IDisposable
     /// <summary>Opens the driver, adopts running instances and (optionally) re-applies the active profile.</summary>
     public async Task StartupAsync(bool autoApply)
     {
-        Log.Info($"Moonlight Hub 启动 (exe={Paths.ExePath}, 数据目录={Paths.DataDir})");
+        Log.Info($"Moonlight Hub 启动 (exe={Paths.ExePath}, 数据目录={Paths.DataDir}, Sunshine={Settings.SunshineExe}{(Settings.SunshineIsEmbedded ? " [随附]" : string.Empty)})");
+        var pruned = Paths.PruneLogs();
+        if (pruned > 0) Log.Info($"已清理 {pruned} 个超过 14 天的日志文件");
         if (ParsecVdd.IsDriverPresent())
         {
             if (Vdd.Open()) Log.Info($"Parsec VDD 已打开 (版本 0.{Vdd.Version})，keep-alive 运行中");
@@ -87,7 +89,15 @@ public sealed class Hub : IDisposable
         }
         else
         {
-            Log.Warn("未检测到 Parsec Virtual Display Adapter，虚拟屏功能不可用");
+            // "Fast startup" hibernates the kernel, so an adapter that failed before the shutdown is still failed after
+            // the next boot: repair it right away instead of waiting for the watchdog.
+            var state = ParsecVdd.QueryDeviceState();
+            Log.Warn($"Parsec Virtual Display Adapter 不可用: {state.Text}{(string.IsNullOrEmpty(state.InstanceId) ? string.Empty : $" ({state.InstanceId})")}");
+            if (State.ExpectedVirtualDisplays > 0 || (ActiveProfile?.VirtualCount ?? 0) > 0)
+            {
+                var note = Watchdog.RecoverDriverNow("启动时设备不可用");
+                Log.Info("启动时驱动恢复: " + note);
+            }
         }
 
         foreach (var rt in Instances.All)

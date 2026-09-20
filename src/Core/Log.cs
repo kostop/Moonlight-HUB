@@ -28,6 +28,13 @@ public static class Paths
     public static string ExePath => Environment.ProcessPath ?? Path.Combine(AppContext.BaseDirectory, "MoonlightHub.exe");
     public static string ExeDir => Path.GetDirectoryName(ExePath) ?? AppContext.BaseDirectory;
 
+    /// <summary>Sunshine runtime shipped inside the hub package (dist\sunshine\sunshine.exe), when present.</summary>
+    public static string EmbeddedSunshineExe => Path.Combine(ExeDir, "sunshine", "sunshine.exe");
+    public static bool HasEmbeddedSunshine => File.Exists(EmbeddedSunshineExe);
+    /// <summary>Configuration of the embedded Sunshine lives in the hub's data directory, never inside the package.</summary>
+    public static string EmbeddedSunshineConfigDir => Path.Combine(DataDir, "sunshine", "config");
+    public static string EmbeddedSunshineInstancesRoot => Path.Combine(DataDir, "sunshine", "instances");
+
     /// <summary>Repository root (…\moonlight) when running from the source/publish tree, otherwise the exe dir.</summary>
     public static string RepoRoot
     {
@@ -50,6 +57,24 @@ public static class Paths
     {
         Directory.CreateDirectory(DataDir);
         Directory.CreateDirectory(LogDir);
+    }
+
+    /// <summary>Deletes hub log files older than <paramref name="keepDays"/> so the data directory does not grow forever.</summary>
+    public static int PruneLogs(int keepDays = 14)
+    {
+        var removed = 0;
+        try
+        {
+            foreach (var file in Directory.GetFiles(LogDir, "hub-*.log"))
+            {
+                if (File.GetLastWriteTimeUtc(file) < DateTime.UtcNow.AddDays(-keepDays))
+                {
+                    try { File.Delete(file); removed++; } catch { }
+                }
+            }
+        }
+        catch { }
+        return removed;
     }
 }
 

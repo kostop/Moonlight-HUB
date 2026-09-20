@@ -39,6 +39,17 @@
 
             <Border Style="{StaticResource Card}">
                 <StackPanel>
+                    <TextBlock Text="系统" Style="{StaticResource H2}" />
+                    <TextBlock x:Name="FastStartupText" Style="{StaticResource Muted}" Margin="0,4,0,10" TextWrapping="Wrap"
+                               Text="Windows「快速启动」会在关机时把内核休眠：Parsec 适配器如果在关机前已经异常，下次开机后仍然异常（Hub 启动时会自动重启它）。关闭快速启动后每次开机都是干净的驱动状态，代价是开机慢几秒。" />
+                    <WrapPanel>
+                        <Button x:Name="FastStartupBtn" Content="关闭快速启动" Click="FastStartup_Click" Style="{StaticResource GhostButton}" />
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
                     <TextBlock Text="快捷打开" Style="{StaticResource H2}" />
                     <WrapPanel Margin="0,10,0,0">
                         <Button Content="脚本目录" Click="OpenScripts_Click" Style="{StaticResource GhostButton}" />

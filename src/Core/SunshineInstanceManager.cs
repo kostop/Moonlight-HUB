@@ -166,7 +166,11 @@ public sealed class SunshineInstanceManager
         {
             managed.Add(("dd_configuration_option", "disabled"));
         }
-        if (spec.Id != 1)
+        // Sunshine resolves relative paths against <exe dir>\config: every instance whose config lives elsewhere
+        // (all extra instances, and instance 1 when the embedded runtime keeps its config in the hub data dir) needs
+        // absolute paths so state, log, apps and certificates stay together.
+        var defaultConfigDir = Path.Combine(_settings.SunshineDir, "config");
+        if (spec.Id != 1 || !string.Equals(Path.GetFullPath(rt.ConfigDir).TrimEnd('\\'), Path.GetFullPath(defaultConfigDir).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
         {
             var credDir = Path.Combine(rt.ConfigDir, "credentials");
             Directory.CreateDirectory(credDir);
@@ -260,6 +264,16 @@ public sealed class SunshineInstanceManager
         {
             var p = Process.GetProcessById(pid.Value);
             if (p.HasExited) return false;
+            if (rt.Pid != pid.Value && rt.ConfigDirty)
+            {
+                // somebody else (CLI, another hub process) restarted the instance: when that happened after our last
+                // config write the running process already uses it, so no further restart is due
+                try
+                {
+                    if (File.Exists(rt.ConfigPath) && p.StartTime > File.GetLastWriteTime(rt.ConfigPath)) rt.ConfigDirty = false;
+                }
+                catch { }
+            }
             rt.Process = p;
             rt.Pid = pid.Value;
             if (rt.State is InstanceState.Stopped or InstanceState.Disabled or InstanceState.Starting) rt.State = InstanceState.Running;

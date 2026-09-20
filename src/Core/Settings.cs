@@ -135,8 +135,19 @@ public sealed class HubSettings
     public bool AutoManageCredentials { get; set; } = true;
     /// <summary>Pop up the PIN window automatically when a client starts pairing.</summary>
     public bool AutoPairingPrompt { get; set; } = true;
+    /// <summary>Use the Sunshine runtime shipped inside the hub package (dist\sunshine) instead of a separately installed Sunshine.</summary>
+    public bool UseEmbeddedSunshine { get; set; } = true;
+    /// <summary>Run the hub with administrator rights so it can restart / install the Parsec driver and register modes without UAC prompts.</summary>
+    public bool RunElevated { get; set; } = true;
+    /// <summary>Install the bundled Parsec driver automatically when the device is missing (needs administrator rights).</summary>
+    public bool AutoInstallDriver { get; set; } = true;
+    /// <summary>Restart the Parsec adapter automatically when it stops responding (needs administrator rights).</summary>
+    public bool AutoRestartAdapter { get; set; } = true;
+    /// <summary>Set once the legacy Sunshine config was copied into the hub data directory.</summary>
+    public bool SunshineConfigMigrated { get; set; }
 
     [JsonIgnore] public string SunshineDir => Path.GetDirectoryName(SunshineExe) ?? @"D:\YingYong\Sunshine";
+    [JsonIgnore] public bool SunshineIsEmbedded => string.Equals(SunshineExe, Paths.EmbeddedSunshineExe, StringComparison.OrdinalIgnoreCase);
 
     public InstanceSpec? Instance(int id) => Instances.FirstOrDefault(i => i.Id == id);
     public Profile? Profile(string id) => Profiles.FirstOrDefault(p => p.Id == id);
@@ -204,6 +215,7 @@ public sealed class HubSettings
 
     public void ResolveDerivedPaths()
     {
+        ResolveSunshinePaths();
         var scriptsCandidate = Path.Combine(Paths.RepoRoot, "scripts");
         if (string.IsNullOrWhiteSpace(ScriptsDir) || (!File.Exists(Path.Combine(ScriptsDir, "toggle-usb-network.ps1")) && Directory.Exists(scriptsCandidate)))
         {
@@ -219,6 +231,70 @@ public sealed class HubSettings
             {
                 if (File.Exists(candidate)) { AdbPath = candidate; break; }
             }
+        }
+    }
+
+    /// <summary>
+    /// Prefers the Sunshine runtime shipped with the hub. Its configuration lives in the hub data directory; the first
+    /// time the embedded runtime is selected the legacy configuration (paired clients, certificates, apps) is copied
+    /// over so nothing has to be paired again. A separately installed Sunshine is still used when the package has none
+    /// or the user switched the embedded runtime off.
+    /// </summary>
+    public void ResolveSunshinePaths()
+    {
+        var legacyExe = SunshineExe;
+        var legacyConfig = Instance1ConfigDir;
+        if (UseEmbeddedSunshine && Paths.HasEmbeddedSunshine)
+        {
+            var newConfig = Paths.EmbeddedSunshineConfigDir;
+            if (!SunshineIsEmbedded || !string.Equals(Instance1ConfigDir, newConfig, StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    Directory.CreateDirectory(newConfig);
+                    if (!File.Exists(Path.Combine(newConfig, "sunshine.conf")) && Directory.Exists(legacyConfig) && File.Exists(Path.Combine(legacyConfig, "sunshine.conf")))
+                    {
+                        CopyDirectory(legacyConfig, newConfig, skip: name => name.EndsWith(".log", StringComparison.OrdinalIgnoreCase));
+                        Log.Info($"已把 Sunshine 配置从 {legacyConfig} 迁移到 {newConfig}（配对信息与证书一并保留）");
+                    }
+                    var legacyInstances = InstancesRoot;
+                    var newInstances = Paths.EmbeddedSunshineInstancesRoot;
+                    if (Directory.Exists(legacyInstances) && !Directory.Exists(newInstances))
+                    {
+                        CopyDirectory(legacyInstances, newInstances, skip: name => name.EndsWith(".log", StringComparison.OrdinalIgnoreCase));
+                    }
+                    SunshineExe = Paths.EmbeddedSunshineExe;
+                    Instance1ConfigDir = newConfig;
+                    InstancesRoot = newInstances;
+                    SunshineConfigMigrated = true;
+                    Log.Info($"使用随附的 Sunshine: {SunshineExe}（配置目录 {Instance1ConfigDir}）");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("切换到随附 Sunshine 失败，继续使用 " + legacyExe + ": " + ex.Message);
+                }
+            }
+        }
+        else if (SunshineIsEmbedded && !Paths.HasEmbeddedSunshine)
+        {
+            // package no longer ships Sunshine (e.g. source checkout): fall back to the last known external install
+            if (File.Exists(@"D:\YingYong\Sunshine\sunshine.exe")) SunshineExe = @"D:\YingYong\Sunshine\sunshine.exe";
+        }
+    }
+
+    private static void CopyDirectory(string source, string target, Func<string, bool>? skip = null)
+    {
+        Directory.CreateDirectory(target);
+        foreach (var file in Directory.GetFiles(source))
+        {
+            var name = Path.GetFileName(file);
+            if (skip != null && skip(name)) continue;
+            var dest = Path.Combine(target, name);
+            if (!File.Exists(dest)) File.Copy(file, dest);
+        }
+        foreach (var dir in Directory.GetDirectories(source))
+        {
+            CopyDirectory(dir, Path.Combine(target, Path.GetFileName(dir)), skip);
         }
     }
 
@@ -263,6 +339,10 @@ public sealed class HubState
     public List<int> PendingReplugSlots { get; set; } = new();
     /// <summary>Refresh rates Windows last exposed per virtual display slot and resolution ("slot:WxH"): lets a switched-off (stand-by) display be configured without turning it on.</summary>
     public Dictionary<string, List<int>> ExposedRates { get; set; } = new();
+    /// <summary>Device ids of the physical displays that were active right after the last apply (virtual displays come and go with stand-by).</summary>
+    public List<string> LastAppliedActiveIds { get; set; } = new();
+    /// <summary>Last known arrangement of the physical displays (device id → position/primary), restored on every apply and after reboots.</summary>
+    public Dictionary<string, DisplayPlacement> PhysicalLayout { get; set; } = new();
 
     public static HubState Load()
     {
@@ -289,4 +369,15 @@ public sealed class HubState
             Log.Warn("保存运行状态失败: " + ex.Message);
         }
     }
+}
+
+/// <summary>Position of one physical display as the user arranged it (part of <see cref="HubState.PhysicalLayout"/>).</summary>
+public sealed class DisplayPlacement
+{
+    public int X { get; set; }
+    public int Y { get; set; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    public bool Primary { get; set; }
+    public string Label { get; set; } = string.Empty;
 }

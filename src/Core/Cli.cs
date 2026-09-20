@@ -227,8 +227,13 @@ public static class Cli
 
             case "autostart":
                 {
-                    if (rest.Count == 0) { P(TaskSchedulerHelper.IsHubAutostartRegistered() ? "已注册" : "未注册"); return 0; }
-                    var r = rest[0] == "on" ? TaskSchedulerHelper.RegisterHubAutostart() : TaskSchedulerHelper.UnregisterHubAutostart();
+                    if (rest.Count == 0)
+                    {
+                        var t = TaskSchedulerHelper.QueryHubTask();
+                        P(t == null ? "未注册" : $"已注册 ({(t.Value.Highest ? "管理员权限" : "普通权限")}) {t.Value.Exe}");
+                        return 0;
+                    }
+                    var r = rest[0] == "on" ? TaskSchedulerHelper.RegisterHubAutostart(hub.Settings.RunElevated) : TaskSchedulerHelper.UnregisterHubAutostart();
                     P(r.Message);
                     return r.Ok ? 0 : 2;
                 }
@@ -265,11 +270,18 @@ public static class Cli
                 {
                     if (rest.Count > 0 && rest[0] == "restart")
                     {
-                        var (ok, msg) = ParsecVdd.RestartAdapter();
+                        var (ok, msg) = ParsecVdd.RestartAdapterAndWait(TimeSpan.FromSeconds(25));
                         P(msg);
                         return ok ? 0 : 2;
                     }
-                    P("Parsec adapter status: " + ParsecVdd.QueryAdapterStatus());
+                    if (rest.Count > 0 && rest[0] == "install")
+                    {
+                        var (ok, msg) = ParsecVdd.InstallDriver();
+                        P(msg);
+                        return ok ? 0 : 2;
+                    }
+                    var st = ParsecVdd.QueryDeviceState();
+                    P($"Parsec adapter: {st.Health} {st.Text} instance={st.InstanceId} status=0x{st.Status:X} problem={st.Problem} interface={(ParsecVdd.IsDriverPresent() ? "present" : "absent")} elevated={ProcessUtil.IsElevated()} bundledSetup={ParsecVdd.HasBundledSetup}");
                     return 0;
                 }
 

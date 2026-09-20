@@ -246,15 +246,50 @@ public sealed class ProfileEngine
         return r.Success;
     }
 
-    /// <summary>Stores the current positions of the virtual displays into the active profile (user dragged them in Windows settings).</summary>
-    public bool RememberVirtualPositions(List<DisplayInfo> displays)
+    /// <summary>
+    /// Stores the current arrangement (virtual display positions into the active profile, physical display positions
+    /// into the state) after the user rearranged displays in Windows settings. Refuses snapshots taken while Windows
+    /// is mid-reconfiguration: a monitor hot-plug briefly leaves the virtual display alone at (0,0) as the primary,
+    /// and remembering that is how the layout used to get "forgotten". Rules: a physical display must be active and
+    /// primary, virtual displays must not overlap physical ones, and — unless <paramref name="force"/> (the user pressed
+    /// "apply layout" in the hub) — the set of active displays must be the one the last apply produced.
+    /// </summary>
+    public bool RememberLayout(List<DisplayInfo> displays, bool force = false)
     {
         var profile = _settings.Profile(_state.ActiveProfileId);
         if (profile == null || !profile.RememberManualPosition || profile.Mode != ProfileMode.Extend) return false;
+        var active = displays.Where(d => d.Active && d.IsReady).ToList();
+        var physical = active.Where(d => !d.IsParsec).ToList();
+        if (physical.Count == 0 || !physical.Any(d => d.Primary))
+        {
+            Log.Info("忽略当前布局快照：没有激活的物理主屏（显示器可能正在重新连接）");
+            return false;
+        }
+        if (!force)
+        {
+            // the physical displays must be the ones the apply saw (a monitor that dropped off the DP link changes the
+            // set); virtual displays come and go with stand-by, so they are not part of this comparison
+            var expected = _state.LastAppliedActiveIds;
+            var current = physical.Select(d => d.SunshineDeviceId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (expected.Count > 0 && !current.SetEquals(expected))
+            {
+                Log.Info($"忽略当前布局快照：激活的物理显示器与方案生效时不同（{string.Join(",", physical.Select(d => d.Label))}）");
+                return false;
+            }
+        }
+        foreach (var v in active.Where(d => d.IsParsec))
+        {
+            if (physical.Any(p => Overlaps(v, p)))
+            {
+                Log.Info($"忽略当前布局快照：{v.GdiName} 与物理显示器重叠 ({v.PositionX},{v.PositionY})");
+                return false;
+            }
+        }
+
         var changed = false;
         foreach (var spec in profile.VirtualDisplays)
         {
-            var d = displays.FirstOrDefault(x => x.IsParsec && x.Active && x.ParsecSlot == spec.Slot);
+            var d = active.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot);
             if (d == null) continue;
             if (spec.Placement == Placement.Custom && spec.X == d.PositionX && spec.Y == d.PositionY) continue;
             spec.Placement = Placement.Custom;
@@ -263,9 +298,25 @@ public sealed class ProfileEngine
             changed = true;
             Log.Info($"记住虚拟屏 #{spec.Slot + 1} 的手动位置 ({d.PositionX},{d.PositionY})（方案「{profile.Name}」）");
         }
-        if (changed) _settings.Save();
+        foreach (var p in physical)
+        {
+            var key = p.SunshineDeviceId;
+            if (string.IsNullOrEmpty(key)) continue;
+            if (_state.PhysicalLayout.TryGetValue(key, out var old) && old.X == p.PositionX && old.Y == p.PositionY && old.Primary == p.Primary && old.Width == p.Width && old.Height == p.Height) continue;
+            _state.PhysicalLayout[key] = new DisplayPlacement { X = p.PositionX, Y = p.PositionY, Width = p.Width, Height = p.Height, Primary = p.Primary, Label = p.Label };
+            changed = true;
+            Log.Info($"记住物理显示器 {p.Label} 的位置 ({p.PositionX},{p.PositionY}){(p.Primary ? " 主屏" : string.Empty)}");
+        }
+        if (changed)
+        {
+            _settings.Save();
+            _state.Save();
+        }
         return changed;
     }
+
+    private static bool Overlaps(DisplayInfo a, DisplayInfo b)
+        => a.PositionX < b.PositionX + b.Width && b.PositionX < a.PositionX + a.Width && a.PositionY < b.PositionY + b.Height && b.PositionY < a.PositionY + a.Height;
 
     private void Step(ApplyResult result, string text)
     {
@@ -469,6 +520,8 @@ public sealed class ProfileEngine
             _state.ExpectedVirtualDisplays = want;
             _state.ExpectedInstances = mapping.Keys.OrderBy(k => k).ToList();
             _state.InstanceOutputIds = mapping;
+            // the physical displays this apply saw (the reference for "did the user rearrange something" later)
+            _state.LastAppliedActiveIds = DisplayManager.Enumerate().Where(d => d.Active && d.IsReady && !d.IsParsec).Select(d => d.SunshineDeviceId).ToList();
             _state.Save();
             _settings.ActiveProfileId = profile.Id;
             _settings.Save();
@@ -753,16 +806,21 @@ public sealed class ProfileEngine
     }
 
     // ------------------------------------------------------------------ layouts
-    private static (int X, int Y) PlaceRelative(VirtualDisplaySpec spec, DisplayInfo anchor, int cursorX, int cursorY)
+    private readonly record struct Rect(int X, int Y, int Width, int Height)
+    {
+        public bool Overlaps(Rect o) => X < o.X + o.Width && o.X < X + Width && Y < o.Y + o.Height && o.Y < Y + Height;
+    }
+
+    private static (int X, int Y) PlaceRelative(VirtualDisplaySpec spec, Rect anchor, int cursorX, int cursorY)
     {
         return spec.Placement switch
         {
-            Placement.Right => (cursorX, anchor.PositionY),
-            Placement.Left => (anchor.PositionX - spec.Width - (cursorX - (anchor.PositionX + anchor.Width)), anchor.PositionY),
-            Placement.Above => (anchor.PositionX, anchor.PositionY - spec.Height),
-            Placement.Below => (anchor.PositionX, anchor.PositionY + anchor.Height + cursorY),
-            Placement.Custom => (spec.X ?? cursorX, spec.Y ?? anchor.PositionY),
-            _ => (cursorX, anchor.PositionY)
+            Placement.Right => (cursorX, anchor.Y),
+            Placement.Left => (anchor.X - spec.Width - (cursorX - (anchor.X + anchor.Width)), anchor.Y),
+            Placement.Above => (anchor.X, anchor.Y - spec.Height),
+            Placement.Below => (anchor.X, anchor.Y + anchor.Height + cursorY),
+            Placement.Custom => (spec.X ?? cursorX, spec.Y ?? anchor.Y),
+            _ => (cursorX, anchor.Y)
         };
     }
 
@@ -774,16 +832,41 @@ public sealed class ProfileEngine
         }
         parsec = parsec.Where(p => p.IsReady).ToList();
         var items = new List<LayoutItem>();
+        var physicalActive = all.Where(d => d.Active && !d.IsParsec).ToList();
+        // physical displays: the arrangement the user last made (state) when every remembered display is present,
+        // otherwise whatever Windows currently has
+        var remembered = physicalActive.Count > 0 && physicalActive.All(d => _state.PhysicalLayout.ContainsKey(d.SunshineDeviceId))
+                         && _state.PhysicalLayout.Values.Count(v => v.Primary) == 1;
+        if (remembered)
+        {
+            var rememberedPrimary = physicalActive.FirstOrDefault(d => _state.PhysicalLayout[d.SunshineDeviceId].Primary);
+            if (rememberedPrimary != null && primary != null && rememberedPrimary.GdiName != primary.GdiName)
+            {
+                Step(result, $"按记忆把主屏恢复为 {rememberedPrimary.Label}");
+                primary = rememberedPrimary;
+            }
+        }
+        var physicalRects = new List<Rect>();
+        Rect? anchor = null;
         if (primary != null)
         {
-            items.Add(new LayoutItem { GdiName = primary.GdiName, Attached = true, Primary = true, X = primary.PositionX, Y = primary.PositionY });
-            foreach (var other in all.Where(d => d.Active && !d.IsParsec && d.GdiName != primary.GdiName))
+            var pp = remembered ? _state.PhysicalLayout[primary.SunshineDeviceId] : null;
+            var px = pp?.X ?? primary.PositionX;
+            var py = pp?.Y ?? primary.PositionY;
+            items.Add(new LayoutItem { GdiName = primary.GdiName, Attached = true, Primary = true, X = px, Y = py });
+            anchor = new Rect(px, py, primary.Width, primary.Height);
+            physicalRects.Add(anchor.Value);
+            foreach (var other in physicalActive.Where(d => d.GdiName != primary.GdiName))
             {
-                items.Add(new LayoutItem { GdiName = other.GdiName, Attached = true, X = other.PositionX, Y = other.PositionY });
+                var op = remembered ? _state.PhysicalLayout[other.SunshineDeviceId] : null;
+                var ox = op?.X ?? other.PositionX;
+                var oy = op?.Y ?? other.PositionY;
+                items.Add(new LayoutItem { GdiName = other.GdiName, Attached = true, X = ox, Y = oy });
+                physicalRects.Add(new Rect(ox, oy, other.Width, other.Height));
             }
         }
 
-        var cursorX = primary != null ? primary.PositionX + primary.Width : 0;
+        var cursorX = anchor.HasValue ? anchor.Value.X + anchor.Value.Width : 0;
         var belowY = 0;
         foreach (var spec in specs)
         {
@@ -792,8 +875,26 @@ public sealed class ProfileEngine
             var (rw, rh) = ResolveResolution(profile, spec, d.GdiName);
             var hz = ResolveHz(profile, spec, d.GdiName, rw, rh);
             var mode = PickMode(d.GdiName, rw, rh, hz, result, spec.Slot);
-            var (x, y) = primary != null ? PlaceRelative(spec, primary, cursorX, belowY) : (cursorX, 0);
-            if (spec.Placement == Placement.Custom && spec.X.HasValue && spec.Y.HasValue) { x = spec.X.Value; y = spec.Y.Value; }
+            var (x, y) = anchor.HasValue ? PlaceRelative(spec, anchor.Value, cursorX, belowY) : (cursorX, 0);
+            if (spec.Placement == Placement.Custom && spec.X.HasValue && spec.Y.HasValue)
+            {
+                // a remembered position that overlaps a physical display is a snapshot taken mid hot-plug: drop it
+                var want = new Rect(spec.X.Value, spec.Y.Value, mode.Width, mode.Height);
+                if (physicalRects.Any(r => r.Overlaps(want)))
+                {
+                    Step(result, $"⚠ 虚拟屏 #{spec.Slot + 1} 记住的位置 ({spec.X},{spec.Y}) 与物理显示器重叠，改回默认摆放（主屏右侧）");
+                    spec.Placement = Placement.Right;
+                    spec.X = null;
+                    spec.Y = null;
+                    _settings.Save();
+                    (x, y) = anchor.HasValue ? PlaceRelative(spec, anchor.Value, cursorX, belowY) : (cursorX, 0);
+                }
+                else
+                {
+                    x = spec.X.Value;
+                    y = spec.Y.Value;
+                }
+            }
             items.Add(new LayoutItem
             {
                 GdiName = d.GdiName,

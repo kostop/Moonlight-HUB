@@ -41,6 +41,8 @@ public partial class ToolsView : UserControl, IRefreshable
         if ((DateTime.UtcNow - _lastTasks) > TimeSpan.FromSeconds(30))
         {
             _lastTasks = DateTime.UtcNow;
+            FastStartupBtn.IsEnabled = FastStartupEnabled();
+            if (!FastStartupBtn.IsEnabled) FastStartupText.Text = "快速启动已关闭：每次开机驱动都会完整初始化。";
             _ = Task.Run(() =>
             {
                 var parts = TaskSchedulerHelper.LegacyTaskNames.Select(n => { var t = TaskSchedulerHelper.Query(n); return t.Exists ? $"{n}: {t.Status}" : null; }).Where(s => s != null).ToList();
@@ -109,6 +111,29 @@ public partial class ToolsView : UserControl, IRefreshable
 
     private void OpenScripts_Click(object sender, RoutedEventArgs e) => ProcessUtil.OpenInShell(Directory.Exists(Hub.Settings.ScriptsDir) ? Hub.Settings.ScriptsDir : Paths.RepoRoot);
     private void OpenSunshine_Click(object sender, RoutedEventArgs e) => ProcessUtil.OpenInShell(Hub.Settings.SunshineDir);
+
+    private static bool FastStartupEnabled()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Control\Session Manager\Power");
+            return key?.GetValue("HiberbootEnabled") is int v && v != 0;
+        }
+        catch { return false; }
+    }
+
+    private void FastStartup_Click(object sender, RoutedEventArgs e)
+    {
+        if (!FastStartupEnabled()) { _window.Toast("快速启动", "快速启动已经是关闭状态"); return; }
+        var prompt = ProcessUtil.IsElevated() ? string.Empty : "（会弹出 UAC 提示）";
+        if (MessageBox.Show(_window, "关闭 Windows 快速启动？下次开机会完整初始化驱动，开机时间略长。" + prompt, "快速启动", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        Ui.RunAsync(_window, () => Task.Run(() =>
+        {
+            var code = ProcessUtil.IsElevated() ? ElevatedOps.Run(new[] { "disable-fast-startup" }) : ProcessUtil.RunSelfElevated("--elevated disable-fast-startup");
+            if (code != 0) throw new InvalidOperationException(code == -1 ? "用户取消了 UAC 提示" : $"退出码 {code}");
+            Dispatcher.BeginInvoke(() => FastStartupText.Text = "快速启动已关闭（HiberbootEnabled = 0）。");
+        }), "快速启动", "已关闭");
+    }
     private void OpenWeb_Click(object sender, RoutedEventArgs e) => ProcessUtil.OpenInShell($"https://localhost:{(Hub.Settings.Instance(1)?.WebPort ?? 47990)}/");
     private void OpenParsec_Click(object sender, RoutedEventArgs e) => ProcessUtil.OpenInShell(Hub.Settings.ParsecVDisplayExe);
     private void OpenData_Click(object sender, RoutedEventArgs e) => ProcessUtil.OpenInShell(Paths.DataDir);

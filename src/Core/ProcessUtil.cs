@@ -143,6 +143,26 @@ public static class ProcessUtil
         }
     }
 
+    /// <summary>Starts an elevated copy of this executable and returns immediately. False when the UAC prompt was cancelled.</summary>
+    public static bool StartSelfElevatedDetached(string arguments)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(Paths.ExePath, arguments)
+            {
+                UseShellExecute = true,
+                Verb = "runas",
+                WorkingDirectory = Paths.ExeDir,
+            };
+            using var p = Process.Start(psi);
+            return p != null;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
+    }
+
     public static (int ExitCode, string Output) Run(string file, string arguments, int timeoutMs = 60000, string? workingDir = null)
     {
         var psi = new ProcessStartInfo(file, arguments)

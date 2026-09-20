@@ -43,6 +43,28 @@ public partial class App : Application
         }
 
         var replace = args.Contains("--replace");
+
+        // Run with administrator rights (like ParsecVDisplay does) so the Parsec adapter can be restarted / installed and
+        // custom modes registered without UAC prompts. The logon task already starts us elevated; a manual launch or the
+        // hot-update script re-launches through ShellExecute "runas" before touching the driver or the old instance.
+        if (!args.Contains("--no-elevate") && !ProcessUtil.IsElevated() && HubSettings.Load().RunElevated)
+        {
+            if (!replace && !IsFirstInstance())
+            {
+                try { using var evt = EventWaitHandle.OpenExisting(ShowEventName); evt.Set(); } catch { }
+                Shutdown();
+                return;
+            }
+            var forwarded = string.Join(" ", args.Select(a => a.Contains(' ') ? $"\"{a}\"" : a));
+            if (ProcessUtil.StartSelfElevatedDetached(forwarded))
+            {
+                Log.Info("以管理员权限重新启动 Moonlight Hub" + (forwarded.Length > 0 ? " (" + forwarded + ")" : string.Empty));
+                Shutdown();
+                return;
+            }
+            Log.Warn("无法以管理员权限启动（UAC 被取消），以普通权限继续运行：驱动异常时需要手动确认提权");
+        }
+
         if (replace)
         {
             // Hot replace: keep the driver alive from this process before asking the old instance to leave,
@@ -101,6 +123,7 @@ public partial class App : Application
         AppDomain.CurrentDomain.UnhandledException += (_, ex) => Log.Error("未处理的异常: " + ex.ExceptionObject);
         TaskScheduler.UnobservedTaskException += (_, ex) => { Log.Error("后台任务异常", ex.Exception); ex.SetObserved(); };
 
+        Log.Info($"进程权限: {(ProcessUtil.IsElevated() ? "管理员" : "普通用户")}");
         _hub = new Hub();
         _window = new MainWindow(_hub);
         _tray = new TrayIcon(_hub, _window);
@@ -124,6 +147,24 @@ public partial class App : Application
             _handoffVdd?.Dispose();
             _handoffVdd = null;
         });
+    }
+
+    /// <summary>True when no other hub instance holds the single-instance mutex (the probe releases it again immediately).</summary>
+    private static bool IsFirstInstance()
+    {
+        try
+        {
+            using var probe = new Mutex(false, @"Local\MoonlightHub.SingleInstance");
+            bool got;
+            try { got = probe.WaitOne(0); }
+            catch (AbandonedMutexException) { got = true; }
+            if (got) probe.ReleaseMutex();
+            return got;
+        }
+        catch
+        {
+            return true;
+        }
     }
 
     private void StartExitListener()

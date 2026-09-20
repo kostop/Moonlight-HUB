@@ -80,32 +80,93 @@ public sealed unsafe class ParsecVdd : IDisposable
         return null;
     }
 
+    /// <summary>True when the adapter exposes its device interface, i.e. the driver is installed and the device started.</summary>
     public static bool IsDriverPresent() => FindDevicePath() != null;
 
-    /// <summary>PnP status of the adapter device ("OK", "Error (code)", or "missing") via pnputil, for diagnostics.</summary>
-    public static string QueryAdapterStatus()
+    public enum DeviceHealth
     {
-        try
-        {
-            var (code, output) = ProcessUtil.Run("pnputil.exe", "/enum-devices /instanceid \"ROOT\\DISPLAY\\0000\"", 15000);
-            if (code != 0) return "missing";
-            foreach (var raw in output.Split('\n'))
-            {
-                var line = raw.Trim();
-                if (line.StartsWith("Status:", StringComparison.OrdinalIgnoreCase) || line.StartsWith("状态:", StringComparison.Ordinal))
-                {
-                    return line[(line.IndexOf(':') + 1)..].Trim();
-                }
-            }
-            return "unknown";
-        }
-        catch
-        {
-            return "unknown";
-        }
+        /// <summary>No "Root\Parsec\VDA" device node: the driver package was never installed (or was uninstalled).</summary>
+        Missing,
+        /// <summary>Device node exists and is started.</summary>
+        Ok,
+        /// <summary>Device node exists but reports a problem code (typically 43 FAILED_POST_START after the user-mode driver host died).</summary>
+        Problem,
+        /// <summary>Device node exists but was disabled in Device Manager.</summary>
+        Disabled,
     }
 
-    /// <summary>Restarts the adapter device (needs administrator rights; re-launches the hub elevated when necessary).</summary>
+    public sealed record DeviceState(DeviceHealth Health, string InstanceId, uint Status, uint Problem)
+    {
+        public string Text => Health switch
+        {
+            DeviceHealth.Missing => "驱动未安装",
+            DeviceHealth.Ok => "设备正常",
+            DeviceHealth.Disabled => "设备已被禁用",
+            _ => Problem switch
+            {
+                NativeMethods.CM_PROB_FAILED_POST_START => "设备异常 (代码 43，驱动进程曾停止响应)",
+                NativeMethods.CM_PROB_FAILED_START => "设备无法启动 (代码 10)",
+                _ => $"设备异常 (代码 {Problem})"
+            }
+        };
+    }
+
+    /// <summary>
+    /// PnP state of the adapter device node, found by hardware id (the instance id is usually ROOT\DISPLAY\0000 but other
+    /// virtual display drivers may have taken that slot). Pure SetupAPI/cfgmgr32: no pnputil process, safe to call every tick.
+    /// </summary>
+    public static DeviceState QueryDeviceState()
+    {
+        var guid = Guid.Empty;
+        var set = NativeMethods.SetupDiGetClassDevsW(ref guid, null, IntPtr.Zero, NativeMethods.DIGCF_ALLCLASSES | NativeMethods.DIGCF_PRESENT);
+        if (set == IntPtr.Zero || set == new IntPtr(-1)) return new DeviceState(DeviceHealth.Missing, string.Empty, 0, 0);
+        try
+        {
+            var info = new NativeMethods.SP_DEVINFO_DATA { cbSize = (uint)Marshal.SizeOf<NativeMethods.SP_DEVINFO_DATA>() };
+            var buffer = Marshal.AllocHGlobal(4096);
+            try
+            {
+                for (uint i = 0; NativeMethods.SetupDiEnumDeviceInfo(set, i, ref info); i++)
+                {
+                    if (!NativeMethods.SetupDiGetDeviceRegistryPropertyW(set, ref info, NativeMethods.SPDRP_HARDWAREID, out _, buffer, 4096, out var size) || size < 4) continue;
+                    var ids = Marshal.PtrToStringUni(buffer, (int)size / 2) ?? string.Empty;
+                    if (!ids.Split('\0', StringSplitOptions.RemoveEmptyEntries).Any(id => id.Equals(HardwareId, StringComparison.OrdinalIgnoreCase))) continue;
+
+                    var instanceId = string.Empty;
+                    if (NativeMethods.SetupDiGetDeviceInstanceIdW(set, ref info, buffer, 2048, out _)) instanceId = Marshal.PtrToStringUni(buffer) ?? string.Empty;
+                    if (NativeMethods.CM_Get_DevNode_Status(out var status, out var problem, info.DevInst, 0) != 0)
+                    {
+                        return new DeviceState(DeviceHealth.Problem, instanceId, 0, 0);
+                    }
+                    var health = (status & NativeMethods.DN_HAS_PROBLEM) != 0
+                        ? (problem == NativeMethods.CM_PROB_DISABLED ? DeviceHealth.Disabled : DeviceHealth.Problem)
+                        : (status & NativeMethods.DN_STARTED) != 0 ? DeviceHealth.Ok : DeviceHealth.Problem;
+                    return new DeviceState(health, instanceId, status, problem);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        finally
+        {
+            NativeMethods.SetupDiDestroyDeviceInfoList(set);
+        }
+        return new DeviceState(DeviceHealth.Missing, string.Empty, 0, 0);
+    }
+
+    /// <summary>Human readable adapter status for the UI / logs.</summary>
+    public static string QueryAdapterStatus()
+    {
+        try { return QueryDeviceState().Text; }
+        catch (Exception ex) { return "unknown: " + ex.Message; }
+    }
+
+    /// <summary>
+    /// Restarts the adapter device node (disable/enable through pnputil). Needs administrator rights: when this process
+    /// is elevated it runs directly, otherwise a UAC prompt for an elevated helper copy of the hub appears.
+    /// </summary>
     public static (bool Ok, string Message) RestartAdapter()
     {
         if (ProcessUtil.IsElevated())
@@ -121,6 +182,69 @@ public sealed unsafe class ParsecVdd : IDisposable
             -2 => (false, "提权进程超时"),
             _ => (false, $"提权重启失败，退出码 {result}")
         };
+    }
+
+    /// <summary>Restarts the adapter and waits until its device interface is back (caller must be elevated).</summary>
+    public static (bool Ok, string Message) RestartAdapterAndWait(TimeSpan wait)
+    {
+        var (ok, msg) = RestartAdapter();
+        if (!ok) return (false, msg);
+        var deadline = DateTime.UtcNow + wait;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (IsDriverPresent()) return (true, msg);
+            Thread.Sleep(500);
+        }
+        return (false, "适配器已重启，但设备接口没有在 " + wait.TotalSeconds + " 秒内出现: " + QueryAdapterStatus());
+    }
+
+    /// <summary>The driver installer shipped next to the hub (Parsec's signed parsec-vdd-setup.exe, run with -silent like ParsecVDisplay does).</summary>
+    public static string BundledSetupPath => System.IO.Path.Combine(Paths.ExeDir, "drivers", "parsec-vdd-setup.exe");
+    public static bool HasBundledSetup => System.IO.File.Exists(BundledSetupPath);
+
+    /// <summary>
+    /// Installs (or repairs) the Parsec virtual display driver from the bundled installer. Needs administrator rights;
+    /// the installer itself elevates when this process is not elevated (UAC prompt).
+    /// </summary>
+    public static (bool Ok, string Message) InstallDriver()
+    {
+        if (!HasBundledSetup) return (false, "找不到随附的驱动安装包 " + BundledSetupPath);
+        try
+        {
+            Log.Info("开始安装 Parsec 虚拟显示驱动: " + BundledSetupPath + " -silent");
+            var psi = new System.Diagnostics.ProcessStartInfo(BundledSetupPath, "-silent")
+            {
+                UseShellExecute = true,
+                Verb = ProcessUtil.IsElevated() ? string.Empty : "runas",
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                WorkingDirectory = System.IO.Path.GetDirectoryName(BundledSetupPath) ?? Paths.ExeDir,
+            };
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return (false, "无法启动驱动安装程序");
+            if (!p.WaitForExit(240000)) { try { p.Kill(); } catch { } return (false, "驱动安装程序超时"); }
+            Log.Info($"驱动安装程序退出码 {p.ExitCode}");
+            var deadline = DateTime.UtcNow.AddSeconds(45);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (IsDriverPresent()) return (true, "驱动已安装，设备已就绪");
+                Thread.Sleep(1000);
+            }
+            var state = QueryDeviceState();
+            return state.Health switch
+            {
+                DeviceHealth.Missing => (false, $"安装程序已结束（退出码 {p.ExitCode}），但没有出现 Parsec 设备；可能需要重启电脑完成安装"),
+                DeviceHealth.Ok => (true, "驱动已安装"),
+                _ => (false, "驱动已安装但设备状态为: " + state.Text)
+            };
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return (false, "用户取消了 UAC 提示");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
     }
 
     public bool Open()
@@ -169,6 +293,8 @@ public sealed unsafe class ParsecVdd : IDisposable
         StopPing();
         _handle?.Dispose();
         _handle = null;
+        Faulted = false;
+        ConsecutivePingFailures = 0;
         StateChanged?.Invoke();
     }
 
@@ -205,6 +331,8 @@ public sealed unsafe class ParsecVdd : IDisposable
             {
                 ConsecutivePingFailures++;
                 LastError = "keep-alive 失败: " + ex.Message;
+                if (ConsecutivePingFailures == 1) Log.Warn("VDD keep-alive 失败: " + ex.Message);
+                if (Faulted) { _pinging = false; break; } // the device is gone; the watchdog restarts it
             }
             Thread.Sleep(Math.Clamp(PingIntervalMs, 10, 90));
         }
@@ -257,34 +385,62 @@ public sealed unsafe class ParsecVdd : IDisposable
     /// One IOCTL round-trip. Deliberately lock-free: the driver completes ADD/REMOVE only while UPDATE pings keep
     /// arriving, so the keep-alive thread must never be blocked by another call (each call owns its buffers/event).
     /// </summary>
+    /// <summary>Set when an IOCTL timed out: the user-mode driver host is most likely gone and the device needs a restart.</summary>
+    public bool Faulted { get; private set; }
+    public DateTime LastFaultUtc { get; private set; }
+
     private int IoControl(uint code, ReadOnlySpan<byte> input)
     {
         var handle = _handle ?? throw new InvalidOperationException("Parsec VDD 设备未打开");
-        byte* inBuffer = stackalloc byte[32];
-        byte* outBuffer = stackalloc byte[32];
-        for (var i = 0; i < 32; i++) { inBuffer[i] = 0; outBuffer[i] = 0; }
+        // The OVERLAPPED block and both buffers live on the native heap: if the driver never completes the request
+        // (dead UMDF host) the kernel may still touch them after we give up, so they are leaked instead of freed
+        // (stack memory would have been reused → silent memory corruption).
+        const int block = 64 + 32 + 32;
+        var mem = (byte*)NativeMemory.AllocZeroed(block);
+        var overlapped = (NativeOverlapped*)mem;
+        var inBuffer = mem + 64;
+        var outBuffer = mem + 96;
         var copy = Math.Min(input.Length, 32);
         for (var i = 0; i < copy; i++) inBuffer[i] = input[i];
 
         var started = System.Diagnostics.Stopwatch.StartNew();
-        var overlapped = new NativeOverlapped();
-        overlapped.EventHandle = NativeMethods.CreateEventW(IntPtr.Zero, false, false, null);
+        overlapped->EventHandle = NativeMethods.CreateEventW(IntPtr.Zero, false, false, null);
+        var completed = false;
         try
         {
-            var ok = NativeMethods.DeviceIoControl(handle, code, inBuffer, 32, outBuffer, 32, out _, &overlapped);
+            var ok = NativeMethods.DeviceIoControl(handle, code, inBuffer, 32, outBuffer, 32, out _, overlapped);
             if (!ok)
             {
                 var err = Marshal.GetLastWin32Error();
                 if (err != NativeMethods.ERROR_IO_PENDING)
                 {
+                    completed = true;
                     throw new InvalidOperationException($"DeviceIoControl(0x{code:X8}) 失败: Win32 错误 {err}");
                 }
             }
-            if (!NativeMethods.GetOverlappedResultEx(handle, &overlapped, out _, IoTimeoutMs, false))
+            if (!NativeMethods.GetOverlappedResultEx(handle, overlapped, out _, IoTimeoutMs, false))
             {
                 var err = Marshal.GetLastWin32Error();
+                // give the driver a chance to complete the cancelled request so the buffers can be released
+                NativeMethods.CancelIoEx(handle, overlapped);
+                if (NativeMethods.GetOverlappedResultEx(handle, overlapped, out _, 3000, false))
+                {
+                    completed = true;
+                }
+                else
+                {
+                    var err2 = Marshal.GetLastWin32Error();
+                    // 995 OPERATION_ABORTED = cancelled and done; 258 / 996 / 997 = still owned by the driver
+                    completed = err2 != 258 && err2 != 996 && err2 != NativeMethods.ERROR_IO_PENDING;
+                }
+                if (code != IoctlUpdate || err != 258)
+                {
+                    Faulted = true;
+                    LastFaultUtc = DateTime.UtcNow;
+                }
                 throw new InvalidOperationException($"DeviceIoControl(0x{code:X8}) 等待结果失败: Win32 错误 {err}");
             }
+            completed = true;
             var result = *(int*)outBuffer;
             if (code != IoctlUpdate)
             {
@@ -294,7 +450,9 @@ public sealed unsafe class ParsecVdd : IDisposable
         }
         finally
         {
-            if (overlapped.EventHandle != IntPtr.Zero) NativeMethods.CloseHandle(overlapped.EventHandle);
+            if (overlapped->EventHandle != IntPtr.Zero) NativeMethods.CloseHandle(overlapped->EventHandle);
+            if (completed) NativeMemory.Free(mem);
+            else Log.Warn($"VDD IOCTL 0x{code:X8} 未完成，缓冲区保留不释放（驱动可能已停止响应）");
         }
     }
 

@@ -24,13 +24,26 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
     {
         var vdd = Hub.Vdd;
         var present = ParsecVdd.IsDriverPresent();
-        DriverText.Text = !present ? "未检测到 Parsec Virtual Display Adapter（请安装 ParsecVDisplay 附带的驱动）"
-            : vdd.IsOpen ? $"已连接 · 驱动版本 0.{vdd.Version} · {vdd.DevicePath}"
-            : "驱动已安装，尚未连接 · " + (vdd.LastError ?? string.Empty);
+        if (!present && (DateTime.UtcNow - _deviceStateUtc) > TimeSpan.FromSeconds(3))
+        {
+            _deviceStateUtc = DateTime.UtcNow;
+            try { _deviceState = ParsecVdd.QueryDeviceState(); } catch { _deviceState = null; }
+        }
+        var elevated = ProcessUtil.IsElevated();
+        DriverText.Text = present
+            ? (vdd.IsOpen ? $"已连接 · 驱动版本 0.{vdd.Version} · {vdd.DevicePath}" : "驱动已安装，尚未连接 · " + (vdd.LastError ?? string.Empty))
+            : _deviceState?.Health switch
+            {
+                ParsecVdd.DeviceHealth.Missing => "驱动未安装" + (ParsecVdd.HasBundledSetup ? "：点击「安装驱动」即可（驱动随本程序一起提供）" : "，且找不到随附的驱动安装包"),
+                ParsecVdd.DeviceHealth.Disabled => $"设备已被禁用 ({_deviceState.InstanceId})" + (elevated ? " · 守护会自动启用" : " · 点击「重启适配器」"),
+                _ => $"{_deviceState?.Text ?? "设备状态未知"} ({_deviceState?.InstanceId})" + (elevated ? " · 守护正在自动恢复" : " · 当前不是管理员权限，点击「重启适配器」需要确认 UAC"),
+            };
         PingText.Text = vdd.IsOpen
             ? (vdd.IsPinging ? $"keep-alive 运行中 · 间隔 {vdd.PingIntervalMs}ms · 上次 {(vdd.LastPingUtc == default ? "—" : (DateTime.UtcNow - vdd.LastPingUtc).TotalMilliseconds.ToString("0") + "ms 前")} · 连续失败 {vdd.ConsecutivePingFailures}" : "keep-alive 未运行！虚拟屏会被驱动移除")
-            : string.Empty;
+            : (elevated ? "本程序以管理员权限运行：驱动异常会自动重启，无需手动操作" : "本程序未以管理员权限运行：驱动异常时需要手动确认 UAC（设置里可开启“以管理员权限运行”）");
         OpenBtn.IsEnabled = present && !vdd.IsOpen;
+        InstallDriverBtn.Visibility = !present && _deviceState?.Health == ParsecVdd.DeviceHealth.Missing && ParsecVdd.HasBundledSetup ? Visibility.Visible : Visibility.Collapsed;
+        RestartAdapterBtn.Content = elevated ? "重启适配器" : "重启适配器 (需管理员)";
 
         if ((DateTime.UtcNow - _lastEnumerate) > TimeSpan.FromSeconds(2))
         {
@@ -104,19 +117,37 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
         Dispatcher.BeginInvoke(Refresh);
     }
 
+    private DateTime _deviceStateUtc = DateTime.MinValue;
+    private ParsecVdd.DeviceState? _deviceState;
+
     private void RestartAdapter_Click(object sender, RoutedEventArgs e)
     {
-        if (MessageBox.Show(_window, "重启 Parsec Virtual Display Adapter 设备会短暂移除所有虚拟屏，随后守护会自动重新应用当前方案。继续？（会弹出 UAC 提示）", "重启适配器", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        var prompt = ProcessUtil.IsElevated() ? string.Empty : "（会弹出 UAC 提示）";
+        if (MessageBox.Show(_window, "重启 Parsec Virtual Display Adapter 设备会短暂移除所有虚拟屏，随后守护会自动重新应用当前方案。继续？" + prompt, "重启适配器", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
         Ui.RunAsync(_window, () => Task.Run(() =>
         {
             Hub.Vdd.Close();
-            var (ok, msg) = ParsecVdd.RestartAdapter();
+            var (ok, msg) = ParsecVdd.RestartAdapterAndWait(TimeSpan.FromSeconds(25));
             Log.Info("重启 Parsec 适配器: " + msg);
             if (!ok) throw new InvalidOperationException(msg);
-            Thread.Sleep(3000);
             if (Hub.Vdd.Open() && Hub.ActiveProfile != null) _ = Hub.Engine.ApplyAsync(Hub.ActiveProfile);
             Invalidate();
         }), "适配器", "已重启，正在重新应用方案");
+    }
+
+    private void InstallDriver_Click(object sender, RoutedEventArgs e)
+    {
+        var prompt = ProcessUtil.IsElevated() ? string.Empty : "（会弹出 UAC 提示）";
+        if (MessageBox.Show(_window, "将安装随附的 Parsec 虚拟显示驱动 (parsec-vdd-setup.exe, Parsec Cloud 签名)。安装期间屏幕可能闪烁几秒。继续？" + prompt, "安装驱动", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        Ui.RunAsync(_window, () => Task.Run(() =>
+        {
+            var (ok, msg) = ParsecVdd.InstallDriver();
+            Log.Info("安装驱动: " + msg);
+            if (!ok) throw new InvalidOperationException(msg);
+            _deviceStateUtc = DateTime.MinValue;
+            if (Hub.Vdd.Open() && Hub.ActiveProfile != null) _ = Hub.Engine.ApplyAsync(Hub.ActiveProfile);
+            Invalidate();
+        }), "驱动", "驱动已安装，正在应用方案");
     }
 
     private void Open_Click(object sender, RoutedEventArgs e)

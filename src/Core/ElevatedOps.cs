@@ -29,18 +29,36 @@ public static class ElevatedOps
                     }
                 case "restart-parsec-adapter":
                     {
-                        var (code, output) = ProcessUtil.Run("pnputil.exe", "/restart-device \"ROOT\\DISPLAY\\0000\"", 60000);
-                        Log.Info($"[elevated] pnputil /restart-device => {code}: {output.Replace(Environment.NewLine, " ")}");
-                        if (code != 0)
+                        var state = ParsecVdd.QueryDeviceState();
+                        var instance = string.IsNullOrEmpty(state.InstanceId) ? @"ROOT\DISPLAY\0000" : state.InstanceId;
+                        if (state.Health == ParsecVdd.DeviceHealth.Disabled)
                         {
-                            // fall back to disable + enable
-                            ProcessUtil.Run("pnputil.exe", "/disable-device \"ROOT\\DISPLAY\\0000\"", 60000);
-                            Thread.Sleep(1500);
-                            var (code2, output2) = ProcessUtil.Run("pnputil.exe", "/enable-device \"ROOT\\DISPLAY\\0000\"", 60000);
-                            Log.Info($"[elevated] pnputil disable/enable => {code2}: {output2.Replace(Environment.NewLine, " ")}");
-                            return code2 == 0 ? 0 : 2;
+                            var (ce, oe) = ProcessUtil.Run("pnputil.exe", $"/enable-device \"{instance}\"", 60000);
+                            Log.Info($"[elevated] pnputil /enable-device => {ce}: {oe.Replace(Environment.NewLine, " ")}");
+                            return ce == 0 ? 0 : 2;
                         }
-                        return 0;
+                        var (code, output) = ProcessUtil.Run("pnputil.exe", $"/restart-device \"{instance}\"", 60000);
+                        Log.Info($"[elevated] pnputil /restart-device {instance} => {code}: {output.Replace(Environment.NewLine, " ")}");
+                        // a device with problem code 43 sometimes survives /restart-device: verify and fall back to disable + enable
+                        Thread.Sleep(1500);
+                        if (code == 0 && ParsecVdd.QueryDeviceState().Health == ParsecVdd.DeviceHealth.Ok) return 0;
+                        ProcessUtil.Run("pnputil.exe", $"/disable-device \"{instance}\"", 60000);
+                        Thread.Sleep(1500);
+                        var (code2, output2) = ProcessUtil.Run("pnputil.exe", $"/enable-device \"{instance}\"", 60000);
+                        Log.Info($"[elevated] pnputil disable/enable => {code2}: {output2.Replace(Environment.NewLine, " ")}");
+                        return code2 == 0 ? 0 : 2;
+                    }
+                case "install-parsec-driver":
+                    {
+                        var (ok, msg) = ParsecVdd.InstallDriver();
+                        Log.Info("[elevated] install-parsec-driver: " + msg);
+                        return ok ? 0 : 2;
+                    }
+                case "disable-fast-startup":
+                    {
+                        var (code, output) = ProcessUtil.Run("reg.exe", @"add ""HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power"" /v HiberbootEnabled /t REG_DWORD /d 0 /f", 15000);
+                        Log.Info($"[elevated] disable-fast-startup => {code}: {output.Replace(Environment.NewLine, " ")}");
+                        return code == 0 ? 0 : 2;
                     }
                 case "disable-legacy-tasks":
                     {

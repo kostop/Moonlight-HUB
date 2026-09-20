@@ -34,7 +34,7 @@ public partial class DisplaysView : UserControl, IRefreshable
             Log.Info("手动摆放显示器: " + r);
             if (!r.Success) throw new InvalidOperationException(r.ToString());
             Thread.Sleep(800);
-            Hub.Engine.RememberVirtualPositions(DisplayManager.Enumerate());
+            Hub.Engine.RememberLayout(DisplayManager.Enumerate(), force: true);
             Dispatcher.BeginInvoke(Invalidate);
         }));
     }

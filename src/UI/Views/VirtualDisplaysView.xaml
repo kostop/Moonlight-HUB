@@ -6,7 +6,8 @@
             <Border Style="{StaticResource Card}">
                 <DockPanel>
                     <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Top">
-                        <Button x:Name="RestartAdapterBtn" Content="重启适配器 (需管理员)" Style="{StaticResource GhostButton}" Click="RestartAdapter_Click" ToolTip="当驱动进入错误状态（设备管理器里 Parsec Virtual Display Adapter 带感叹号）时用这个恢复" />
+                        <Button x:Name="InstallDriverBtn" Content="安装驱动" Style="{StaticResource PrimaryButton}" Click="InstallDriver_Click" Visibility="Collapsed" ToolTip="安装随本程序提供的 Parsec 虚拟显示驱动（parsec-vdd-setup.exe）" />
+                        <Button x:Name="RestartAdapterBtn" Content="重启适配器" Style="{StaticResource GhostButton}" Click="RestartAdapter_Click" ToolTip="当驱动进入错误状态（设备管理器里 Parsec Virtual Display Adapter 带感叹号）时用这个恢复；以管理员权限运行时守护会自动做这件事" />
                         <Button x:Name="OpenBtn" Content="连接驱动" Style="{StaticResource GhostButton}" Click="Open_Click" />
                         <Button Content="添加虚拟屏" Style="{StaticResource PrimaryButton}" Click="Add_Click" />
                         <Button Content="全部移除" Style="{StaticResource DangerButton}" Click="RemoveAll_Click" Margin="0" />
@@ -15,8 +16,8 @@
                         <TextBlock Text="Parsec Virtual Display Driver" Style="{StaticResource H2}" />
                         <TextBlock x:Name="DriverText" Style="{StaticResource Muted}" Margin="0,4,0,0" Text="—" />
                         <TextBlock x:Name="PingText" Style="{StaticResource Muted}" Text="" />
-                        <TextBlock Style="{StaticResource Muted}" Margin="0,8,0,0"
-                                   Text="驱动要求每 100ms 内收到一次 keep-alive，否则会自动移除所有虚拟屏（这就是旧脚本里副屏几秒后消失的原因）。只要本程序在运行，虚拟屏就会一直保持。" />
+                        <TextBlock Style="{StaticResource Muted}" Margin="0,8,0,0" TextWrapping="Wrap"
+                                   Text="驱动要求每 100ms 内收到一次 keep-alive，否则会自动移除所有虚拟屏。只要本程序在运行，虚拟屏就会一直保持。显示器热插拔（DP 链路重连、切换输入源、远程桌面改分辨率）可能让驱动进程停止响应（设备管理器里出现感叹号），守护会自动重启适配器并重新应用方案。" />
                     </StackPanel>
                 </DockPanel>
             </Border>

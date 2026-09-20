@@ -72,8 +72,24 @@ public static class TaskSchedulerHelper
 
     public static bool IsHubAutostartRegistered() => Query(HubTaskName).Exists;
 
-    /// <summary>Registers a logon task (interactive token, no time limit, limited privileges) that starts the hub minimized.</summary>
-    public static (bool Ok, string Message) RegisterHubAutostart()
+    /// <summary>The executable path and run level of the registered hub task (null when not registered).</summary>
+    public static (string Exe, bool Highest)? QueryHubTask()
+    {
+        var (code, output) = ProcessUtil.Run("schtasks.exe", $"/Query /TN \"{HubTaskName}\" /XML", 15000);
+        if (code != 0) return null;
+        var cmd = System.Text.RegularExpressions.Regex.Match(output, "<Command>(.*?)</Command>");
+        var level = System.Text.RegularExpressions.Regex.Match(output, "<RunLevel>(.*?)</RunLevel>");
+        if (!cmd.Success) return null;
+        var exe = System.Net.WebUtility.HtmlDecode(cmd.Groups[1].Value.Trim());
+        return (exe, level.Success && level.Groups[1].Value.Trim().Equals("HighestAvailable", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Registers a logon task that starts the hub minimized. With <paramref name="elevated"/> the task runs with the
+    /// user's full administrator token (no UAC prompt at logon), which is what lets the hub restart / install the Parsec
+    /// driver by itself. The task also restarts the hub should it ever exit abnormally.
+    /// </summary>
+    public static (bool Ok, string Message) RegisterHubAutostart(bool elevated = true)
     {
         var user = WindowsIdentity.GetCurrent();
         var sid = user.User?.Value ?? string.Empty;
@@ -103,7 +119,7 @@ public static class TaskSchedulerHelper
     <Principal id=""Author"">
       <UserId>{Escape(sid)}</UserId>
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
+      <RunLevel>{(elevated ? "HighestAvailable" : "LeastPrivilege")}</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -112,6 +128,10 @@ public static class TaskSchedulerHelper
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>false</AllowHardTerminate>
     <StartWhenAvailable>true</StartWhenAvailable>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>20</Count>
+    </RestartOnFailure>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
     <IdleSettings>
       <StopOnIdleEnd>false</StopOnIdleEnd>
@@ -142,8 +162,14 @@ public static class TaskSchedulerHelper
             var (code, output) = ProcessUtil.Run("schtasks.exe", $"/Create /TN \"{HubTaskName}\" /XML \"{tmp}\" /F", 20000);
             if (code == 0)
             {
-                Log.Info("已注册开机自启任务 " + HubTaskName);
+                Log.Info($"已注册开机自启任务 {HubTaskName}（{(elevated ? "管理员权限" : "普通权限")}，{exe}）");
                 return (true, "已注册登录自启任务");
+            }
+            if (elevated && !ProcessUtil.IsElevated())
+            {
+                // creating a HighestAvailable task from a filtered token is refused on some systems: fall back to a plain task
+                Log.Warn("注册管理员权限的自启任务失败，改为普通权限: " + output.Replace(Environment.NewLine, " "));
+                return RegisterHubAutostart(false);
             }
             return (false, output);
         }

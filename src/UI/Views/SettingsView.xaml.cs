@@ -1,3 +1,4 @@
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using MoonlightHub.Core;
@@ -33,6 +34,17 @@ public partial class SettingsView : UserControl, IRefreshable
         CloseToTray.IsChecked = S.CloseToTray;
         AutoCreds.IsChecked = S.AutoManageCredentials;
         AutoPairPrompt.IsChecked = S.AutoPairingPrompt;
+        UseEmbedded.IsChecked = S.UseEmbeddedSunshine;
+        UseEmbedded.IsEnabled = Paths.HasEmbeddedSunshine;
+        EmbeddedText.Text = Paths.HasEmbeddedSunshine
+            ? (S.SunshineIsEmbedded ? $"当前使用随附的 Sunshine：{Paths.EmbeddedSunshineExe}；配置目录 {S.Instance1ConfigDir}" : $"随附的 Sunshine 位于 {Paths.EmbeddedSunshineExe}，当前使用的是 {S.SunshineExe}")
+            : "本程序目录下没有 sunshine\\sunshine.exe（源码运行或精简版），使用下面指定的 Sunshine";
+        RunElevated.IsChecked = S.RunElevated;
+        AutoRestartAdapter.IsChecked = S.AutoRestartAdapter;
+        AutoInstallDriver.IsChecked = S.AutoInstallDriver;
+        ElevationText.Text = ProcessUtil.IsElevated()
+            ? "当前进程：管理员权限"
+            : "当前进程：普通权限（勾选并保存后，下次启动时以管理员权限运行；开机自启任务会同步改为管理员权限）";
         PingMs.Text = S.VddPingMs.ToString();
         WatchdogSec.Text = S.WatchdogSeconds.ToString();
         StartupDelay.Text = S.StartupDelaySeconds.ToString();
@@ -50,13 +62,14 @@ public partial class SettingsView : UserControl, IRefreshable
             _lastAutostart = DateTime.UtcNow;
             _ = Task.Run(() =>
             {
-                var registered = TaskSchedulerHelper.IsHubAutostartRegistered();
+                var task = TaskSchedulerHelper.QueryHubTask();
+                var registered = task != null;
                 Dispatcher.BeginInvoke(() =>
                 {
                     _autostartSyncing = true;
                     AutoStartBox.IsChecked = registered;
                     _autostartSyncing = false;
-                    AutostartText.Text = "开机自启：" + (registered ? $"已注册计划任务「{TaskSchedulerHelper.HubTaskName}」，路径 {Paths.ExePath}" : "未注册");
+                    AutostartText.Text = "开机自启：" + (task != null ? $"已注册计划任务「{TaskSchedulerHelper.HubTaskName}」（{(task.Value.Highest ? "管理员权限" : "普通权限")}），路径 {task.Value.Exe}" : "未注册");
                 });
             });
         }
@@ -69,7 +82,7 @@ public partial class SettingsView : UserControl, IRefreshable
         AutostartText.Text = enable ? "正在注册…" : "正在取消…";
         _ = Task.Run(() =>
         {
-            var r = enable ? TaskSchedulerHelper.RegisterHubAutostart() : TaskSchedulerHelper.UnregisterHubAutostart();
+            var r = enable ? TaskSchedulerHelper.RegisterHubAutostart(S.RunElevated) : TaskSchedulerHelper.UnregisterHubAutostart();
             Dispatcher.BeginInvoke(() =>
             {
                 _lastAutostart = DateTime.MinValue;
@@ -201,6 +214,30 @@ public partial class SettingsView : UserControl, IRefreshable
         S.CloseToTray = CloseToTray.IsChecked == true;
         S.AutoManageCredentials = AutoCreds.IsChecked == true;
         S.AutoPairingPrompt = AutoPairPrompt.IsChecked == true;
+        var elevationChanged = S.RunElevated != (RunElevated.IsChecked == true);
+        S.RunElevated = RunElevated.IsChecked == true;
+        S.AutoRestartAdapter = AutoRestartAdapter.IsChecked == true;
+        S.AutoInstallDriver = AutoInstallDriver.IsChecked == true;
+        var embeddedChanged = S.UseEmbeddedSunshine != (UseEmbedded.IsChecked == true);
+        S.UseEmbeddedSunshine = UseEmbedded.IsChecked == true;
+        if (embeddedChanged)
+        {
+            if (!S.UseEmbeddedSunshine && S.SunshineIsEmbedded && File.Exists(@"D:\YingYong\Sunshine\sunshine.exe"))
+            {
+                S.SunshineExe = @"D:\YingYong\Sunshine\sunshine.exe";
+                S.Instance1ConfigDir = @"D:\YingYong\Sunshine\config";
+                S.InstancesRoot = @"D:\YingYong\Sunshine\instances";
+            }
+            S.ResolveSunshinePaths();
+            SunshineExe.Text = S.SunshineExe;
+            Instance1Dir.Text = S.Instance1ConfigDir;
+            InstancesRoot.Text = S.InstancesRoot;
+            _window.Toast("Sunshine", "Sunshine 路径已切换，重新应用方案后实例会从新位置启动");
+        }
+        if (elevationChanged && TaskSchedulerHelper.IsHubAutostartRegistered())
+        {
+            _ = Task.Run(() => TaskSchedulerHelper.RegisterHubAutostart(S.RunElevated));
+        }
         if (int.TryParse(PingMs.Text, out var ping)) S.VddPingMs = Math.Clamp(ping, 10, 90);
         if (int.TryParse(WatchdogSec.Text, out var wd)) S.WatchdogSeconds = Math.Clamp(wd, 2, 120);
         if (int.TryParse(StartupDelay.Text, out var sd)) S.StartupDelaySeconds = Math.Clamp(sd, 0, 120);

@@ -27,6 +27,8 @@
             <Border Style="{StaticResource Card}">
                 <StackPanel>
                     <TextBlock Text="路径" Style="{StaticResource H2}" Margin="0,0,0,10" />
+                    <CheckBox x:Name="UseEmbedded" Content="使用随本程序提供的 Sunshine（推荐；配置与配对信息保存在 Hub 数据目录，不依赖单独安装的 Sunshine）" Margin="0,0,0,6" />
+                    <TextBlock x:Name="EmbeddedText" Style="{StaticResource Muted}" Margin="0,0,0,8" Text="—" TextWrapping="Wrap" />
                     <Grid>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="170" />
@@ -58,6 +60,10 @@
                     <CheckBox x:Name="CloseToTray" Content="点击关闭按钮时隐藏到托盘" />
                     <CheckBox x:Name="AutoCreds" Content="自动管理 Sunshine Web 凭据（配对不再需要打开 Sunshine 网页；密码可在“客户端”页查看）" />
                     <CheckBox x:Name="AutoPairPrompt" Content="客户端发起配对时自动弹出 PIN 输入框" />
+                    <CheckBox x:Name="RunElevated" Content="以管理员权限运行（推荐；驱动异常时自动重启适配器、自动安装驱动、注册分辨率都不再弹 UAC）" Margin="0,8,0,0" />
+                    <CheckBox x:Name="AutoRestartAdapter" Content="Parsec 适配器停止响应时自动重启（显示器热插拔后驱动进程可能挂掉）" />
+                    <CheckBox x:Name="AutoInstallDriver" Content="检测不到 Parsec 驱动时自动安装随附的驱动" />
+                    <TextBlock x:Name="ElevationText" Style="{StaticResource Muted}" Margin="22,2,0,0" Text="—" />
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                         <TextBlock Text="keep-alive 间隔 (ms)" Style="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,8,0" />
                         <TextBox x:Name="PingMs" Width="70" />

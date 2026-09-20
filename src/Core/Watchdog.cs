@@ -93,7 +93,8 @@ public sealed class Watchdog : IDisposable
         }
         catch { }
         _manualChangeUtc = DateTime.UtcNow;
-        RequestVerify(TimeSpan.FromSeconds(4), "显示设置发生变化");
+        _lastDisplayChangeUtc = DateTime.UtcNow;
+        RequestVerify(TimeSpan.FromSeconds(12), "显示设置发生变化");
     }
 
     private DateTime _manualChangeUtc = DateTime.MinValue;
@@ -106,13 +107,27 @@ public sealed class Watchdog : IDisposable
     /// <summary>Last known PnP status of the Parsec adapter (only refreshed while the driver cannot be opened).</summary>
     public string AdapterStatus { get; private set; } = string.Empty;
 
+    private DateTime _tickStartedUtc = DateTime.MinValue;
+
     private void Tick()
     {
         if (!Enabled || !_settings.WatchdogEnabled) return;
         lock (_gate)
         {
-            if (_ticking) return;
+            if (_ticking)
+            {
+                // a tick stuck for minutes (hung driver call, blocked process spawn) must not silence the watchdog forever
+                if ((DateTime.UtcNow - _tickStartedUtc) > TimeSpan.FromMinutes(3))
+                {
+                    Log.Error("守护上一轮检查超过 3 分钟未结束，放弃等待并继续新的检查");
+                }
+                else
+                {
+                    return;
+                }
+            }
             _ticking = true;
+            _tickStartedUtc = DateTime.UtcNow;
         }
         try
         {
@@ -134,40 +149,11 @@ public sealed class Watchdog : IDisposable
     {
         var notes = new List<string>();
 
-        // 1) keep-alive
+        // 1) driver / keep-alive
         if (_state.ExpectedVirtualDisplays > 0)
         {
-            if (!_vdd.IsOpen)
-            {
-                if (_vdd.Open())
-                {
-                    notes.Add("重新打开 VDD");
-                }
-                else
-                {
-                    notes.Add("VDD 不可用");
-                    if ((DateTime.UtcNow - _lastAdapterCheckUtc) > TimeSpan.FromSeconds(60))
-                    {
-                        _lastAdapterCheckUtc = DateTime.UtcNow;
-                        AdapterStatus = ParsecVdd.QueryAdapterStatus();
-                        if (!AdapterStatus.StartsWith("Started", StringComparison.OrdinalIgnoreCase) && !AdapterStatus.StartsWith("已启动", StringComparison.Ordinal))
-                        {
-                            Log.Error($"Parsec Virtual Display Adapter 设备状态异常: {AdapterStatus} —— 请在“虚拟屏”页点击「重启适配器」（需要管理员权限）");
-                        }
-                    }
-                }
-            }
-            else if (!_vdd.IsPinging)
-            {
-                _vdd.StartPing();
-                notes.Add("重启 keep-alive");
-            }
-            else if (_vdd.ConsecutivePingFailures >= 20)
-            {
-                Log.Warn("VDD keep-alive 连续失败，重新打开设备");
-                _vdd.Close();
-                _vdd.Open();
-            }
+            var driverNote = EnsureDriverAlive();
+            if (driverNote != null) notes.Add(driverNote);
         }
 
         _instances.PollAsync().GetAwaiter().GetResult();
@@ -187,18 +173,23 @@ public sealed class Watchdog : IDisposable
 
         var health = _engine.CheckHealth();
         var needRepair = false;
+        // Windows re-enumerates everything during a monitor hot-plug (DisplayPort link retrain, KVM switch, remote
+        // desktop tools): for a few seconds the virtual display may be missing although the driver still has it.
+        // Sending ADD/REMOVE into that window is exactly what used to hang the driver, so repairs wait it out.
+        var settling = (DateTime.UtcNow - _lastDisplayChangeUtc) < TimeSpan.FromSeconds(12);
 
         // 2) virtual displays vanished (driver reset, sleep, other tools)
         if (!health.VirtualDisplaysOk)
         {
             _displayMismatchTicks++;
-            notes.Add($"虚拟屏 {health.ParsecActive}/{health.ParsecExpected}");
-            if (_displayMismatchTicks >= 2) needRepair = true;
+            notes.Add($"虚拟屏 {health.ParsecActive}/{health.ParsecExpected}" + (settling ? "（显示器正在重新枚举，等待）" : string.Empty));
+            if (_displayMismatchTicks >= 3 && !settling) needRepair = true;
         }
         else
         {
             _displayMismatchTicks = 0;
         }
+        if (!_vdd.IsOpen) needRepair = false; // nothing to repair with until the driver is back
 
         // 3) drifted capture targets
         if (health.DriftedInstances.Count > 0)
@@ -359,9 +350,20 @@ public sealed class Watchdog : IDisposable
                 if (!_activeSinceUtc.ContainsKey(d.GdiName)) _activeSinceUtc[d.GdiName] = DateTime.UtcNow;
                 var activeFor = DateTime.UtcNow - _activeSinceUtc[d.GdiName];
                 var sinceStream = DateTime.UtcNow - _lastStreamingUtc.GetValueOrDefault(spec.InstanceId, DateTime.MinValue);
-                if (activeFor > TimeSpan.FromSeconds(20) && sinceStream > TimeSpan.FromSeconds(20) && !_engine.IsBusy)
+                var sinceDetachFailure = DateTime.UtcNow - _detachFailedUtc.GetValueOrDefault(d.GdiName, DateTime.MinValue);
+                if (activeFor > TimeSpan.FromSeconds(20) && sinceStream > TimeSpan.FromSeconds(20) && sinceDetachFailure > TimeSpan.FromMinutes(10) && !settling && !_engine.IsBusy)
                 {
-                    if (_engine.DetachIdleVirtualDisplay(d, "无客户端连接")) notes.Add($"虚拟屏 #{spec.Slot + 1} 待机");
+                    if (_engine.DetachIdleVirtualDisplay(d, "无客户端连接"))
+                    {
+                        notes.Add($"虚拟屏 #{spec.Slot + 1} 待机");
+                        _detachFailedUtc.Remove(d.GdiName);
+                    }
+                    else
+                    {
+                        // e.g. DISP_CHANGE_BADPARAM while Windows is mid-reconfiguration: do not hammer the API every 20 s
+                        _detachFailedUtc[d.GdiName] = DateTime.UtcNow;
+                        Log.Warn($"虚拟屏 #{spec.Slot + 1} 无法进入待机，10 分钟后再试");
+                    }
                     _activeSinceUtc.Remove(d.GdiName);
                 }
             }
@@ -391,11 +393,16 @@ public sealed class Watchdog : IDisposable
         // 5) scheduled verification (resume / display change)
         if (DateTime.UtcNow >= _pendingVerifyUtc)
         {
+            if (settling)
+            {
+                _pendingVerifyUtc = DateTime.UtcNow.AddSeconds(6); // still changing: look again later
+                return;
+            }
             _pendingVerifyUtc = DateTime.MaxValue;
             if (_manualChangeUtc != DateTime.MinValue && health.VirtualDisplaysOk)
             {
                 _manualChangeUtc = DateTime.MinValue;
-                if (_engine.RememberVirtualPositions(health.Displays)) notes.Add("已记住手动摆放的位置");
+                if (_engine.RememberLayout(health.Displays)) notes.Add("已记住手动摆放的位置");
             }
             if (!health.VirtualDisplaysOk || health.DriftedInstances.Count > 0 || !LayoutMatches(profile, health.Displays, health.IdleOff))
             {
@@ -408,16 +415,128 @@ public sealed class Watchdog : IDisposable
             }
         }
 
-        if (needRepair && (DateTime.UtcNow - _lastRepairUtc) > TimeSpan.FromSeconds(40))
+        if (needRepair && !settling && (DateTime.UtcNow - _lastRepairUtc) > RepairInterval())
         {
             _lastRepairUtc = DateTime.UtcNow;
-            Log.Warn("守护: 重新应用方案「" + profile.Name + "」 (" + string.Join("; ", notes) + ")");
-            _ = _engine.ApplyAsync(profile);
+            Log.Warn("守护: 重新应用方案「" + profile.Name + "」 (" + string.Join("; ", notes) + ")" + (_failedRepairs > 0 ? $"，连续失败 {_failedRepairs} 次" : string.Empty));
+            _ = _engine.ApplyAsync(profile).ContinueWith(t =>
+            {
+                var ok = t.Status == TaskStatus.RanToCompletion && t.Result.Success;
+                _failedRepairs = ok ? 0 : Math.Min(_failedRepairs + 1, 8);
+                if (!ok && _failedRepairs == 3) Log.Error("守护: 连续 3 次修复失败，降低重试频率（最长每 10 分钟一次）: " + (t.Exception?.Message ?? t.Result?.Summary));
+            }, TaskScheduler.Default);
         }
 
         LastSummary = notes.Count == 0
             ? $"正常 · 虚拟屏 {health.ParsecActive}/{health.ParsecExpected} · 实例 {string.Join(",", _state.ExpectedInstances)}"
             : string.Join("; ", notes);
+    }
+
+    private int _failedRepairs;
+    private int _driverRecoveries;
+    private DateTime _lastDriverRecoveryUtc = DateTime.MinValue;
+    private DateTime _lastDriverInstallUtc = DateTime.MinValue;
+    private DateTime _lastDisplayChangeUtc = DateTime.MinValue;
+
+    /// <summary>Repair interval grows with consecutive failures: 40 s, 80 s, 160 s … capped at 10 minutes.</summary>
+    private TimeSpan RepairInterval() => TimeSpan.FromSeconds(Math.Min(600, 40 * Math.Pow(2, _failedRepairs)));
+
+    /// <summary>Recovery interval for the adapter: 20 s, 40 s, 80 s … capped at 10 minutes, reset by a successful open.</summary>
+    private TimeSpan DriverRecoveryInterval() => TimeSpan.FromSeconds(Math.Min(600, 20 * Math.Pow(2, Math.Min(_driverRecoveries, 6))));
+
+    /// <summary>Last adapter state seen by the watchdog (for the UI).</summary>
+    public ParsecVdd.DeviceState? AdapterState { get; private set; }
+
+    /// <summary>
+    /// Keeps the driver handle usable: reopens it, restarts the adapter when the user-mode driver host died (problem
+    /// code 43 after a display hot-plug), installs the bundled driver when it is missing. Everything that needs
+    /// administrator rights only runs when the hub is elevated; otherwise it logs once and leaves the button to the user.
+    /// </summary>
+    private string? EnsureDriverAlive()
+    {
+        if (_vdd.IsOpen && _vdd.IsPinging && !_vdd.Faulted && _vdd.ConsecutivePingFailures < 3)
+        {
+            if (_driverRecoveries > 0 && (DateTime.UtcNow - _lastDriverRecoveryUtc) > TimeSpan.FromMinutes(5)) _driverRecoveries = 0;
+            return null;
+        }
+        if (_vdd.IsOpen && !_vdd.Faulted && _vdd.ConsecutivePingFailures < 3)
+        {
+            _vdd.StartPing();
+            return "重启 keep-alive";
+        }
+        if (_vdd.IsOpen)
+        {
+            Log.Warn($"VDD 停止响应（{(_vdd.Faulted ? "IOCTL 超时" : $"keep-alive 连续失败 {_vdd.ConsecutivePingFailures} 次")}），关闭句柄后检查设备状态");
+            _vdd.Close();
+        }
+
+        var state = ParsecVdd.QueryDeviceState();
+        AdapterState = state;
+        AdapterStatus = state.Text;
+        if (state.Health == ParsecVdd.DeviceHealth.Ok && _vdd.Open())
+        {
+            _driverRecoveries = 0;
+            return "重新打开 VDD";
+        }
+
+        // the interface is gone or the device reports a problem: repair (rate limited, escalating back-off)
+        if ((DateTime.UtcNow - _lastDriverRecoveryUtc) < DriverRecoveryInterval()) return "VDD 不可用: " + state.Text;
+        _lastDriverRecoveryUtc = DateTime.UtcNow;
+        _driverRecoveries++;
+
+        if (state.Health == ParsecVdd.DeviceHealth.Missing)
+        {
+            if (!_settings.AutoInstallDriver || !ParsecVdd.HasBundledSetup || (DateTime.UtcNow - _lastDriverInstallUtc) < TimeSpan.FromMinutes(15))
+            {
+                if (_driverRecoveries == 1) Log.Error("未找到 Parsec Virtual Display Adapter：驱动未安装。请在“虚拟屏”页点击「安装驱动」");
+                return "驱动未安装";
+            }
+            if (!ProcessUtil.IsElevated())
+            {
+                if (_driverRecoveries == 1) Log.Error("驱动未安装，且当前不是管理员权限，无法自动安装。请在“虚拟屏”页点击「安装驱动」");
+                return "驱动未安装";
+            }
+            _lastDriverInstallUtc = DateTime.UtcNow;
+            Log.Warn("驱动未安装，自动安装随附的 Parsec 虚拟显示驱动…");
+            var (iok, imsg) = ParsecVdd.InstallDriver();
+            Log.Info("自动安装驱动: " + imsg);
+            if (iok && _vdd.Open()) { _driverRecoveries = 0; return "驱动已安装"; }
+            return "驱动安装: " + imsg;
+        }
+
+        if (!_settings.AutoRestartAdapter)
+        {
+            if (_driverRecoveries == 1) Log.Error($"Parsec Virtual Display Adapter 状态: {state.Text} —— 自动重启已关闭，请在“虚拟屏”页点击「重启适配器」");
+            return "VDD 不可用: " + state.Text;
+        }
+        if (!ProcessUtil.IsElevated())
+        {
+            if (_driverRecoveries == 1) Log.Error($"Parsec Virtual Display Adapter 状态: {state.Text} —— 当前不是管理员权限，无法自动重启。请在“虚拟屏”页点击「重启适配器」，或在设置里开启“以管理员权限运行”");
+            return "VDD 不可用: " + state.Text;
+        }
+        Log.Warn($"Parsec Virtual Display Adapter 状态: {state.Text}，自动重启适配器（第 {_driverRecoveries} 次）");
+        var (ok, msg) = ParsecVdd.RestartAdapterAndWait(TimeSpan.FromSeconds(25));
+        Log.Info("自动重启适配器: " + msg);
+        if (ok && _vdd.Open())
+        {
+            _driverRecoveries = 0;
+            _displayMismatchTicks = 3; // the displays are certainly gone: let the repair run on the next tick
+            _lastRepairUtc = DateTime.MinValue;
+            return "适配器已恢复";
+        }
+        return "适配器重启失败: " + msg;
+    }
+
+    /// <summary>Restarts / installs the driver right away (start-up and the UI buttons use this; it honours the same rules as the tick).</summary>
+    public string RecoverDriverNow(string reason)
+    {
+        lock (_gate)
+        {
+            _lastDriverRecoveryUtc = DateTime.MinValue;
+            _lastDriverInstallUtc = DateTime.MinValue;
+        }
+        Log.Info("检查 Parsec 驱动状态: " + reason);
+        return EnsureDriverAlive() ?? "驱动正常";
     }
 
     private bool LayoutMatches(Profile profile, List<DisplayInfo> displays, bool idleOff = false)
@@ -459,6 +578,7 @@ public sealed class Watchdog : IDisposable
 
     private readonly Dictionary<int, DateTime> _lastStreamingUtc = new();
     private readonly Dictionary<string, DateTime> _activeSinceUtc = new();
+    private readonly Dictionary<string, DateTime> _detachFailedUtc = new();
 
     public void Dispose()
     {

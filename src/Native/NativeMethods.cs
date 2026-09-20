@@ -48,6 +48,29 @@ public static unsafe class NativeMethods
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool SetupDiGetDeviceInstanceIdW(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, IntPtr deviceInstanceId, uint deviceInstanceIdSize, out uint requiredSize);
 
+    public const uint DIGCF_ALLCLASSES = 0x00000004;
+    public const uint SPDRP_HARDWAREID = 0x00000001;
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    public static extern bool SetupDiEnumDeviceInfo(IntPtr deviceInfoSet, uint memberIndex, ref SP_DEVINFO_DATA deviceInfoData);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData, uint property, out uint propertyRegDataType, IntPtr propertyBuffer, uint propertyBufferSize, out uint requiredSize);
+
+    // cfgmgr32 device-node status (DN_* / CM_PROB_*)
+    public const uint DN_DRIVER_LOADED = 0x00000002;
+    public const uint DN_STARTED = 0x00000008;
+    public const uint DN_HAS_PROBLEM = 0x00000400;
+    public const uint CM_PROB_FAILED_START = 10;
+    public const uint CM_PROB_DISABLED = 22;
+    public const uint CM_PROB_FAILED_POST_START = 43;
+
+    [DllImport("cfgmgr32.dll")]
+    public static extern int CM_Get_DevNode_Status(out uint status, out uint problemNumber, uint devInst, uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern unsafe bool CancelIoEx(SafeFileHandle file, NativeOverlapped* overlapped);
+
     public const uint DICS_FLAG_GLOBAL = 0x00000001;
     public const uint DIREG_DEV = 0x00000001;
     public const uint KEY_READ = 0x20019;

@@ -17,36 +17,42 @@
 * **驱动模式表同步**：Parsec 驱动只在虚拟屏重新插拔时读取 `HKLM\SOFTWARE\Parsec\vdd` 的自定义模式。在"虚拟屏"页注册/删除模式后，
   Hub 自动重新插拔空闲的虚拟屏；正在串流的虚拟屏标记为"待重新插拔"，客户端断开后自动处理。"显示布局"页的刷新率下拉框会把
   已注册但驱动尚未发布的模式一并列出，选择后记入方案。
-* **守护**：虚拟屏丢失自动重建、实例掉线自动重启、睡眠唤醒/显示变更后复核、驱动异常一键重启适配器。
+* **自包含**：安装包内含定制版 Sunshine（`sunshine\`）与 Parsec 官方签名的驱动安装程序（`drivers\parsec-vdd-setup.exe`）。
+  不需要单独安装 Sunshine 或 ParsecVDisplay：检测不到驱动时 Hub 自动静默安装；Sunshine 的配置、配对信息保存在 `%LOCALAPPDATA%\MoonlightHub\sunshine\`。
+* **自恢复**：Hub 以管理员权限运行（开机自启任务用最高权限启动，不弹 UAC）。显示器热插拔可能让 Parsec 驱动进程停止响应（设备管理器代码 43），
+  守护通过 SetupAPI 判断设备状态后自动重启适配器并重新应用方案；开机时设备异常同样立即修复。修复失败按指数退避，不会无限重试。
+* **布局记忆**：手动摆放后物理屏与虚拟屏的位置记入状态文件，每次应用方案 / 开机后恢复；显示器重新枚举期间的瞬态布局不会被误记。
+* **守护**：虚拟屏丢失自动重建、实例掉线自动重启、睡眠唤醒/显示变更后复核。
 * **无中断更新**：`tools/update-hub.ps1` 热替换正在运行的 Hub，虚拟屏与串流会话不断。
-* **命令行**：`MoonlightHub.exe --cli status|displays|apply <方案>|instances|pair <id> <PIN>|clients|unpair|adapter|takeover|restore|autostart on|off|shutdown …`
+* **命令行**：`MoonlightHub.exe --cli status|displays|apply <方案>|instances|pair <id> <PIN>|clients|unpair|adapter [restart|install]|takeover|restore|autostart on|off|shutdown …`
 
 ## 运行要求
 
-* Windows 10 19041+ / Windows 11，x64
+* Windows 10 19041+ / Windows 11，x64，管理员账户
 * [.NET 9 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/9.0)（安装包会检测并提示）
-* [Sunshine](https://github.com/LizardByte/Sunshine)（推荐 2025.924，配合 `sunshine-patches/` 里的补丁可获得自动配对提示与分辨率跟随；不打补丁也能用，退化为手动输入 PIN）
-* [Parsec VDD](https://github.com/nomi-san/parsec-vdd)（ParsecVDisplay 0.45 附带的驱动）
 * 客户端：Moonlight（Android / iOS / PC）
+* Sunshine 与 Parsec 驱动已随程序提供。也可以在设置里关闭"使用随附的 Sunshine"，改用自己安装的 [Sunshine](https://github.com/LizardByte/Sunshine)
+  （推荐 2025.924 + `sunshine-patches/` 补丁；不打补丁退化为手动输入 PIN）。驱动来自 [parsec-vdd](https://github.com/nomi-san/parsec-vdd) 项目所用的 Parsec 官方安装包 0.45。
 
 ## 快速开始
 
-1. 安装 Sunshine 与 ParsecVDisplay（只需要它的驱动），安装本程序（`MoonlightHub-Setup-*.exe`）。
-2. 打开 Hub → 设置 → 确认 `sunshine.exe` 路径与实例端口（默认 47989 / 48989 / 49989）→ 保存。
-3. 概览页选择方案，例如「主屏 + 1 副屏」。
-4. 平板 Moonlight 添加电脑 IP（实例 2/3 用 `IP:48989` 这种带端口的形式），点击后在 Hub 弹出的窗口里输入 PIN。
-5. 连接后副屏自动启用；断开后自动待机。
+1. 安装本程序（`MoonlightHub-Setup-*.exe`）并启动；首次运行会请求管理员权限，检测不到 Parsec 驱动时会自动安装。
+2. 概览页选择方案，例如「主屏 + 1 副屏」。
+3. 平板 Moonlight 添加电脑 IP（实例 2/3 用 `IP:48989` 这种带端口的形式），点击后在 Hub 弹出的窗口里输入 PIN。
+4. 连接后副屏自动启用；断开后自动待机。在 Windows 显示设置或 Hub 的"显示布局"页拖动一次位置，之后开机都会保持。
 
 ## 构建
 
 ```powershell
 cd src
 dotnet publish -c Release -r win-x64 --self-contained false -o ..\dist
+# 嵌入 Sunshine 运行时与驱动安装包（来源路径可用参数指定）
+..\tools\bundle-runtime.ps1 -Target ..\dist
 # 安装包（需要 Inno Setup 6）
 ISCC.exe ..\installer\MoonlightHub.iss
 ```
 
-编译中间目录默认重定向到 `%LOCALAPPDATA%\MoonlightHub\build`（见 `src/Directory.Build.props`）。
+`tools/update-hub.ps1` 一次完成发布 + 嵌入 + 热替换。编译中间目录默认重定向到 `%LOCALAPPDATA%\MoonlightHub\build`（见 `src/Directory.Build.props`）。
 
 ## 目录
 
@@ -54,7 +60,7 @@ ISCC.exe ..\installer\MoonlightHub.iss
 | --- | --- |
 | `src/` | WPF 应用源码（Core = 驱动/显示/Sunshine/守护逻辑，UI = 界面） |
 | `installer/` | Inno Setup 脚本 |
-| `tools/` | `update-hub.ps1` 热更新、`organize-folder.ps1` 工作区整理 |
+| `tools/` | `update-hub.ps1` 热更新、`bundle-runtime.ps1` 嵌入 Sunshine/驱动、`organize-folder.ps1` 工作区整理 |
 | `sunshine-patches/` | 定制 Sunshine 的补丁与说明 |
 
 ## 原理简述
@@ -62,6 +68,9 @@ ISCC.exe ..\installer\MoonlightHub.iss
 * Parsec VDD 协议：`\\?\root#display#0000#{00b41627-04c4-429e-a26e-0265cf50c8fa}` 设备接口，IOCTL `ADD 0x0022e004 / REMOVE 0x0022a008 / UPDATE 0x0022a00c / VERSION 0x0022e010`；UPDATE 必须持续发送。
 * Sunshine 设备 ID：`UUIDv5(nil, EDID + 实例ID稳定部分 + UTF-16 NUL)`，与 libdisplaydevice 一致，因此可在启动实例前就确定 `output_name`。
 * 待机：实例配置 `dd_configuration_option = ensure_active`（仅副屏方案用 `ensure_only_display`）+ `dd_config_revert_on_disconnect = enabled`。
+* 驱动健康：Parsec VDD 是 UMDF（用户态）驱动，显示器热插拔时其宿主进程可能崩溃，设备进入 `CM_PROB_FAILED_POST_START`(43)，设备接口消失；
+  Hub 用 `SetupDiGetClassDevs` + `CM_Get_DevNode_Status` 按硬件 ID `Root\Parsec\VDA` 找到设备并判断状态，用 `pnputil /restart-device` 恢复。
+  显示设置变化后的 12 秒内不向驱动发 ADD/REMOVE，避免在它处理热插拔时把它打挂。
 
 ## 许可
 
