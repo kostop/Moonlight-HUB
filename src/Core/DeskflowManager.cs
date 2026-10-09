@@ -873,7 +873,8 @@ public sealed class DeskflowManager : IDisposable
         if (name == null || screens[name] is not JsonObject rect) return;
         var res = rect["resolution"] as JsonObject;
         if ((int)(res?["width"]?.GetValue<double>() ?? 0) == hub.DesktopWidth && (int)(res?["height"]?.GetValue<double>() ?? 0) == hub.DesktopHeight) return;
-        rect["resolution"] = new JsonObject { ["width"] = hub.DesktopWidth, ["height"] = hub.DesktopHeight };
+        // doubles: the readers use GetValue<double>(), which throws on an int-backed JsonValue
+        rect["resolution"] = new JsonObject { ["width"] = (double)hub.DesktopWidth, ["height"] = (double)hub.DesktopHeight };
         Log.Info($"Deskflow: {name} 报告桌面为 {hub.DesktopWidth}x{hub.DesktopHeight}（{hub.Os}），更新布局中的尺寸");
         SaveLayoutCache(Layout);
     }
