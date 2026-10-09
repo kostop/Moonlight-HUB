@@ -15,6 +15,13 @@ public static class InstanceControl
     private const string ShowEventName = @"Local\MoonlightHub.ShowWindow";
     public const string ExitEventName = @"Local\MoonlightHub.ExitForReplace";
 
+    /// <summary>
+    /// Local\ objects only exist in their own session, so a CLI run over SSH (session 0, whose Local\ is the global
+    /// namespace) could not reach the hub on the desktop (session 1). The elevated hub therefore also listens on Global\
+    /// copies of its events (creating Global\ objects needs administrator rights; without them only Local\ is used).
+    /// </summary>
+    private static string GlobalName(string localName) => @"Global\" + localName[(localName.IndexOf('\\') + 1)..];
+
     private static string SocketPath => Path.Combine(Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR") is { Length: > 0 } dir ? dir : Path.GetTempPath(), "moonlight-hub.sock");
 
     /// <summary>True when no other hub instance holds the single-instance mutex (the probe releases it again immediately).</summary>
@@ -44,16 +51,20 @@ public static class InstanceControl
     {
         if (OperatingSystem.IsWindows())
         {
-            try
+            foreach (var name in new[] { eventName, GlobalName(eventName) })
             {
-                using var evt = EventWaitHandle.OpenExisting(eventName);
-                evt.Set();
-                return true;
+                try
+                {
+                    using var evt = EventWaitHandle.OpenExisting(name);
+                    evt.Set();
+                    return true;
+                }
+                catch
+                {
+                    // not running in this session (or no access to the global copy): try the next name
+                }
             }
-            catch
-            {
-                return false;
-            }
+            return false;
         }
         try
         {
@@ -73,8 +84,22 @@ public static class InstanceControl
     {
         if (OperatingSystem.IsWindows())
         {
+            var exited = 0;
+            void ExitOnce() { if (Interlocked.Exchange(ref exited, 1) == 0) onExitForReplace(); }
             StartEventListener(ShowEventName, onShow, repeat: true);
-            StartEventListener(ExitEventName, onExitForReplace, repeat: false);
+            StartEventListener(ExitEventName, ExitOnce, repeat: false);
+            if (ProcessUtil.IsElevated())
+            {
+                try
+                {
+                    StartEventListener(GlobalName(ShowEventName), onShow, repeat: true);
+                    StartEventListener(GlobalName(ExitEventName), ExitOnce, repeat: false);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("无法创建跨会话的实例控制事件（SSH 里的 --cli shutdown 将找不到本实例）: " + ex.Message);
+                }
+            }
             return;
         }
         var thread = new Thread(() =>

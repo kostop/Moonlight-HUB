@@ -28,6 +28,18 @@ public static class Program
 
         var replace = args.Contains("--replace");
 
+        // Session 0 (services, SSH logins) has no desktop, and its Local\ objects are not the ones of the hub on the
+        // user's desktop: a hub started there would run blind next to the real one and fight it over the Parsec driver,
+        // the Sunshine ports and Deskflow. Only --cli works from there.
+        if (OperatingSystem.IsWindows() && System.Diagnostics.Process.GetCurrentProcess().SessionId == 0)
+        {
+            const string message = "Moonlight Hub 不能在会话 0（服务 / SSH 会话）里运行界面：那里没有桌面，而且会和桌面会话里的 Hub 争用虚拟屏驱动。"
+                + "请在用户的桌面会话里启动，例如 schtasks /run /tn \"Moonlight Hub\"，或用一次性计划任务（交互用户、最高权限）运行 MoonlightHub.exe --replace。命令行功能请用 --cli。";
+            Log.Warn(message);
+            try { Console.Error.WriteLine(message); } catch { }
+            return 3;
+        }
+
         // Windows: run with administrator rights so the Parsec adapter can be restarted / installed and custom modes
         // registered without UAC prompts. The logon task already starts us elevated; a manual launch or the hot-update
         // script re-launches through ShellExecute "runas" before touching the driver or the old instance.
