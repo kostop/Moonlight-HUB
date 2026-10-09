@@ -1,0 +1,35 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ic="using:FluentIcons.Avalonia"
+        x:Class="MoonlightHub.UI.PairingWindow"
+        Title="Moonlight 配对" Width="480" SizeToContent="Height" WindowStartupLocation="CenterScreen" Topmost="True"
+        CanResize="False" ShowInTaskbar="True" Icon="/Assets/app.ico">
+    <Border Padding="24">
+        <StackPanel>
+            <StackPanel Orientation="Horizontal">
+                <Border Width="40" Height="40" CornerRadius="10" Background="{StaticResource AccentSoftBrush}">
+                    <ic:SymbolIcon Symbol="PhoneLaptop" FontSize="20" Foreground="{StaticResource AccentBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <StackPanel Margin="14,0,0,0" VerticalAlignment="Center">
+                    <TextBlock x:Name="HeaderText" Text="有新的 Moonlight 客户端请求配对" Classes="h2" />
+                    <TextBlock x:Name="DetailText" Classes="muted" />
+                </StackPanel>
+            </StackPanel>
+
+            <TextBlock Text="请输入平板/手机 Moonlight 上显示的 4 位 PIN：" Margin="0,18,0,8" TextWrapping="Wrap" />
+            <TextBox x:Name="PinBox" MaxLength="4" FontSize="34" FontWeight="SemiBold" HorizontalContentAlignment="Center" Padding="10" TextChanged="PinBox_TextChanged" />
+
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                <TextBlock Text="客户端名称" Classes="muted" VerticalAlignment="Center" Margin="0,0,10,0" />
+                <TextBox x:Name="NameBox" Width="240" />
+            </StackPanel>
+
+            <TextBlock x:Name="StatusText" Classes="muted" Margin="0,14,0,0" Text="" />
+
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+                <Button Content="取消" Click="Cancel_Click" Classes="ghost" />
+                <Button x:Name="PairButton" Content="配对" Click="Pair_Click" Classes="primary" Margin="0" MinWidth="110" />
+            </StackPanel>
+        </StackPanel>
+    </Border>
+</Window>

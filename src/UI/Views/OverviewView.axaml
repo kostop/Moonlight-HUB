@@ -1,0 +1,72 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="using:MoonlightHub.UI"
+             x:Class="MoonlightHub.UI.Views.OverviewView">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+            <TextBlock Text="显示方案" Classes="h2" Margin="0,4,0,10" />
+            <WrapPanel x:Name="ProfilesPanel" Margin="0,0,0,8" />
+
+            <UniformGrid Columns="4" Margin="-7,0,-7,14">
+                <Border Classes="card" Margin="7,0">
+                    <StackPanel>
+                        <TextBlock Text="虚拟副屏" Classes="muted" />
+                        <TextBlock x:Name="TileVdd" Text="—" FontSize="24" FontWeight="SemiBold" Margin="0,4,0,2" />
+                        <TextBlock x:Name="TileVddSub" Text="" Classes="muted" />
+                    </StackPanel>
+                </Border>
+                <Border Classes="card" Margin="7,0">
+                    <StackPanel>
+                        <TextBlock Text="Sunshine 实例" Classes="muted" />
+                        <TextBlock x:Name="TileInstances" Text="—" FontSize="24" FontWeight="SemiBold" Margin="0,4,0,2" />
+                        <TextBlock x:Name="TileInstancesSub" Text="" Classes="muted" />
+                    </StackPanel>
+                </Border>
+                <Border Classes="card" Margin="7,0">
+                    <StackPanel>
+                        <TextBlock Text="客户端连接" Classes="muted" />
+                        <TextBlock x:Name="TileClients" Text="—" FontSize="24" FontWeight="SemiBold" Margin="0,4,0,2" />
+                        <TextBlock x:Name="TileClientsSub" Text="" Classes="muted" />
+                    </StackPanel>
+                </Border>
+                <Border Classes="card" Margin="7,0">
+                    <StackPanel>
+                        <TextBlock Text="守护状态" Classes="muted" />
+                        <TextBlock x:Name="TileWatchdog" Text="—" FontSize="16" FontWeight="SemiBold" Margin="0,8,0,2" TextTrimming="CharacterEllipsis" />
+                        <TextBlock x:Name="TileWatchdogSub" Text="" Classes="muted" />
+                    </StackPanel>
+                </Border>
+            </UniformGrid>
+
+            <Grid ColumnDefinitions="3*,14,2*">
+                <Border Classes="card">
+                    <DockPanel>
+                        <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                            <Button DockPanel.Dock="Right" Content="显示布局详情" Classes="ghost" Click="GoDisplays_Click" Margin="0" />
+                            <TextBlock Text="当前桌面布局" Classes="h2" VerticalAlignment="Center" />
+                        </DockPanel>
+                        <ui:DisplayCanvas x:Name="LayoutCanvas" Height="260" />
+                    </DockPanel>
+                </Border>
+                <Border Grid.Column="2" Classes="card">
+                    <DockPanel>
+                        <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                            <Button DockPanel.Dock="Right" Content="全部日志" Classes="ghost" Click="GoLogs_Click" Margin="0" />
+                            <TextBlock Text="最近动态" Classes="h2" VerticalAlignment="Center" />
+                        </DockPanel>
+                        <ItemsControl x:Name="Activity" Height="260" ClipToBounds="True">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                                        <TextBlock Text="{Binding TimeText}" Classes="muted" Width="60" VerticalAlignment="Top" />
+                                        <TextBlock Text="{Binding Message}" FontSize="12" Width="330" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" ToolTip.Tip="{Binding Message}" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </DockPanel>
+                </Border>
+            </Grid>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

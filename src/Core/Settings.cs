@@ -143,6 +143,11 @@ public sealed class HubSettings
     public bool AutoInstallDriver { get; set; } = true;
     /// <summary>Restart the Parsec adapter automatically when it stops responding (needs administrator rights).</summary>
     public bool AutoRestartAdapter { get; set; } = true;
+    /// <summary>
+    /// Extend profiles: when a tablet's Moonlight disconnects, keep the virtual display (and the windows on it) and ask
+    /// before switching it off, instead of letting Sunshine revert the display configuration a few seconds later.
+    /// </summary>
+    public bool ConfirmStandbyOnDisconnect { get; set; } = true;
     /// <summary>Set once the legacy Sunshine config was copied into the hub data directory.</summary>
     public bool SunshineConfigMigrated { get; set; }
 
@@ -157,9 +162,10 @@ public sealed class HubSettings
         var s = new HubSettings();
         s.Instances = new List<InstanceSpec>
         {
-            new() { Id = 1, Name = "Desktop-lin", Port = 47989, Audio = true, SystemTray = false, MinimumFpsTarget = 60 },
-            new() { Id = 2, Name = "Desktop-lin-2", Port = 48989, Audio = false, SystemTray = false, MinimumFpsTarget = 60 },
-            new() { Id = 3, Name = "Desktop-lin-3", Port = 49989, Audio = false, SystemTray = false, MinimumFpsTarget = 60 },
+            // the name Moonlight lists the host under: this computer's name (a second PC must not show up as another one)
+            new() { Id = 1, Name = Environment.MachineName, Port = 47989, Audio = true, SystemTray = false, MinimumFpsTarget = 60 },
+            new() { Id = 2, Name = Environment.MachineName + "-2", Port = 48989, Audio = false, SystemTray = false, MinimumFpsTarget = 60 },
+            new() { Id = 3, Name = Environment.MachineName + "-3", Port = 49989, Audio = false, SystemTray = false, MinimumFpsTarget = 60 },
         };
         s.Profiles = new List<Profile>
         {

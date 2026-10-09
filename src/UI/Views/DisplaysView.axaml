@@ -1,0 +1,31 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="using:MoonlightHub.UI"
+             x:Class="MoonlightHub.UI.Views.DisplaysView">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+            <Border Classes="card">
+                <DockPanel>
+                    <DockPanel DockPanel.Dock="Top" Margin="0,0,0,10">
+                        <WrapPanel DockPanel.Dock="Right" Orientation="Horizontal" MaxWidth="560" HorizontalAlignment="Right">
+                            <Button x:Name="ApplyLayoutBtn" Content="应用摆放" Classes="primary" Click="ApplyLayout_Click" IsEnabled="False" Margin="0,0,8,6" ToolTip.Tip="把拖动后的位置写入显示设置和 Deskflow 共享布局" />
+                            <Button x:Name="ResetLayoutBtn" Content="撤销拖动" Classes="ghost" Click="ResetLayout_Click" IsEnabled="False" Margin="0,0,8,6" />
+                            <Button Content="刷新" Classes="ghost" Click="Refresh_Click" Margin="0,0,8,6" />
+                            <Button x:Name="ExtendBtn" Content="扩展全部显示器" Classes="ghost" Click="Extend_Click" Margin="0,0,8,6" ToolTip.Tip="SetDisplayConfig(SDC_TOPOLOGY_EXTEND)：让所有已连接显示器都加入桌面" />
+                            <Button x:Name="ReapplyBtn" Content="重新应用当前方案" Classes="ghost" Click="Reapply_Click" Margin="0,0,0,6" />
+                        </WrapPanel>
+                        <StackPanel>
+                            <TextBlock Text="桌面布局" Classes="h2" />
+                            <TextBlock x:Name="HelpText" Classes="muted" MaxWidth="560" HorizontalAlignment="Left"
+                                       Text="拖动方块摆放位置（自动吸附到相邻边），然后点“应用摆放”。灰色/蓝色是本机显示器和虚拟屏，琥珀色是 Deskflow 的另一台电脑：鼠标从相邻的边移过去就会切过去。" />
+                        </StackPanel>
+                    </DockPanel>
+                    <TextBlock x:Name="DeskflowLayoutText" DockPanel.Dock="Bottom" Classes="muted" Margin="0,8,0,0" Text="" />
+                    <ui:DisplayCanvas x:Name="LayoutCanvas" Height="320" Interactive="True" />
+                </DockPanel>
+            </Border>
+            <TextBlock Text="显示器" Classes="h2" Margin="0,4,0,10" />
+            <StackPanel x:Name="DisplayList" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

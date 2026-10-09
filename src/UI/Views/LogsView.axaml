@@ -1,0 +1,37 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="MoonlightHub.UI.Views.LogsView">
+    <UserControl.Styles>
+        <!-- the log box is borderless inside its card: keep it flat on hover / focus instead of the theme's input chrome -->
+        <Style Selector="TextBox.logbox /template/ Border#PART_BorderElement">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+        </Style>
+        <Style Selector="TextBox.logbox:pointerover /template/ Border#PART_BorderElement">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+        </Style>
+        <Style Selector="TextBox.logbox:focus /template/ Border#PART_BorderElement">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+        </Style>
+    </UserControl.Styles>
+    <DockPanel>
+        <DockPanel DockPanel.Dock="Top" Margin="0,4,0,10">
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <CheckBox x:Name="AutoScroll" Content="自动滚动" IsChecked="True" Margin="0,0,14,0" />
+                <Button Content="打开日志文件" Classes="ghost" Click="OpenFile_Click" />
+                <Button Content="打开日志目录" Classes="ghost" Click="OpenDir_Click" Margin="0" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="来源" Classes="muted" VerticalAlignment="Center" Margin="0,0,8,0" />
+                <ComboBox x:Name="Source" Width="260" SelectionChanged="Source_Changed" />
+            </StackPanel>
+        </DockPanel>
+        <Border Classes="card" Padding="0" Margin="0">
+            <TextBox x:Name="Text" Classes="logbox mono" IsReadOnly="True" AcceptsReturn="True"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                     FontFamily="{StaticResource MonoFont}" FontSize="12" Background="Transparent" BorderThickness="0" Padding="14" TextWrapping="NoWrap" />
+        </Border>
+    </DockPanel>
+</UserControl>

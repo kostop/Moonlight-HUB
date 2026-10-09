@@ -66,7 +66,18 @@ public sealed record DisplayMode(int Width, int Height, int RefreshRate, int Ori
 /// <summary>Desired state of one GDI display when applying a layout.</summary>
 public sealed class LayoutItem
 {
+    /// <summary>从已枚举的显示器创建布局项，记录设备路径，防止显示编号变化后误操作其他屏幕。</summary>
+    /// <param name="display">此次布局操作实际对应的显示器快照。</param>
+    public LayoutItem(DisplayInfo display)
+    {
+        GdiName = display.GdiName;
+        ExpectedDevicePath = display.DevicePath;
+        RequireParsec = display.IsParsec;
+    }
+
     public string GdiName { get; set; } = string.Empty;
+    public string ExpectedDevicePath { get; set; } = string.Empty;
+    public bool RequireParsec { get; set; }
     public bool Attached { get; set; } = true;
     public int? Width { get; set; }
     public int? Height { get; set; }
@@ -325,6 +336,7 @@ public static unsafe class DisplayManager
     public static List<DisplayMode> GetModes(string gdiName, int? width = null, int? height = null)
     {
         var modes = new List<DisplayMode>();
+        if (string.IsNullOrWhiteSpace(gdiName)) return modes;
         var seen = new HashSet<string>();
         for (var i = 0; ; i++)
         {
@@ -346,33 +358,88 @@ public static unsafe class DisplayManager
 
     public static DEVMODEW? GetCurrentMode(string gdiName)
     {
+        if (string.IsNullOrWhiteSpace(gdiName)) return null;
         var dm = DEVMODEW.Create();
         return EnumDisplaySettingsExW(gdiName, ENUM_CURRENT_SETTINGS, ref dm, 0) ? dm : null;
     }
 
     // ------------------------------------------------------------------ layout
+    /// <summary>核对布局目标的真实身份；返回错误说明时，调用方必须停止全部写入。</summary>
+    /// <param name="items">携带原始设备路径的待应用布局项。</param>
+    /// <param name="displays">写入前重新枚举的显示器，用于检测断开、编号变化和复制模式。</param>
+    internal static string? ValidateLayoutTargets(IReadOnlyList<LayoutItem> items, IReadOnlyList<DisplayInfo> displays)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item.GdiName) || string.IsNullOrWhiteSpace(item.ExpectedDevicePath))
+                return "显示器名称或设备路径为空，请等待显示器连接完成";
+            if (!names.Add(item.GdiName)) return $"{item.GdiName}: 多个布局项使用同一显示源";
+
+            var target = displays.FirstOrDefault(d => d.DevicePath.Equals(item.ExpectedDevicePath, StringComparison.OrdinalIgnoreCase));
+            if (target == null || !target.IsReady) return $"{item.GdiName}: 原目标显示器已断开或尚未就绪";
+            if (!target.GdiName.Equals(item.GdiName, StringComparison.OrdinalIgnoreCase))
+                return $"{item.GdiName}: 显示编号已变化，请重新读取布局";
+            if (item.RequireParsec && !target.IsParsec) return $"{item.GdiName}: 原目标不再是 Parsec 虚拟屏";
+            if (item.RequireParsec && displays.Any(d => d.Active && !d.IsParsec && d.GdiName.Equals(item.GdiName, StringComparison.OrdinalIgnoreCase)))
+                return $"{item.GdiName}: 虚拟屏与物理屏共用显示源，无法单独修改虚拟屏";
+        }
+        return null;
+    }
+
     /// <summary>
     /// Stages every item with CDS_UPDATEREGISTRY|CDS_NORESET and then applies once. Positions are normalised so the
     /// primary display ends at (0,0). Detached items get a 0x0 mode which removes them from the desktop.
     /// </summary>
+    /// <param name="items">带原显示器设备路径的布局项；目标缺失或变化时拒绝整批应用。</param>
     public static LayoutResult ApplyLayout(IEnumerable<LayoutItem> items)
     {
         var list = items.ToList();
         var result = new LayoutResult { Success = true };
+        if (list.Count == 0) return result;
+        var error = ValidateLayoutTargets(list, Enumerate());
+        if (error != null)
+        {
+            result.Success = false;
+            result.Messages.Add("拒绝应用显示布局: " + error);
+            return result;
+        }
+
+        // 所有目标的模式都必须可读；检查完成前不暂存任何改动，避免半套布局生效。
+        var currentModes = new Dictionary<string, DEVMODEW>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in list)
+        {
+            var mode = GetCurrentMode(item.GdiName);
+            if (!mode.HasValue)
+            {
+                result.Success = false;
+                result.Messages.Add($"拒绝应用显示布局: {item.GdiName} 的当前模式不可用");
+                return result;
+            }
+            currentModes[item.GdiName] = mode.Value;
+        }
+        // 模式读取期间也可能发生热插拔；在暂存前再次核对设备身份。
+        error = ValidateLayoutTargets(list, Enumerate());
+        if (error != null)
+        {
+            result.Success = false;
+            result.Messages.Add("拒绝应用显示布局: " + error);
+            return result;
+        }
         var primary = list.FirstOrDefault(i => i.Primary && i.Attached);
 
         int ox = 0, oy = 0;
         if (primary != null)
         {
-            var cur = GetCurrentMode(primary.GdiName);
-            ox = primary.X ?? cur?.dmPositionX ?? 0;
-            oy = primary.Y ?? cur?.dmPositionY ?? 0;
+            var cur = currentModes[primary.GdiName];
+            ox = primary.X ?? cur.dmPositionX;
+            oy = primary.Y ?? cur.dmPositionY;
         }
 
         var staged = 0;
         foreach (var item in list)
         {
-            var dm = GetCurrentMode(item.GdiName) ?? DEVMODEW.Create();
+            var dm = currentModes[item.GdiName];
             dm.dmDeviceName = string.Empty;
             uint flags = CDS_UPDATEREGISTRY | CDS_NORESET;
             if (!item.Attached)
@@ -458,7 +525,9 @@ public static unsafe class DisplayManager
         {
             var candidates = all.Where(p => p.targetInfo.adapterId.Same(adapter) && p.targetInfo.id == target && p.targetInfo.targetAvailable != 0).ToList();
             if (candidates.Count == 0) return -2;
-            var active = candidates.Where(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0).ToList();
+            // 复制拓扑中的多个目标可能共用一个活动源；拆为独立屏时，每个源只能使用一次。
+            var active = candidates.Where(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0 &&
+                !usedSources.Contains($"{p.sourceInfo.adapterId}/{p.sourceInfo.id}")).ToList();
             DISPLAYCONFIG_PATH_INFO pick;
             if (active.Count > 0)
             {

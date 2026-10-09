@@ -23,7 +23,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $SkipBuild -and -not $Elevated) {
     # 编译不需要管理员权限，在当前会话完成，输出直接可见
     Write-Output "== 发布到 $staging =="
-    & dotnet publish (Join-Path $src 'MoonlightHub.csproj') -c Release -r win-x64 --self-contained false -o $staging -nologo -v q
+    & dotnet publish (Join-Path $src 'MoonlightHub.csproj') -c Release -f net9.0-windows -r win-x64 --self-contained false -o $staging -nologo -v q
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish 失败 ($LASTEXITCODE)" }
     & dotnet build-server shutdown | Out-Null
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'bundle-runtime.ps1') -Target $staging

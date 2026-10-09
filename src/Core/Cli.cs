@@ -15,7 +15,7 @@ public static class Cli
 
     public static int Run(string[] args)
     {
-        NativeMethods.AttachConsole(NativeMethods.ATTACH_PARENT_PROCESS);
+        if (OperatingSystem.IsWindows()) NativeMethods.AttachConsole(NativeMethods.ATTACH_PARENT_PROCESS);
         Console.OutputEncoding = Encoding.UTF8;
         var code = 1;
         try
@@ -227,6 +227,13 @@ public static class Cli
 
             case "autostart":
                 {
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        if (rest.Count == 0) { P(LinuxAutostart.IsEnabled() ? "已启用（~/.config/autostart/moonlight-hub.desktop）" : "未启用"); return 0; }
+                        var lr = LinuxAutostart.Set(rest[0] == "on");
+                        P(lr.Message);
+                        return lr.Ok ? 0 : 2;
+                    }
                     if (rest.Count == 0)
                     {
                         var t = TaskSchedulerHelper.QueryHubTask();
@@ -287,19 +294,17 @@ public static class Cli
 
             case "shutdown":
                 {
-                    try
+                    if (InstanceControl.SignalExitForReplace())
                     {
-                        using var evt = EventWaitHandle.OpenExisting(App.ExitEventName);
-                        evt.Set();
                         P("已通知运行中的 Moonlight Hub 退出（保留虚拟屏与实例）");
                         return 0;
                     }
-                    catch (WaitHandleCannotBeOpenedException)
-                    {
-                        P("没有运行中的 Moonlight Hub");
-                        return 2;
-                    }
+                    P("没有运行中的 Moonlight Hub");
+                    return 2;
                 }
+
+            case "deskflow":
+                return DeskflowCommand(hub, rest);
 
             case "addresses":
                 foreach (var (ip, nic) in Hub.GetHostAddresses()) P($"{ip,-16} {nic}");
@@ -308,6 +313,100 @@ public static class Cli
             default:
                 P("未知命令: " + cmd);
                 PrintHelp();
+                return 1;
+        }
+    }
+
+    private static int DeskflowCommand(Hub hub, List<string> rest)
+    {
+        var df = hub.Deskflow;
+        df.EnsureInitialized();
+        var sub = rest.Count > 0 ? rest[0].ToLowerInvariant() : "status";
+        switch (sub)
+        {
+            case "status":
+                {
+                    var s = df.Settings;
+                    df.Refresh();
+                    Thread.Sleep(4500); // a peer only counts once its connection has lasted a few seconds
+                    var st = df.Refresh();
+                    P($"期望角色: {DeskflowManager.RoleName(s.Role)}{(s.Role == DeskflowRole.Client ? " → " + s.RemoteHost : string.Empty)}  托管: {(s.Managed ? "Hub" : "关闭")}  联动对端: {(s.LinkPeer ? "开" : "关")}  已接管自启组件: {s.LegacyTakenOver}");
+                    P($"运行状态: {st.Summary}");
+                    P($"core pid={st.CorePid} core数={st.MainCores} 触摸过滤={st.Filtered} 过滤健康={st.FilterHealthy?.ToString() ?? "-"} F24规则={st.F24Rule} 监视器={st.MonitorRunning}");
+                    P($"Deskflow.conf: coreMode={DeskflowManager.RoleName(st.ConfiguredRole)} remoteHost={st.RemoteHost} 屏幕名={st.ScreenName} 端口={st.Port} TLS={st.Tls}");
+                    P($"位置: {df.InstallLocation}  配置: {df.ConfigPath}  日志: {df.CoreLogPath}");
+                    P("旧组件: " + string.Join("；", df.LegacyStatus().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)));
+                    if (DeskflowPeer.IsValidHost(s.RemoteHost))
+                    {
+                        try
+                        {
+                            var peer = PeerLink.GetStatusAsync(s.RemoteHost, TimeSpan.FromSeconds(4)).GetAwaiter().GetResult();
+                            P("对端 Hub: " + (peer?.Text ?? "无应答"));
+                        }
+                        catch (Exception ex)
+                        {
+                            P($"对端 Hub: {s.RemoteHost}:{PeerLink.Port} 不可用（{ex.GetBaseException().Message}）");
+                        }
+                    }
+                    return 0;
+                }
+            case "server":
+            case "client":
+            case "off":
+                {
+                    var role = sub == "server" ? DeskflowRole.Server : sub == "client" ? DeskflowRole.Client : DeskflowRole.Off;
+                    var local = rest.Contains("--local");
+                    var host = rest.Skip(1).FirstOrDefault(a => !a.StartsWith("--"));
+                    // a running hub owns the core: let it do the switch instead of racing its guard
+                    var (ok, msg) = PeerLink.RequestRoleAsync("127.0.0.1", role, host, cascade: !local).GetAwaiter().GetResult();
+                    if (!ok && msg.StartsWith("对端 Hub 无法连接", StringComparison.Ordinal))
+                    {
+                        // no hub running here: switch in this process
+                        (ok, msg) = df.SetRoleAsync(role, host, cascade: !local).GetAwaiter().GetResult();
+                    }
+                    P(msg);
+                    return ok ? 0 : 2;
+                }
+            case "peer":
+                {
+                    if (rest.Count < 2) { P("对端地址: " + df.Settings.RemoteHost + "  剪贴板/文件通道: " + DeskflowPeer.ConfiguredSideChannelHost()); return 0; }
+                    foreach (var n in df.SetPeerHost(rest[1])) P(n);
+                    P("对端地址已保存为 " + rest[1]);
+                    return 0;
+                }
+            case "layout":
+                {
+                    df.Refresh();
+                    df.RefreshLayoutAsync().GetAwaiter().GetResult();
+                    if (df.Layout == null) { P(df.LayoutError); return 2; }
+                    P($"共享布局 服务端={df.Layout.Server} 本机屏幕={df.Layout.LocalScreen} 布局服务={df.LayoutHost}:{DeskflowPeer.LayoutPort} 状态={df.Layout.PeerStatus}");
+                    var active = (OperatingSystem.IsWindows() ? DisplayManager.Enumerate() : LinuxDisplays.Enumerate()).Where(d => d.Active && d.Width > 0).ToList();
+                    foreach (var d in active) P($"  本机 {d.GdiName,-12} ({d.PositionX},{d.PositionY}) {d.Width}x{d.Height}{(d.Primary ? " 主屏" : string.Empty)}");
+                    foreach (var peer in DeskflowPeer.MapPeers(df.Layout, active.Select(d => LocalRect.From(d)).ToList()))
+                        P($"  对端 {peer.Name,-12} ({peer.X},{peer.Y}) 画布尺寸 {peer.Width}x{peer.Height} 分辨率 {peer.ResolutionWidth}x{peer.ResolutionHeight}{(peer.IsServer ? " 服务端" : string.Empty)}");
+                    if (!string.IsNullOrEmpty(df.LayoutError)) P(df.LayoutError);
+                    return 0;
+                }
+            case "takeover":
+                foreach (var n in df.TakeOverLegacy()) P(n);
+                return 0;
+            case "restore":
+                foreach (var n in df.RestoreLegacy()) P(n);
+                return 0;
+            case "link":
+                {
+                    var arg = rest.Count > 1 ? rest[1].ToLowerInvariant() : string.Empty;
+                    if (arg is "on" or "off")
+                    {
+                        df.UpdateSettings(s => s.LinkPeer = arg == "on");
+                        P("联动对端: " + (arg == "on" ? "开启" : "关闭"));
+                        return 0;
+                    }
+                    P("用法: deskflow link on|off");
+                    return 1;
+                }
+            default:
+                P("用法: deskflow [status] | deskflow server|client [对端IP] [--local] | deskflow off | deskflow peer [IP] | deskflow layout | deskflow takeover|restore | deskflow link on|off");
                 return 1;
         }
     }
@@ -438,6 +537,7 @@ public static class Cli
         P("  instances | start <id> | stop <id> | restart <id> | config <id> [output_id] | serverinfo <id>");
         P("  creds <id> <用户> <密码> | auth-test <id> | pair <id> <PIN> [名称] | clients <id>");
         P("  takeover | restore | autostart [on|off] | topology extend|clone|internal|external");
+        P("  deskflow [status] | deskflow server|client [对端IP] [--local] | deskflow off | deskflow peer [IP] | deskflow layout | deskflow takeover|restore | deskflow link on|off");
         P("  shutdown  (让运行中的 Hub 退出但保留虚拟屏；配合 MoonlightHub.exe --minimized --replace 做无中断更新)");
     }
 }

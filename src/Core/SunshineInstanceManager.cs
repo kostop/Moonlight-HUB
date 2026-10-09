@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 
 namespace MoonlightHub.Core;
 
@@ -97,14 +98,24 @@ public sealed class SunshineInstanceManager
 
     // ------------------------------------------------------------------ configuration
     /// <summary>Writes the per-instance sunshine.conf with the last known display-device options.</summary>
+    /// <param name="spec">需要更新配置的 Sunshine 实例。</param>
+    /// <param name="outputId">目标显示设备 ID；留空时抓取主屏且禁止自动调整显示模式。</param>
+    /// <param name="message">返回配置写入结果。</param>
     public bool EnsureConfig(InstanceSpec spec, string outputId, out string message)
     {
         return EnsureConfig(spec, outputId, Get(spec).DesiredDd, out message);
     }
 
     /// <summary>Writes the per-instance sunshine.conf. Returns true when the file content changed.</summary>
+    /// <param name="spec">需要更新配置的 Sunshine 实例。</param>
+    /// <param name="outputId">目标显示设备 ID；留空时抓取主屏且禁止自动调整显示模式。</param>
+    /// <param name="dd">目标虚拟屏的自动激活及显示模式配置。</param>
+    /// <param name="message">返回配置写入结果。</param>
     public bool EnsureConfig(InstanceSpec spec, string outputId, DdOptions dd, out string message)
     {
+        // 没有明确目标时只能抓取主屏，运行时也不能留下虚拟屏的分辨率配置。
+        outputId = string.IsNullOrWhiteSpace(outputId) ? string.Empty : outputId;
+        if (outputId.Length == 0) dd = DdOptions.Disabled;
         var rt = Get(spec);
         Directory.CreateDirectory(rt.ConfigDir);
         rt.DesiredOutputId = outputId;
@@ -144,7 +155,7 @@ public sealed class SunshineInstanceManager
             ("minimum_fps_target", spec.MinimumFpsTarget.ToString()),
             ("upnp", "disabled"),
         };
-        if (dd.Enabled && !string.IsNullOrEmpty(outputId))
+        if (dd.Enabled)
         {
             // Sunshine activates the (idle, switched-off) virtual display right before the session and reverts afterwards.
             managed.Add(("dd_configuration_option", dd.Configuration));
@@ -285,6 +296,59 @@ public sealed class SunshineInstanceManager
         }
     }
 
+    /// <summary>
+    /// Sunshine keeps the undo record of its display changes in &lt;sunshine.exe dir&gt;\config\display_device.state (fixed
+    /// path, not next to the config file, so all instances of one exe share it) and replays it when it starts. A record
+    /// left by a session that never reverted (reboot, crash, hub restart) can name displays that are not connected now —
+    /// the Dell while the laptop runs alone. The revert then fails and Sunshine falls back to "enable all displays" with
+    /// modes Windows picks itself: that put the laptop panel at 1024x768 after every start (2026-10-01, record from the
+    /// 2026-09-30 session on the Dell). Such a record can never be replayed, so it is moved aside before the start.
+    /// </summary>
+    private void DiscardUnrevertableDisplayState(InstanceSpec spec)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        var path = Path.Combine(_settings.SunshineDir, "config", "display_device.state");
+        if (!File.Exists(path)) return;
+        try
+        {
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var doc = JsonDocument.Parse(File.ReadAllText(path))) CollectDeviceIds(doc.RootElement, ids);
+            var present = DisplayManager.Enumerate().Select(d => d.SunshineDeviceId).Where(id => !string.IsNullOrEmpty(id))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var missing = ids.Where(id => !present.Contains(id)).ToList();
+            if (missing.Count == 0) return; // every display is here: let Sunshine revert its own changes
+            var aside = path + ".stale-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            File.Move(path, aside);
+            Log.Warn($"实例 {spec.Id}: Sunshine 的显示还原记录引用了未连接的显示器 {string.Join(", ", missing)}，无法还原，已移到 {Path.GetFileName(aside)}"
+                + "（否则 Sunshine 启动时会启用所有显示器并由 Windows 自选分辨率）");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"实例 {spec.Id}: 检查 display_device.state 失败: {ex.Message}");
+        }
+    }
+
+    private static void CollectDeviceIds(JsonElement e, HashSet<string> ids)
+    {
+        static bool IsDeviceId(string s) => s.Length == 38 && s[0] == '{' && s[^1] == '}' && Guid.TryParse(s, out _);
+        switch (e.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var p in e.EnumerateObject())
+                {
+                    if (IsDeviceId(p.Name)) ids.Add(p.Name);
+                    CollectDeviceIds(p.Value, ids);
+                }
+                break;
+            case JsonValueKind.Array:
+                foreach (var x in e.EnumerateArray()) CollectDeviceIds(x, ids);
+                break;
+            case JsonValueKind.String:
+                if (e.GetString() is { } s && IsDeviceId(s)) ids.Add(s);
+                break;
+        }
+    }
+
     public async Task<bool> StartAsync(InstanceSpec spec, CancellationToken ct = default)
     {
         var rt = Get(spec);
@@ -316,6 +380,7 @@ public sealed class SunshineInstanceManager
         rt.State = InstanceState.Starting;
         rt.LastStartUtc = DateTime.UtcNow;
         Changed?.Invoke();
+        DiscardUnrevertableDisplayState(spec);
         try
         {
             var psi = new ProcessStartInfo(_settings.SunshineExe, $"\"{rt.ConfigPath}\"")

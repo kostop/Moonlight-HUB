@@ -125,6 +125,20 @@ public sealed class SunshineApi
         }
     }
 
+    /// <summary>Ends the running session (Sunshine then reverts the display configuration it applied for it).</summary>
+    public async Task<(bool Ok, string Message)> CloseAppAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var response = await _client.PostAsync("api/apps/close", new StringContent(string.Empty), ct).ConfigureAwait(false);
+            return response.IsSuccessStatusCode ? (true, "已结束串流会话") : (false, $"HTTP {(int)response.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
     public async Task<(bool Ok, string Message)> RestartAsync(CancellationToken ct = default)
     {
         try

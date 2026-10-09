@@ -1,0 +1,57 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="MoonlightHub.UI.Views.VirtualDisplaysView">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+            <Border Classes="card">
+                <DockPanel>
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Top">
+                        <Button x:Name="InstallDriverBtn" Content="安装驱动" Classes="primary" Click="InstallDriver_Click" IsVisible="False" ToolTip.Tip="安装随本程序提供的 Parsec 虚拟显示驱动（parsec-vdd-setup.exe）" />
+                        <Button x:Name="RestartAdapterBtn" Content="重启适配器" Classes="ghost" Click="RestartAdapter_Click" ToolTip.Tip="当驱动进入错误状态（设备管理器里 Parsec Virtual Display Adapter 带感叹号）时用这个恢复；以管理员权限运行时守护会自动做这件事" />
+                        <Button x:Name="OpenBtn" Content="连接驱动" Classes="ghost" Click="Open_Click" />
+                        <Button Content="添加虚拟屏" Classes="primary" Click="Add_Click" />
+                        <Button Content="全部移除" Classes="danger" Click="RemoveAll_Click" Margin="0" />
+                    </StackPanel>
+                    <StackPanel>
+                        <TextBlock Text="Parsec Virtual Display Driver" Classes="h2" />
+                        <TextBlock x:Name="DriverText" Classes="muted" Margin="0,4,0,0" Text="—" />
+                        <TextBlock x:Name="PingText" Classes="muted" Text="" />
+                        <TextBlock Classes="muted" Margin="0,8,0,0" TextWrapping="Wrap"
+                                   Text="驱动约 1 秒收不到 keep-alive 就会移除所有虚拟屏。本程序每 50ms 发送一次，由原生线程发送（锁定内存、最高优先级，不受垃圾回收暂停和磁盘繁忙影响），只要本程序在运行，虚拟屏就会一直保持；若系统整体卡顿超过 1 秒导致虚拟屏丢失，守护会立即重建并让平板重新连接。显示器热插拔（DP 链路重连、切换输入源、远程桌面改分辨率）可能让驱动进程停止响应（设备管理器里出现感叹号），守护会自动重启适配器并重新应用方案。" />
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <TextBlock Text="当前虚拟屏" Classes="h2" Margin="0,4,0,10" />
+            <StackPanel x:Name="List" />
+
+            <Border Classes="card" Margin="0,6,0,14">
+                <StackPanel>
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <TextBox x:Name="ModeW" Width="70" Text="2000" ToolTip.Tip="宽度" />
+                            <TextBlock Text="×" VerticalAlignment="Center" Margin="6,0" />
+                            <TextBox x:Name="ModeH" Width="70" Text="1200" ToolTip.Tip="高度" />
+                            <TextBlock Text="@" VerticalAlignment="Center" Margin="6,0" />
+                            <TextBox x:Name="ModeHz" Width="60" Text="120" ToolTip.Tip="刷新率" />
+                            <Button Content="注册模式 (需管理员)" Classes="ghost" Click="AddMode_Click" Margin="10,0,0,0" />
+                        </StackPanel>
+                        <TextBlock Text="自定义分辨率 / 刷新率" Classes="h2" VerticalAlignment="Center" />
+                    </DockPanel>
+                    <TextBlock Classes="muted" Margin="0,6,0,8" TextWrapping="Wrap"
+                               Text="Parsec 驱动内置 1920×1080 等常见模式；平板的 2000×1200 需要作为自定义模式写入注册表 HKLM\SOFTWARE\Parsec\vdd。应用方案时如果缺少模式会自动请求注册。驱动只在虚拟屏重新插拔时读取这张表：注册或删除模式后，Hub 会自动重新插拔空闲的虚拟屏；正在串流的虚拟屏等客户端断开后再处理。" />
+                    <StackPanel x:Name="ModesPanel" />
+                </StackPanel>
+            </Border>
+
+            <Border Classes="card">
+                <StackPanel>
+                    <TextBlock Text="降低虚拟屏延迟的建议" Classes="h2" />
+                    <TextBlock Classes="muted" Margin="0,6,0,0" TextWrapping="Wrap" Text="• 虚拟屏刷新率与 Moonlight 串流帧率保持一致（60 fps ↔ 60 Hz），避免 90 Hz 屏配 60 fps 造成的采样抖动；方案编辑器里的「合成刷新率」可以把虚拟屏提高到 120 Hz，让 DWM 每 8ms 合成一次，Sunshine 抓到的画面更新鲜（GPU 负载略增）。" />
+                    <TextBlock Classes="muted" Margin="0,4,0,0" TextWrapping="Wrap" Text="• 每个实例的 dd_configuration_option 已固定为 disabled：显示拓扑由本程序在连接前准备好，Sunshine 不再在每次连接时切换显示器，连接更快也更稳。" />
+                    <TextBlock Classes="muted" Margin="0,4,0,0" TextWrapping="Wrap" Text="• 虚拟屏分辨率与平板一致 (2000×1200) 可避免缩放；「仅副屏」方案只保留虚拟屏，DWM 无需同时合成物理屏。" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

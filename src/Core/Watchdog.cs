@@ -155,6 +155,7 @@ public sealed class Watchdog : IDisposable
             var driverNote = EnsureDriverAlive();
             if (driverNote != null) notes.Add(driverNote);
         }
+        CheckKeepAliveStalls(notes);
 
         _instances.PollAsync().GetAwaiter().GetResult();
 
@@ -177,13 +178,18 @@ public sealed class Watchdog : IDisposable
         // desktop tools): for a few seconds the virtual display may be missing although the driver still has it.
         // Sending ADD/REMOVE into that window is exactly what used to hang the driver, so repairs wait it out.
         var settling = (DateTime.UtcNow - _lastDisplayChangeUtc) < TimeSpan.FromSeconds(12);
+        // …unless the keep-alive just stalled for about a second: then the driver unplugged the displays itself and
+        // there is no hot-plug to wait out, so the repair starts right away
+        var urgentRepair = false;
 
         // 2) virtual displays vanished (driver reset, sleep, other tools)
         if (!health.VirtualDisplaysOk)
         {
             _displayMismatchTicks++;
-            notes.Add($"虚拟屏 {health.ParsecActive}/{health.ParsecExpected}" + (settling ? "（显示器正在重新枚举，等待）" : string.Empty));
-            if (_displayMismatchTicks >= 3 && !settling) needRepair = true;
+            urgentRepair = (DateTime.UtcNow - _keepAliveStallUtc) < TimeSpan.FromSeconds(60);
+            notes.Add($"虚拟屏 {health.ParsecActive}/{health.ParsecExpected}"
+                + (urgentRepair ? "（keep-alive 停顿后被驱动移除，立即修复）" : settling ? "（显示器正在重新枚举，等待）" : string.Empty));
+            if (urgentRepair || _displayMismatchTicks >= 3 && !settling) needRepair = true;
         }
         else
         {
@@ -226,6 +232,9 @@ public sealed class Watchdog : IDisposable
 
         // 4a) a running Sunshine session keeps the GDI name it resolved at start; when the virtual display was
         //     re-created under a new name, the session silently falls back to the primary display → restart it.
+        //     After an urgent repair (display unplugged by the driver mid-stream) that is certain: restart at once.
+        var restartAfterUrgentRepair = _restartStreamingAfterRepair;
+        _restartStreamingAfterRepair = false;
         foreach (var id in _state.ExpectedInstances)
         {
             var spec = _settings.Instance(id);
@@ -235,6 +244,17 @@ public sealed class Watchdog : IDisposable
             if (!_state.InstanceOutputIds.TryGetValue(id, out var outputId) || string.IsNullOrEmpty(outputId)) continue;
             var target = health.Displays.FirstOrDefault(d => d.Active && d.SunshineDeviceId.Equals(outputId, StringComparison.OrdinalIgnoreCase));
             var captured = _instances.LastCaptureResolution(spec);
+            if (restartAfterUrgentRepair && target != null
+                && (captured == null || captured.Value.Width != target.Width || captured.Value.Height != target.Height)
+                && (DateTime.UtcNow - _instanceLastRestart.GetValueOrDefault(id, DateTime.MinValue)) > TimeSpan.FromSeconds(60))
+            {
+                _instanceLastRestart[id] = DateTime.UtcNow;
+                _captureMismatchTicks[id] = 0;
+                Log.Warn($"守护: 虚拟屏在串流中被驱动移除后已重建，实例 {id} 的会话仍在抓取{(captured == null ? "未知目标" : $" {captured.Value.Width}x{captured.Value.Height}")}，立即重启实例让客户端重新连接到 {target.GdiName}");
+                notes.Add($"实例 {id} 抓取目标错位，重启");
+                _ = Task.Run(() => _instances.RestartAsync(spec));
+                continue;
+            }
             if (target == null || captured == null) { _captureMismatchTicks[id] = 0; continue; }
             var mismatch = captured.Value.Width != target.Width || captured.Value.Height != target.Height;
             _captureMismatchTicks[id] = mismatch ? _captureMismatchTicks.GetValueOrDefault(id) + 1 : 0;
@@ -415,15 +435,17 @@ public sealed class Watchdog : IDisposable
             }
         }
 
-        if (needRepair && !settling && (DateTime.UtcNow - _lastRepairUtc) > RepairInterval())
+        if (needRepair && (!settling || urgentRepair) && (DateTime.UtcNow - _lastRepairUtc) > RepairInterval())
         {
             _lastRepairUtc = DateTime.UtcNow;
+            if (urgentRepair) _keepAliveStallUtc = DateTime.MinValue; // one urgent repair per stall
             Log.Warn("守护: 重新应用方案「" + profile.Name + "」 (" + string.Join("; ", notes) + ")" + (_failedRepairs > 0 ? $"，连续失败 {_failedRepairs} 次" : string.Empty));
             _ = _engine.ApplyAsync(profile).ContinueWith(t =>
             {
                 var ok = t.Status == TaskStatus.RanToCompletion && t.Result.Success;
                 _failedRepairs = ok ? 0 : Math.Min(_failedRepairs + 1, 8);
                 if (!ok && _failedRepairs == 3) Log.Error("守护: 连续 3 次修复失败，降低重试频率（最长每 10 分钟一次）: " + (t.Exception?.Message ?? t.Result?.Summary));
+                if (ok && urgentRepair) _restartStreamingAfterRepair = true; // consumed by the next tick (4a)
             }, TaskScheduler.Default);
         }
 
@@ -431,6 +453,47 @@ public sealed class Watchdog : IDisposable
             ? $"正常 · 虚拟屏 {health.ParsecActive}/{health.ParsecExpected} · 实例 {string.Join(",", _state.ExpectedInstances)}"
             : string.Join("; ", notes);
     }
+
+    private DateTime _keepAliveStallUtc = DateTime.MinValue;
+    private volatile bool _restartStreamingAfterRepair;
+    private int _pendingGapMaxMs;
+    private int _pendingLongGaps;
+    private DateTime _lastGapLogUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// The driver unplugs every virtual display after about a second without a ping (2026-09-30 15:06:40: the tablet
+    /// display vanished while a disk-heavy image restore ran). Gaps of 300 ms and more are logged with their likely
+    /// cause (at most once a minute, a potentially fatal one at once); one of 900 ms and more makes the next repair of
+    /// missing displays urgent.
+    /// </summary>
+    private void CheckKeepAliveStalls(List<string> notes)
+    {
+        if (!_vdd.IsOpen) return;
+        var ka = _vdd.TakeKeepAliveReport();
+        if (ka.MaxGapMs >= 300)
+        {
+            _pendingLongGaps += Math.Max(1, ka.LongGaps);
+            if (ka.MaxGapMs > _pendingGapMaxMs)
+            {
+                _pendingGapMaxMs = ka.MaxGapMs;
+                _pendingGapCause = !ka.Native ? "托管线程停顿（GC 暂停或内存页换入）"
+                    : ka.MaxIoMs * 2 >= ka.MaxGapMs ? $"驱动响应慢（单次 UPDATE 耗时 {ka.MaxIoMs} ms）"
+                    : "整个系统停顿，原生 ping 线程没有被调度";
+            }
+        }
+        var lethal = ka.MaxGapMs >= 900;
+        if (_pendingGapMaxMs == 0 || !lethal && (DateTime.UtcNow - _lastGapLogUtc) < TimeSpan.FromMinutes(1)) return;
+        Log.Warn($"VDD keep-alive 停顿: 最长 {_pendingGapMaxMs} ms（≥300 ms 共 {_pendingLongGaps} 次）：{_pendingGapCause}"
+            + (lethal ? "；超过约 1 s 驱动会移除所有虚拟屏" : string.Empty));
+        _lastGapLogUtc = DateTime.UtcNow;
+        _pendingGapMaxMs = 0;
+        _pendingLongGaps = 0;
+        if (!lethal) return;
+        _keepAliveStallUtc = DateTime.UtcNow;
+        notes.Add($"keep-alive 停顿 {ka.MaxGapMs} ms");
+    }
+
+    private string _pendingGapCause = string.Empty;
 
     private int _failedRepairs;
     private int _driverRecoveries;

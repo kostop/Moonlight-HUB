@@ -1,0 +1,107 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ic="using:FluentIcons.Avalonia"
+             x:Class="MoonlightHub.UI.Views.DeskflowView">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+            <Border Classes="card">
+                <StackPanel>
+                    <DockPanel>
+                        <Border x:Name="StatusPill" DockPanel.Dock="Right" Classes="pill" Background="{StaticResource Surface3Brush}">
+                            <TextBlock x:Name="StatusText" Text="—" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}" />
+                        </Border>
+                        <TextBlock Text="键鼠共享角色" Classes="h2" VerticalAlignment="Center" />
+                    </DockPanel>
+                    <TextBlock Classes="muted" Margin="0,4,0,12"
+                               Text="服务端：本机的键盘鼠标可以移到另一台电脑的屏幕上。客户端：本机由另一台电脑控制。开启“联动对端”后，在任意一台 Moonlight Hub 上切换，另一台会自动切到相反的角色。" />
+
+                    <UniformGrid Columns="3" Margin="-6,0,-6,0">
+                        <Button x:Name="ServerBtn" Margin="6,0" Padding="14,12" Click="Server_Click" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
+                            <StackPanel Orientation="Horizontal">
+                                <ic:SymbolIcon Symbol="Desktop" FontSize="22" Margin="0,0,12,0" VerticalAlignment="Center" />
+                                <StackPanel>
+                                    <TextBlock Text="服务端" FontWeight="SemiBold" FontSize="15" />
+                                    <TextBlock Text="本机键鼠控制另一台电脑" Classes="muted" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="ClientBtn" Margin="6,0" Padding="14,12" Click="Client_Click" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
+                            <StackPanel Orientation="Horizontal">
+                                <ic:SymbolIcon Symbol="PhoneLaptop" FontSize="22" Margin="0,0,12,0" VerticalAlignment="Center" />
+                                <StackPanel>
+                                    <TextBlock Text="客户端" FontWeight="SemiBold" FontSize="15" />
+                                    <TextBlock x:Name="ClientSub" Text="由另一台电脑控制本机" Classes="muted" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Button>
+                        <Button x:Name="OffBtn" Margin="6,0" Padding="14,12" Click="Off_Click" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
+                            <StackPanel Orientation="Horizontal">
+                                <ic:SymbolIcon Symbol="Power" FontSize="22" Margin="0,0,12,0" VerticalAlignment="Center" />
+                                <StackPanel>
+                                    <TextBlock Text="关闭" FontWeight="SemiBold" FontSize="15" />
+                                    <TextBlock Text="停止 deskflow-core" Classes="muted" />
+                                </StackPanel>
+                            </StackPanel>
+                        </Button>
+                    </UniformGrid>
+
+                    <Grid ColumnDefinitions="170,*,Auto,Auto" Margin="0,14,0,0">
+                        <TextBlock Text="对端电脑 IP" Classes="muted" VerticalAlignment="Center" />
+                        <TextBox x:Name="RemoteHostBox" Grid.Column="1" Watermark="例如 10.10.3.136" ToolTip.Tip="另一台电脑的 IP（它的 IP 变了就在这里改）" />
+                        <Button Grid.Column="2" Content="保存地址" Click="SavePeer_Click" Classes="ghost" Margin="8,0,0,0" />
+                        <Button Grid.Column="3" Content="连接为客户端" Click="Client_Click" Classes="primary" Margin="8,0,0,0" />
+                    </Grid>
+                    <TextBlock x:Name="PeerHint" Classes="muted" Margin="170,6,0,0"
+                               Text="保存后，本机所有 Deskflow 组件都改用这个地址：客户端连接、对端 Hub 联动、共享屏幕布局、剪贴板 / 文件传输 / 布局同步进程。" />
+                    <TextBlock x:Name="ActionText" Classes="muted" Margin="0,10,0,0" Text="" />
+                </StackPanel>
+            </Border>
+
+            <Border Classes="card">
+                <StackPanel>
+                    <TextBlock Text="运行状态" Classes="h2" Margin="0,0,0,10" />
+                    <Grid x:Name="InfoGrid" ColumnDefinitions="170,*" />
+                </StackPanel>
+            </Border>
+
+            <Border Classes="card">
+                <StackPanel>
+                    <TextBlock Text="托管与选项" Classes="h2" Margin="0,0,0,10" />
+                    <CheckBox x:Name="LinkBox" Click="Option_Click">
+                        <TextBlock TextWrapping="Wrap" Text="联动对端：切换角色时，另一台电脑的 Moonlight Hub 自动切到相反角色（服务端先启动，客户端再连接）" />
+                    </CheckBox>
+                    <CheckBox x:Name="ManagedBox" Click="Option_Click">
+                        <TextBlock TextWrapping="Wrap" Text="由 Moonlight Hub 运行并守护 deskflow-core（Deskflow 自己的开机自启与后台组件保持关闭）" />
+                    </CheckBox>
+                    <CheckBox x:Name="FilterBox" Click="Option_Click">
+                        <TextBlock TextWrapping="Wrap" Text="服务端经过触摸过滤包装器运行（平板触摸不移动 Deskflow 光标，F24 把键盘切回本机）" />
+                    </CheckBox>
+                    <CheckBox x:Name="TouchIsolationBox" Click="Option_Click">
+                        <TextBlock TextWrapping="Wrap" Text="平板触摸不移动本机鼠标（服务端时由触摸过滤器负责；客户端 / 关闭 / core 重启时由 Hub 运行的触摸隔离器负责）" />
+                    </CheckBox>
+                    <CheckBox x:Name="MonitorBox" Click="Option_Click" Margin="0,2,0,10">
+                        <TextBlock TextWrapping="Wrap" Text="服务端模式下保持“触摸时释放键盘”监视器运行" />
+                    </CheckBox>
+                    <WrapPanel>
+                        <Button Content="重新启动 core" Click="Reapply_Click" Classes="ghost" Margin="0,0,8,8" />
+                        <Button Content="配置目录" Click="OpenConfig_Click" Classes="ghost" Margin="0,0,8,8" />
+                        <Button x:Name="TakeOverBtn" Content="关闭 Deskflow 自带的开机自启" Click="TakeOver_Click" Classes="ghost" Margin="0,0,8,8" />
+                        <Button x:Name="RestoreBtn" Content="恢复 Deskflow 自带的开机自启（回退）" Click="Restore_Click" Classes="danger" Margin="0,0,8,8" />
+                    </WrapPanel>
+                    <TextBlock x:Name="LegacyText" Classes="muted" Text="—" Margin="0,4,0,0" />
+                </StackPanel>
+            </Border>
+
+            <Border Classes="card">
+                <StackPanel>
+                    <DockPanel Margin="0,0,0,10">
+                        <Button DockPanel.Dock="Right" Content="打开日志文件" Click="OpenLog_Click" Classes="ghost" Margin="0" />
+                        <TextBlock Text="deskflow-core 日志" Classes="h2" VerticalAlignment="Center" />
+                    </DockPanel>
+                    <TextBox x:Name="LogBox" Classes="mono" Height="220" IsReadOnly="True" TextWrapping="NoWrap" AcceptsReturn="True"
+                             ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" VerticalContentAlignment="Top" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

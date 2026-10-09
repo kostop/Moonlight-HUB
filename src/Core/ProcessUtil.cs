@@ -116,6 +116,7 @@ public static class ProcessUtil
 
     public static bool IsElevated()
     {
+        if (!OperatingSystem.IsWindows()) return false;
         using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
         var principal = new System.Security.Principal.WindowsPrincipal(identity);
         return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
@@ -200,6 +201,93 @@ public static class ProcessUtil
         catch (Exception ex)
         {
             Log.Warn($"打开 {target} 失败: {ex.Message}");
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string? lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess, hThread;
+        public int dwProcessId, dwThreadId;
+    }
+
+    [DllImport("user32.dll")] private static extern IntPtr GetShellWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
+    [DllImport("advapi32.dll", SetLastError = true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] private static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attributes, int impersonationLevel, int tokenType, out IntPtr newToken);
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcessWithTokenW(IntPtr token, uint logonFlags, string? application, System.Text.StringBuilder commandLine, uint creationFlags, IntPtr environment, string? currentDirectory, ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
+
+    /// <summary>
+    /// Starts a program with the desktop shell's (unelevated) token, so helpers launched by the elevated hub run with the
+    /// same rights as when the user starts them. Falls back to a plain start when the hub itself is not elevated.
+    /// </summary>
+    public static bool StartAsShellUser(string exe, string arguments, bool hidden) => StartAsShellUserPid(exe, arguments, hidden) > 0;
+
+    /// <summary>Same as <see cref="StartAsShellUser"/> but returns the process id (0 on failure).</summary>
+    public static int StartAsShellUserPid(string exe, string arguments, bool hidden)
+    {
+        if (!OperatingSystem.IsWindows() || !IsElevated())
+        {
+            try
+            {
+                using var p = Process.Start(new ProcessStartInfo(exe, arguments) { UseShellExecute = false, CreateNoWindow = hidden, WorkingDirectory = Path.GetDirectoryName(exe) ?? string.Empty });
+                return p?.Id ?? 0;
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"启动 {exe} 失败: {ex.Message}");
+                return 0;
+            }
+        }
+
+        IntPtr process = IntPtr.Zero, token = IntPtr.Zero, primary = IntPtr.Zero;
+        try
+        {
+            var shell = GetShellWindow();
+            if (shell == IntPtr.Zero || GetWindowThreadProcessId(shell, out var shellPid) == 0) throw new InvalidOperationException("找不到桌面外壳进程");
+            process = OpenProcess(0x1000 /* QUERY_LIMITED_INFORMATION */, false, shellPid);
+            if (process == IntPtr.Zero || !OpenProcessToken(process, 0x0002 /* TOKEN_DUPLICATE */, out token)) throw new System.ComponentModel.Win32Exception();
+            // TOKEN_QUERY | ASSIGN_PRIMARY | DUPLICATE | ADJUST_DEFAULT | ADJUST_SESSIONID, SecurityImpersonation, TokenPrimary
+            if (!DuplicateTokenEx(token, 0x018B, IntPtr.Zero, 2, 1, out primary)) throw new System.ComponentModel.Win32Exception();
+            var si = new STARTUPINFO { cb = Marshal.SizeOf<STARTUPINFO>(), lpDesktop = @"winsta0\default" };
+            if (hidden)
+            {
+                si.dwFlags = 0x1; // STARTF_USESHOWWINDOW
+                si.wShowWindow = 0; // SW_HIDE
+            }
+            var cmd = new System.Text.StringBuilder($"\"{exe}\" {arguments}".TrimEnd());
+            const uint CREATE_NO_WINDOW = 0x08000000, CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+            if (!CreateProcessWithTokenW(primary, 0, exe, cmd, (hidden ? CREATE_NO_WINDOW : 0) | CREATE_UNICODE_ENVIRONMENT, IntPtr.Zero, Path.GetDirectoryName(exe), ref si, out var pi))
+            {
+                throw new System.ComponentModel.Win32Exception();
+            }
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return pi.dwProcessId;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"以普通用户身份启动 {Path.GetFileName(exe)} 失败: {ex.Message}");
+            return 0;
+        }
+        finally
+        {
+            if (primary != IntPtr.Zero) CloseHandle(primary);
+            if (token != IntPtr.Zero) CloseHandle(token);
+            if (process != IntPtr.Zero) CloseHandle(process);
         }
     }
 }

@@ -1,34 +1,68 @@
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Media;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.Media;
+using FluentIcons.Avalonia;
+using FluentIcons.Common;
 using MoonlightHub.Core;
 
 namespace MoonlightHub.UI;
 
 internal static class Ui
 {
-    public static Brush Res(string key) => (Brush)Application.Current.FindResource(key);
-    public static Style St(string key) => (Style)Application.Current.FindResource(key);
+    /// <summary>Theme brush by key (see App.axaml), e.g. "AccentBrush".</summary>
+    public static IBrush Res(string key)
+    {
+        var app = Application.Current;
+        if (app != null && app.TryGetResource(key, app.ActualThemeVariant, out var value) && value is IBrush brush) return brush;
+        return Brushes.Transparent;
+    }
 
-    public static TextBlock T(string text, string? style = null, Brush? fg = null)
+    /// <summary>Maps the style names of the WPF version ("Muted", "GhostButton", …) to the Avalonia style classes.</summary>
+    public static string ClassFor(string style) => style switch
+    {
+        "H1" => "h1",
+        "H2" => "h2",
+        "Muted" => "muted",
+        "Mono" => "mono",
+        "PrimaryButton" => "primary",
+        "GhostButton" => "ghost",
+        "DangerButton" => "danger",
+        "IconButton" => "icon",
+        "Card" => "card",
+        "SubCard" => "subcard",
+        "Pill" => "pill",
+        _ => style
+    };
+
+    public static void AddClass(StyledElement element, string? style)
+    {
+        if (!string.IsNullOrEmpty(style)) element.Classes.Add(ClassFor(style));
+    }
+
+    public static TextBlock T(string text, string? style = null, IBrush? fg = null)
     {
         var tb = new TextBlock { Text = text };
-        if (style != null) tb.Style = St(style);
+        AddClass(tb, style);
         if (fg != null) tb.Foreground = fg;
         return tb;
     }
 
-    public static TextBlock Icon(string glyph, Brush? fg = null, double size = 16)
+    /// <summary>Icon for a Segoe MDL2 glyph used by the WPF version (see <see cref="Icons"/>).</summary>
+    public static SymbolIcon Icon(string glyph, IBrush? fg = null, double size = 16) => Icon(Icons.FromGlyph(glyph), fg, size);
+
+    public static SymbolIcon Icon(Symbol symbol, IBrush? fg = null, double size = 16)
     {
-        var tb = new TextBlock { Text = glyph, Style = St("Icon"), FontSize = size };
-        if (fg != null) tb.Foreground = fg;
-        return tb;
+        var icon = new SymbolIcon { Symbol = symbol, FontSize = size, VerticalAlignment = VerticalAlignment.Center };
+        if (fg != null) icon.Foreground = fg;
+        return icon;
     }
 
-    public static Button B(string text, RoutedEventHandler onClick, string? style = null)
+    public static Button B(string text, EventHandler<RoutedEventArgs> onClick, string? style = null)
     {
         var b = new Button { Content = text };
-        if (style != null) b.Style = St(style);
+        AddClass(b, style);
         b.Click += onClick;
         return b;
     }
@@ -43,25 +77,28 @@ internal static class Ui
             "accent" => ("AccentSoftBrush", "AccentBrush"),
             _ => ("Surface3Brush", "MutedBrush")
         };
-        return new Border
+        var border = new Border
         {
-            Style = St("Pill"),
             Background = Res(bg),
-            Child = new TextBlock { Text = text, Foreground = Res(fg), FontSize = 12, FontWeight = FontWeights.SemiBold }
+            Child = new TextBlock { Text = text, Foreground = Res(fg), FontSize = 12, FontWeight = FontWeight.SemiBold }
         };
+        border.Classes.Add("pill");
+        return border;
     }
 
-    public static Border Card(UIElement child, bool sub = false)
+    public static Border Card(Control child, bool sub = false)
     {
-        return new Border { Style = St(sub ? "SubCard" : "Card"), Child = child };
+        var border = new Border { Child = child };
+        border.Classes.Add(sub ? "subcard" : "card");
+        return border;
     }
 
-    public static StackPanel Row(params UIElement[] children)
+    public static StackPanel Row(params Control[] children)
     {
         var sp = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         foreach (var c in children)
         {
-            if (c is FrameworkElement fe && fe.Margin == default) fe.Margin = new Thickness(0, 0, 8, 0);
+            if (c.Margin == default) c.Margin = new Thickness(0, 0, 8, 0);
             sp.Children.Add(c);
         }
         return sp;

@@ -64,7 +64,7 @@ public sealed class ProfileEngine
         if (profile.AutoMatchClientResolution && spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var mode) && mode.Width > 0 && mode.Height > 0)
         {
             var (w, h) = HostResolutionFor(spec.InstanceId, mode);
-            if (gdiName == null || DisplayManager.GetModes(gdiName, w, h).Any(m => m.Orientation == 0)) return (w, h);
+            if (string.IsNullOrWhiteSpace(gdiName) || DisplayManager.GetModes(gdiName, w, h).Any(m => m.Orientation == 0)) return (w, h);
         }
         return (spec.Width, spec.Height);
     }
@@ -159,15 +159,34 @@ public sealed class ProfileEngine
     /// Applies the client's requested stream mode to the virtual display an instance streams (resolution + refresh rate).
     /// Returns null when nothing had to change, false when the required mode is not available on the display.
     /// </summary>
+    /// <param name="instanceId">请求串流的 Sunshine 实例编号。</param>
+    /// <param name="mode">客户端请求的分辨率及帧率。</param>
     public bool? ApplyClientMode(int instanceId, ClientMode mode)
     {
-        if (!_state.InstanceOutputIds.TryGetValue(instanceId, out var outputId) || string.IsNullOrEmpty(outputId)) return null;
+        // 与方案切换/重新插拔互斥，避免检查完目标后又被另一个操作移除。
+        if (!_busy.Wait(0)) return null;
+        try { return ApplyClientModeCore(instanceId, mode); }
+        finally { _busy.Release(); }
+    }
+
+    /// <summary>在持有方案锁时匹配客户端模式，仅修改独立的虚拟屏。</summary>
+    /// <param name="instanceId">请求串流的 Sunshine 实例编号。</param>
+    /// <param name="mode">客户端请求的分辨率及帧率。</param>
+    private bool? ApplyClientModeCore(int instanceId, ClientMode mode)
+    {
+        if (!_state.InstanceOutputIds.TryGetValue(instanceId, out var outputId) || string.IsNullOrWhiteSpace(outputId)) return null;
         var profile = _settings.Profile(_state.ActiveProfileId);
-        if (profile == null || (!profile.MatchClientFps && !profile.AutoMatchClientResolution)) return null;
+        if (profile == null || profile.Mode is ProfileMode.MainOnly or ProfileMode.Clone || (!profile.MatchClientFps && !profile.AutoMatchClientResolution)) return null;
         var spec = profile.VirtualDisplays.FirstOrDefault(v => v.InstanceId == instanceId);
         if (spec == null) return null;
-        var display = DisplayManager.Enumerate().FirstOrDefault(d => d.Active && d.SunshineDeviceId.Equals(outputId, StringComparison.OrdinalIgnoreCase));
-        if (display == null || !display.IsParsec) return null;
+        var displays = DisplayManager.Enumerate();
+        var display = displays.FirstOrDefault(d => d.Active && d.SunshineDeviceId.Equals(outputId, StringComparison.OrdinalIgnoreCase));
+        if (display == null || !display.IsParsec || !display.IsReady) return null;
+        if (DisplayManager.ValidateLayoutTargets(new[] { new LayoutItem(display) }, displays) is { } targetError)
+        {
+            Log.Warn("拒绝匹配客户端显示模式: " + targetError);
+            return false;
+        }
 
         var (w, h) = ResolveResolution(profile, spec, display.GdiName);
         var hz = ResolveHz(profile, spec, display.GdiName, w, h);
@@ -200,8 +219,8 @@ public sealed class ProfileEngine
             Log.Info($"客户端请求 {mode}（虚拟屏应为 {cw}x{ch}@{mode.Fps}），但 {display.GdiName} 没有这个模式。可在“虚拟屏”页注册自定义模式 {cw}x{ch}@{mode.Fps}");
             return false;
         }
-        var r = DisplayManager.ApplyLayout(new[] { new LayoutItem { GdiName = display.GdiName, Width = w, Height = h, RefreshRate = hz } });
-        Log.Info($"客户端请求 {mode}，虚拟屏 {display.GdiName} 已从 {display.ModeText} 切换到 {w}x{h}@{hz}Hz: {r}");
+        var r = DisplayManager.ApplyLayout(new[] { new LayoutItem(display) { Width = w, Height = h, RefreshRate = hz } });
+        Log.Info($"客户端请求 {mode}，虚拟屏 {display.GdiName} 从 {display.ModeText} 切换到 {w}x{h}@{hz}Hz{(r.Success ? "成功" : "失败")}: {r}");
         return r.Success;
     }
 
@@ -234,15 +253,18 @@ public sealed class ProfileEngine
         var clientFps = ClientFps(spec);
         int? manualHz = profile.MatchClientFps && clientFps > 0 && hz == clientFps ? null : hz;
         var configuration = profile.Mode == ProfileMode.VirtualOnly ? "ensure_only_display" : "ensure_active";
-        return new DdOptions(configuration, w, h, manualHz, RevertOnDisconnect: true, RevertDelayMs: 3000);
+        // Extend: a dropped connection keeps the session and the display; the hub asks before switching it off
+        // (VirtualOnly keeps reverting on disconnect: the physical displays are off there, a prompt would not be seen)
+        var ask = _settings.ConfirmStandbyOnDisconnect && profile.Mode == ProfileMode.Extend;
+        return new DdOptions(configuration, w, h, manualHz, RevertOnDisconnect: !ask, RevertDelayMs: ask ? 500 : 3000);
     }
 
     /// <summary>Switches an idle virtual display off (keeps it connected). Returns true when something was detached.</summary>
     public bool DetachIdleVirtualDisplay(DisplayInfo display, string reason)
     {
         if (!display.Active || !display.IsParsec) return false;
-        var r = DisplayManager.ApplyLayout(new[] { new LayoutItem { GdiName = display.GdiName, Attached = false } });
-        Log.Info($"副屏待机: 已停用 {display.GdiName}（{reason}），客户端连接时由 Sunshine 自动启用: {r}");
+        var r = DisplayManager.ApplyLayout(new[] { new LayoutItem(display) { Attached = false } });
+        Log.Info($"副屏待机: 停用 {display.GdiName}{(r.Success ? "成功" : "失败")}（{reason}）: {r}");
         return r.Success;
     }
 
@@ -353,6 +375,8 @@ public sealed class ProfileEngine
             var want = profile.VirtualCount;
             var specs = profile.VirtualDisplays.OrderBy(v => v.Slot).Take(want).ToList();
             for (var i = 0; i < specs.Count; i++) specs[i].Slot = i; // slots are always contiguous 0..N-1
+            // the physical displays as they are before anything gets plugged (see RestorePhysicalDisplays)
+            var physicalBefore = DisplayManager.Enumerate().Where(d => !d.IsParsec && d.IsReady).ToList();
 
             // ---------------------------------------------------------------- 1. driver
             if (want > 0 || DisplayManager.Enumerate().Any(d => d.IsParsec))
@@ -433,7 +457,20 @@ public sealed class ProfileEngine
             {
                 displays = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(8));
             }
+            // "virtual only" switches the physical displays off on purpose; every other mode keeps them as they were
+            if (profile.Mode != ProfileMode.VirtualOnly || profile.IdleOff)
+            {
+                displays = RestorePhysicalDisplays(result, physicalBefore, displays);
+            }
             parsec = displays.Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).ToList();
+            if (specs.Any(spec => !parsec.Any(d => d.ParsecSlot == spec.Slot &&
+                    (d.IsReady || standBy && !d.Active))))
+            {
+                result.Success = false;
+                result.Summary = "虚拟屏已断开或尚未就绪，已停止应用显示配置";
+                Step(result, "✗ " + result.Summary);
+                return result;
+            }
             var physicalActive = displays.Where(d => !d.IsParsec && d.Active).ToList();
             var primaryPhysical = physicalActive.FirstOrDefault(d => d.Primary) ?? physicalActive.FirstOrDefault();
 
@@ -466,6 +503,12 @@ public sealed class ProfileEngine
                     ApplyCloneLayout(result, profile, specs[0], parsec[0], primaryPhysical);
                     break;
             }
+            if (!result.Success)
+            {
+                result.Summary = "显示布局未能安全应用，已停止更新串流配置，请待屏幕连接稳定后重试";
+                Step(result, "✗ " + result.Summary);
+                return result;
+            }
 
             // ---------------------------------------------------------------- 5. Sunshine instances
             displays = DisplayManager.Enumerate();
@@ -485,14 +528,23 @@ public sealed class ProfileEngine
                 {
                     if (spec.InstanceId <= 0) continue;
                     var d = parsec.FirstOrDefault(p => p.ParsecSlot == spec.Slot);
-                    if (d == null) continue;
+                    if (d == null || string.IsNullOrWhiteSpace(d.SunshineDeviceId) ||
+                        profile.Mode != ProfileMode.Clone && d.Active &&
+                        DisplayManager.ValidateLayoutTargets(new[] { new LayoutItem(d) }, displays) != null)
+                    {
+                        result.Success = false;
+                        result.Summary = $"虚拟屏 #{spec.Slot + 1} 的抓取目标不可用，已停止更新实例";
+                        Step(result, "✗ " + result.Summary);
+                        return result;
+                    }
                     mapping[spec.InstanceId] = d.SunshineDeviceId;
                     ddMap[spec.InstanceId] = ComputeDd(profile, spec, d.GdiName);
                     slotOfInstance[spec.InstanceId] = spec.Slot;
                 }
             }
             ReconcileInstances(result, mapping, ddMap, ct);
-            foreach (var (id, dd) in ddMap) _state.InstanceDd[id] = dd;
+            // 替换整张映射，避免“仅主屏”或减少副屏后残留旧的手动分辨率。
+            _state.InstanceDd = mapping.Keys.ToDictionary(id => id, id => ddMap.GetValueOrDefault(id) ?? DdOptions.Disabled);
 
             // ---------------------------------------------------------------- 5b. idle stand-by: switch virtual displays off until a client connects
             if (profile.IdleOff && profile.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly)
@@ -636,20 +688,69 @@ public sealed class ProfileEngine
         return displays;
     }
 
+    /// <summary>
+    /// Plugging a virtual display makes Windows replay the topology it saved for the new monitor set, and that entry can
+    /// switch a physical display off or give it another mode (2026-10-01, laptop without the Dell: the panel went dark when
+    /// the virtual display appeared, Sunshine's "enable all displays" fallback brought it back at 1024x768, and Windows
+    /// saved that — after every boot). Puts the physical displays seen before this apply back: switched-off ones are
+    /// re-activated, and a mode that got smaller (fewer pixels, or the same size at a lower rate) is restored. A mode
+    /// that got bigger is left alone: that is a monitor recovering from a hot-plug, not a downgrade.
+    /// </summary>
+    private List<DisplayInfo> RestorePhysicalDisplays(ApplyResult result, List<DisplayInfo> before, List<DisplayInfo> displays)
+    {
+        if (before.Count == 0) return displays;
+        static bool Same(DisplayInfo a, DisplayInfo b) => !string.IsNullOrEmpty(b.SunshineDeviceId)
+            ? a.SunshineDeviceId.Equals(b.SunshineDeviceId, StringComparison.OrdinalIgnoreCase)
+            : a.AdapterId.Same(b.AdapterId) && a.TargetId == b.TargetId;
+
+        var off = before.Where(b => !displays.Any(d => !d.IsParsec && d.Active && Same(d, b))).ToList();
+        if (off.Count > 0)
+        {
+            Step(result, $"插入虚拟屏后 Windows 关闭了 {string.Join("、", off.Select(d => d.Label))}，重新启用");
+            var code = DisplayManager.ActivateDisplays(off, displays);
+            if (code != 0) Step(result, $"⚠ 重新启用物理显示器失败 ({code})");
+            displays = DisplayManager.WaitFor(l => off.All(b => l.Any(d => !d.IsParsec && d.IsReady && Same(d, b))), TimeSpan.FromSeconds(10));
+        }
+
+        var items = new List<LayoutItem>();
+        foreach (var b in before)
+        {
+            var d = displays.FirstOrDefault(x => !x.IsParsec && x.IsReady && Same(x, b));
+            if (d == null) continue;
+            long now = (long)d.Width * d.Height, was = (long)b.Width * b.Height;
+            var downgraded = now < was || now == was && d.RefreshRate < b.RefreshRate - 1;
+            if (!downgraded) continue;
+            if (!DisplayManager.HasMode(d.GdiName, b.Width, b.Height, b.RefreshRate)) continue;
+            Step(result, $"{d.Label} 被改成了 {d.ModeText}，恢复为 {b.ModeText}");
+            items.Add(new LayoutItem(d) { Width = b.Width, Height = b.Height, RefreshRate = b.RefreshRate });
+        }
+        if (items.Count == 0) return displays;
+        var r = DisplayManager.ApplyLayout(items);
+        if (!r.Success) Step(result, "⚠ 恢复物理显示器分辨率失败: " + r);
+        return DisplayManager.Enumerate();
+    }
+
     /// <summary>Switches connected-but-inactive Parsec displays on (explicit topology) and waits until they are enumerated.</summary>
     private List<DisplayInfo> EnsureParsecEnabled(ApplyResult result, List<DisplayInfo> displays)
     {
         var inactive = displays.Where(d => d.IsParsec && !d.Active).ToList();
-        if (inactive.Count == 0) return displays;
-        Step(result, $"有 {inactive.Count} 块虚拟屏处于待机（停用），临时启用以便配置");
+        bool SharesPhysicalSource(List<DisplayInfo> current) => current.Any(v => v.IsParsec && v.Active &&
+            current.Any(p => !p.IsParsec && p.Active && !string.IsNullOrEmpty(v.GdiName) &&
+                p.GdiName.Equals(v.GdiName, StringComparison.OrdinalIgnoreCase)));
+        var sharedSource = SharesPhysicalSource(displays);
+        if (inactive.Count == 0 && !sharedSource) return displays;
+        Step(result, sharedSource ? "虚拟屏与物理屏共用显示源，先切换为独立扩展显示再配置" : $"有 {inactive.Count} 块虚拟屏处于待机（停用），临时启用以便配置");
         var code = DisplayManager.ActivateDisplays(inactive, displays);
         if (code != 0)
         {
             Step(result, $"⚠ 显式启用失败 ({code})，改用扩展拓扑");
             DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
         }
-        var ready = DisplayManager.WaitFor(l => l.Where(d => d.IsParsec).All(d => d.IsReady), TimeSpan.FromSeconds(15));
-        if (ready.Where(d => d.IsParsec).All(d => d.IsReady)) Step(result, "✓ 虚拟屏已启用");
+        var slots = displays.Where(d => d.IsParsec).Select(d => d.ParsecSlot).ToList();
+        bool AllReady(List<DisplayInfo> current) => !SharesPhysicalSource(current) &&
+            slots.All(slot => current.Any(d => d.IsParsec && d.ParsecSlot == slot && d.IsReady));
+        var ready = DisplayManager.WaitFor(AllReady, TimeSpan.FromSeconds(15));
+        if (AllReady(ready)) Step(result, "✓ 虚拟屏已启用");
         return ready;
     }
 
@@ -853,7 +954,7 @@ public sealed class ProfileEngine
             var pp = remembered ? _state.PhysicalLayout[primary.SunshineDeviceId] : null;
             var px = pp?.X ?? primary.PositionX;
             var py = pp?.Y ?? primary.PositionY;
-            items.Add(new LayoutItem { GdiName = primary.GdiName, Attached = true, Primary = true, X = px, Y = py });
+            items.Add(new LayoutItem(primary) { Attached = true, Primary = true, X = px, Y = py });
             anchor = new Rect(px, py, primary.Width, primary.Height);
             physicalRects.Add(anchor.Value);
             foreach (var other in physicalActive.Where(d => d.GdiName != primary.GdiName))
@@ -861,7 +962,7 @@ public sealed class ProfileEngine
                 var op = remembered ? _state.PhysicalLayout[other.SunshineDeviceId] : null;
                 var ox = op?.X ?? other.PositionX;
                 var oy = op?.Y ?? other.PositionY;
-                items.Add(new LayoutItem { GdiName = other.GdiName, Attached = true, X = ox, Y = oy });
+                items.Add(new LayoutItem(other) { Attached = true, X = ox, Y = oy });
                 physicalRects.Add(new Rect(ox, oy, other.Width, other.Height));
             }
         }
@@ -895,9 +996,8 @@ public sealed class ProfileEngine
                     y = spec.Y.Value;
                 }
             }
-            items.Add(new LayoutItem
+            items.Add(new LayoutItem(d)
             {
-                GdiName = d.GdiName,
                 Attached = true,
                 Width = mode.Width,
                 Height = mode.Height,
@@ -912,7 +1012,11 @@ public sealed class ProfileEngine
 
         var r = DisplayManager.ApplyLayout(items);
         Step(result, (r.Success ? "✓ " : "⚠ ") + r);
-        if (!r.Success) result.Success = false;
+        if (!r.Success)
+        {
+            result.Success = false;
+            return;
+        }
 
         // verify + retry once (Windows sometimes needs a second pass right after a monitor arrives)
         Thread.Sleep(800);
@@ -930,6 +1034,7 @@ public sealed class ProfileEngine
             Thread.Sleep(1200);
             r = DisplayManager.ApplyLayout(items);
             Step(result, (r.Success ? "✓ " : "⚠ ") + r);
+            if (!r.Success) result.Success = false;
         }
     }
 
@@ -955,17 +1060,18 @@ public sealed class ProfileEngine
         // 1) mode first, while the display is still part of the extended desktop
         var pre = DisplayManager.ApplyLayout(new[]
         {
-            new LayoutItem { GdiName = parsec.GdiName, Attached = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0 }
+            new LayoutItem(parsec) { Attached = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0 }
         });
         Step(result, (pre.Success ? "✓ " : "⚠ ") + "虚拟屏模式: " + pre);
+        if (!pre.Success) { result.Success = false; return; }
 
         // 2) activate only the virtual display
         var code = DisplayManager.SetActiveTargets(new[] { (parsec.AdapterId, parsec.TargetId) });
         if (code != 0)
         {
             Step(result, $"⚠ SetDisplayConfig(仅虚拟屏) 返回 {code}，改用逐个断开物理屏");
-            var items = all.Where(d => d.Active && !d.IsParsec).Select(d => new LayoutItem { GdiName = d.GdiName, Attached = false }).ToList();
-            items.Add(new LayoutItem { GdiName = parsec.GdiName, Attached = true, Primary = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0, X = 0, Y = 0 });
+            var items = all.Where(d => d.Active && !d.IsParsec).Select(d => new LayoutItem(d) { Attached = false }).ToList();
+            items.Add(new LayoutItem(parsec) { Attached = true, Primary = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0, X = 0, Y = 0 });
             var r = DisplayManager.ApplyLayout(items);
             Step(result, (r.Success ? "✓ " : "✗ ") + r);
             if (!r.Success) result.Success = false;
@@ -988,9 +1094,10 @@ public sealed class ProfileEngine
         {
             var fix = DisplayManager.ApplyLayout(new[]
             {
-                new LayoutItem { GdiName = v.GdiName, Attached = true, Primary = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0, X = 0, Y = 0 }
+                new LayoutItem(v) { Attached = true, Primary = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0, X = 0, Y = 0 }
             });
             Step(result, (fix.Success ? "✓ " : "⚠ ") + "重新应用虚拟屏模式: " + fix);
+            if (!fix.Success) { result.Success = false; return; }
         }
         Step(result, $"✓ 仅副屏模式: {v.GdiName} {v.ModeText}");
     }
@@ -1002,9 +1109,10 @@ public sealed class ProfileEngine
         var mode = PickMode(parsec.GdiName, rw, rh, hz, result, spec.Slot);
         var pre = DisplayManager.ApplyLayout(new[]
         {
-            new LayoutItem { GdiName = parsec.GdiName, Attached = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0 }
+            new LayoutItem(parsec) { Attached = true, Width = mode.Width, Height = mode.Height, RefreshRate = mode.RefreshRate, Orientation = 0 }
         });
         Step(result, (pre.Success ? "✓ " : "⚠ ") + "虚拟屏模式: " + pre);
+        if (!pre.Success) { result.Success = false; return; }
         var code = DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_CLONE);
         if (code != 0)
         {

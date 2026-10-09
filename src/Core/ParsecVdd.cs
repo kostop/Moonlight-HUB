@@ -7,8 +7,10 @@ namespace MoonlightHub.Core;
 
 /// <summary>
 /// Direct client for the Parsec Virtual Display Driver (parsec-vdd protocol).
-/// The driver removes every virtual display unless something pings it (VDD_IOCTL_UPDATE) at least every ~100 ms,
-/// so this class owns a dedicated high-priority keep-alive thread for as long as the handle stays open.
+/// The driver removes every virtual display unless something pings it (VDD_IOCTL_UPDATE): after about a second
+/// without a ping all of them are unplugged. This class keeps a keep-alive running for as long as the handle stays open:
+/// a native TIME_CRITICAL thread with locked memory (tools\moonlight-vdd-keepalive.dll, which neither a GC pause nor
+/// a page fault on a busy disk can stall), or a managed thread when the DLL is missing.
 /// This replaces the old PowerShell controller, which only pinged every 30 s and therefore lost the display within seconds.
 /// </summary>
 public sealed unsafe class ParsecVdd : IDisposable
@@ -29,19 +31,69 @@ public sealed unsafe class ParsecVdd : IDisposable
     private SafeFileHandle? _handle;
     private Thread? _pingThread;
     private volatile bool _pinging;
+    private IntPtr _native;              // native keep-alive context, IntPtr.Zero while the managed loop (or nothing) runs
+    private SafeFileHandle? _nativeHandleRef;
+    private int _pingIntervalMs = 50;
+    private DateTime _lastPingUtc;
+    private int _consecutivePingFailures;
+    private int _maxGapMs;               // managed loop: longest interval between two completed pings since the last report
+    private int _longGaps;
+    private bool _nativeAnnounced;
 
-    public int PingIntervalMs { get; set; } = 50;
+    public int PingIntervalMs
+    {
+        get => _pingIntervalMs;
+        set
+        {
+            if (value == _pingIntervalMs) return;
+            _pingIntervalMs = value;
+            if (_native != IntPtr.Zero) { StopPing(); StartPing(); } // the native loop takes the interval at start
+        }
+    }
+
     public int Version { get; private set; } = -1;
     public string? DevicePath { get; private set; }
-    public DateTime LastPingUtc { get; private set; }
-    public int ConsecutivePingFailures { get; private set; }
     public string? LastError { get; private set; }
+
+    /// <summary>True while the keep-alive runs on the native thread of moonlight-vdd-keepalive.dll.</summary>
+    public bool IsNativeKeepAlive => _native != IntPtr.Zero;
+
+    public DateTime LastPingUtc
+    {
+        get
+        {
+            if (_native == IntPtr.Zero) return _lastPingUtc;
+            var s = NativeKeepAlive.Stats(_native, false);
+            return s.MsSinceLastPing < 0 ? default : DateTime.UtcNow - TimeSpan.FromMilliseconds(s.MsSinceLastPing);
+        }
+    }
+
+    public int ConsecutivePingFailures => _native != IntPtr.Zero ? NativeKeepAlive.Stats(_native, false).ConsecutiveFailures : _consecutivePingFailures;
 
     /// <summary>Indices returned by the driver for displays added through this object (best effort bookkeeping).</summary>
     public List<int> AddedIndices { get; } = new();
 
     public bool IsOpen => _handle is { IsInvalid: false, IsClosed: false };
-    public bool IsPinging => _pinging && _pingThread is { IsAlive: true };
+    public bool IsPinging => _native != IntPtr.Zero ? NativeKeepAlive.Stats(_native, false).Running != 0 : _pinging && _pingThread is { IsAlive: true };
+
+    /// <summary>Keep-alive health since the previous call (the watchdog reads it every tick).</summary>
+    public readonly record struct KeepAliveReport(bool Native, bool MemoryLocked, long Pings, int MaxGapMs, int MaxIoMs, int LongGaps, int LastError);
+
+    public KeepAliveReport TakeKeepAliveReport()
+    {
+        if (_native != IntPtr.Zero)
+        {
+            var s = NativeKeepAlive.Stats(_native, true);
+            if (!_nativeAnnounced && s.Pings > 0)
+            {
+                _nativeAnnounced = true;
+                Log.Info($"VDD keep-alive 运行在原生线程（TIME_CRITICAL，不受 GC 暂停影响，内存锁定: {(s.MemoryLocked != 0 ? "是" : "否")}）");
+            }
+            if (s.LastError != 0) LastError = "keep-alive 失败: Win32 错误 " + s.LastError;
+            return new KeepAliveReport(true, s.MemoryLocked != 0, s.Pings, s.MaxGapMs, s.MaxIoMs, s.LongGaps, s.LastError);
+        }
+        return new KeepAliveReport(false, false, 0, Interlocked.Exchange(ref _maxGapMs, 0), 0, Interlocked.Exchange(ref _longGaps, 0), 0);
+    }
 
     public event Action? StateChanged;
 
@@ -293,21 +345,68 @@ public sealed unsafe class ParsecVdd : IDisposable
         StopPing();
         _handle?.Dispose();
         _handle = null;
-        Faulted = false;
-        ConsecutivePingFailures = 0;
+        _faulted = false;
+        _consecutivePingFailures = 0;
         StateChanged?.Invoke();
     }
 
     public void StartPing()
     {
         if (IsPinging || !IsOpen) return;
+        StopPing(); // release a native context that stopped by itself (driver fault) before starting a new one
+        if (StartNativePing()) return;
         _pinging = true;
         _pingThread = new Thread(PingLoop) { IsBackground = true, Name = "ParsecVddKeepAlive", Priority = ThreadPriority.Highest };
         _pingThread.Start();
     }
 
+    private bool StartNativePing()
+    {
+        if (!OperatingSystem.IsWindows() || !NativeKeepAlive.Available) return false;
+        var handle = _handle!;
+        var added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added); // the native thread uses the raw handle: keep it from being closed underneath
+            var context = NativeKeepAlive.Start(handle.DangerousGetHandle(), PingIntervalMs);
+            if (context == IntPtr.Zero)
+            {
+                Log.Warn("原生 VDD keep-alive 启动失败（Win32 错误 " + Marshal.GetLastPInvokeError() + "），改用托管线程");
+                if (added) handle.DangerousRelease();
+                return false;
+            }
+            _native = context;
+            _nativeHandleRef = handle;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (added) handle.DangerousRelease();
+            Log.Warn("原生 VDD keep-alive 不可用（" + ex.Message + "），改用托管线程");
+            return false;
+        }
+    }
+
     public void StopPing()
     {
+        var native = _native;
+        if (native != IntPtr.Zero)
+        {
+            // take the final counters first: a fault seen here must survive the release of the context
+            var s = NativeKeepAlive.Stats(native, false);
+            if (s.Faulted != 0) { _faulted = true; LastFaultUtc = DateTime.UtcNow; }
+            _native = IntPtr.Zero;
+            if (NativeKeepAlive.Stop(native))
+            {
+                _nativeHandleRef?.DangerousRelease();
+            }
+            else
+            {
+                Log.Warn("原生 VDD keep-alive 线程仍卡在驱动调用里，放弃等待（句柄保持引用，不会被关闭）");
+            }
+            _nativeHandleRef = null;
+        }
+
         _pinging = false;
         var t = _pingThread;
         _pingThread = null;
@@ -319,19 +418,29 @@ public sealed unsafe class ParsecVdd : IDisposable
 
     private void PingLoop()
     {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        long lastOk = -1;
         while (_pinging)
         {
             try
             {
                 Update();
-                LastPingUtc = DateTime.UtcNow;
-                ConsecutivePingFailures = 0;
+                var now = clock.ElapsedMilliseconds;
+                if (lastOk >= 0)
+                {
+                    var gap = (int)(now - lastOk);
+                    if (gap > Volatile.Read(ref _maxGapMs)) Interlocked.Exchange(ref _maxGapMs, gap);
+                    if (gap >= 300) Interlocked.Increment(ref _longGaps);
+                }
+                lastOk = now;
+                _lastPingUtc = DateTime.UtcNow;
+                _consecutivePingFailures = 0;
             }
             catch (Exception ex)
             {
-                ConsecutivePingFailures++;
+                _consecutivePingFailures++;
                 LastError = "keep-alive 失败: " + ex.Message;
-                if (ConsecutivePingFailures == 1) Log.Warn("VDD keep-alive 失败: " + ex.Message);
+                if (_consecutivePingFailures == 1) Log.Warn("VDD keep-alive 失败: " + ex.Message);
                 if (Faulted) { _pinging = false; break; } // the device is gone; the watchdog restarts it
             }
             Thread.Sleep(Math.Clamp(PingIntervalMs, 10, 90));
@@ -386,7 +495,8 @@ public sealed unsafe class ParsecVdd : IDisposable
     /// arriving, so the keep-alive thread must never be blocked by another call (each call owns its buffers/event).
     /// </summary>
     /// <summary>Set when an IOCTL timed out: the user-mode driver host is most likely gone and the device needs a restart.</summary>
-    public bool Faulted { get; private set; }
+    public bool Faulted => _faulted || _native != IntPtr.Zero && NativeKeepAlive.Stats(_native, false).Faulted != 0;
+    private bool _faulted;
     public DateTime LastFaultUtc { get; private set; }
 
     private int IoControl(uint code, ReadOnlySpan<byte> input)
@@ -435,7 +545,7 @@ public sealed unsafe class ParsecVdd : IDisposable
                 }
                 if (code != IoctlUpdate || err != 258)
                 {
-                    Faulted = true;
+                    _faulted = true;
                     LastFaultUtc = DateTime.UtcNow;
                 }
                 throw new InvalidOperationException($"DeviceIoControl(0x{code:X8}) 等待结果失败: Win32 错误 {err}");
@@ -459,5 +569,61 @@ public sealed unsafe class ParsecVdd : IDisposable
     public void Dispose()
     {
         Close();
+    }
+
+    /// <summary>Bindings for tools\moonlight-vdd-keepalive.dll (source: MoonlightHub\native\vdd-keepalive).</summary>
+    private static class NativeKeepAlive
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct VkaStats
+        {
+            public int Running;
+            public int Faulted;
+            public int ConsecutiveFailures;
+            public int LastError;
+            public long Pings;
+            public long Failures;
+            public long MsSinceLastPing;
+            public int MaxGapMs;
+            public int MaxIoMs;
+            public int LongGaps;
+            public int MemoryLocked;
+        }
+
+        private static readonly delegate* unmanaged<IntPtr, int, IntPtr> StartFn;
+        private static readonly delegate* unmanaged<IntPtr, int> StopFn;
+        private static readonly delegate* unmanaged<IntPtr, VkaStats*, int, void> StatsFn;
+
+        public static bool Available { get; }
+
+        static NativeKeepAlive()
+        {
+            var path = System.IO.Path.Combine(Paths.ExeDir, "tools", "moonlight-vdd-keepalive.dll");
+            if (!System.IO.File.Exists(path) || !NativeLibrary.TryLoad(path, out var lib)) return;
+            if (!NativeLibrary.TryGetExport(lib, "vka_start", out var start)
+                || !NativeLibrary.TryGetExport(lib, "vka_stop", out var stop)
+                || !NativeLibrary.TryGetExport(lib, "vka_stats", out var stats)) return;
+            StartFn = (delegate* unmanaged<IntPtr, int, IntPtr>)start;
+            StopFn = (delegate* unmanaged<IntPtr, int>)stop;
+            StatsFn = (delegate* unmanaged<IntPtr, VkaStats*, int, void>)stats;
+            Available = true;
+        }
+
+        public static IntPtr Start(IntPtr device, int intervalMs)
+        {
+            Marshal.SetLastPInvokeError(0);
+            var context = StartFn(device, intervalMs);
+            if (context == IntPtr.Zero) Marshal.SetLastPInvokeError(Marshal.GetLastSystemError());
+            return context;
+        }
+
+        public static bool Stop(IntPtr context) => StopFn(context) != 0;
+
+        public static VkaStats Stats(IntPtr context, bool resetPeaks)
+        {
+            VkaStats s;
+            StatsFn(context, &s, resetPeaks ? 1 : 0);
+            return s;
+        }
     }
 }

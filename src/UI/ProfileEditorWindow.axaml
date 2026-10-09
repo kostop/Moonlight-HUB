@@ -1,0 +1,47 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="MoonlightHub.UI.ProfileEditorWindow"
+        Title="编辑方案" Width="860" Height="640" WindowStartupLocation="CenterOwner"
+        Icon="/Assets/app.ico">
+    <DockPanel Margin="22">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button Content="取消" Click="Cancel_Click" Classes="ghost" />
+            <Button Content="保存方案" Click="Save_Click" Classes="primary" Margin="0" />
+        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+                <Grid ColumnDefinitions="120,*" RowDefinitions="Auto,Auto,Auto,Auto">
+                    <TextBlock Text="名称" Classes="muted" VerticalAlignment="Center" />
+                    <TextBox x:Name="NameBox" Grid.Column="1" Margin="0,3" />
+                    <TextBlock Grid.Row="1" Text="说明" Classes="muted" VerticalAlignment="Center" />
+                    <TextBox x:Name="DescBox" Grid.Row="1" Grid.Column="1" Margin="0,3" />
+                    <TextBlock Grid.Row="2" Text="模式" Classes="muted" VerticalAlignment="Center" />
+                    <ComboBox x:Name="ModeBox" Grid.Row="2" Grid.Column="1" Margin="0,3" HorizontalAlignment="Stretch" SelectionChanged="Mode_Changed" />
+                    <TextBlock Grid.Row="3" Text="合成刷新率" Classes="muted" VerticalAlignment="Center" ToolTip.Tip="0 = 与虚拟屏刷新率相同；填 120 可让虚拟屏以 120Hz 合成而串流仍按客户端帧率，降低画面陈旧度" />
+                    <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
+                        <TextBox x:Name="ComposeBox" Width="80" />
+                        <TextBlock Text="Hz（0 = 跟随虚拟屏刷新率；例如 120 可减少约 4ms 平均采样延迟）" Classes="muted" VerticalAlignment="Center" Margin="10,0,0,0" />
+                    </StackPanel>
+                </Grid>
+                <CheckBox x:Name="KeepMainBox" Content="「仅主屏」模式下保留实例 1 串流主屏" Margin="0,10,0,0" />
+                <CheckBox x:Name="MatchFpsBox" Margin="0,4,0,0">
+                    <TextBlock Text="跟随客户端帧率：客户端请求的帧率高于上面的刷新率时自动提高（没有正好的模式时选它的倍数或更高的一档，例如只注册了 120Hz 时 60/90fps 都用 120Hz）" TextWrapping="Wrap" />
+                </CheckBox>
+                <CheckBox x:Name="RememberPosBox" Content="记住在 Windows 显示设置里手动摆放的虚拟屏位置" Margin="0,4,0,0" />
+                <CheckBox x:Name="MatchResBox" Margin="0,4,0,0">
+                    <TextBlock Text="自动把虚拟屏分辨率设为客户端请求的分辨率（竖屏请求在开启预旋转时自动转为横屏，如 1200×2000 → 2000×1200）" TextWrapping="Wrap" />
+                </CheckBox>
+                <CheckBox x:Name="IdleOffBox" Margin="0,4,0,0">
+                    <TextBlock Text="没有 Moonlight 连接时自动关闭副屏（保持已连接但停用；客户端连接时由 Sunshine 自动启用，断开 3 秒后还原）" TextWrapping="Wrap" />
+                </CheckBox>
+                <TextBlock x:Name="ModeHint" Classes="muted" Margin="0,8,0,0" TextWrapping="Wrap" />
+
+                <DockPanel Margin="0,18,0,8">
+                    <Button DockPanel.Dock="Right" Content="添加虚拟屏" Click="AddVd_Click" Classes="ghost" Margin="0" />
+                    <TextBlock Text="虚拟屏" Classes="h2" VerticalAlignment="Center" />
+                </DockPanel>
+                <StackPanel x:Name="VdPanel" />
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

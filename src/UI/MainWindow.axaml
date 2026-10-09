@@ -1,0 +1,103 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ic="using:FluentIcons.Avalonia"
+        x:Class="MoonlightHub.UI.MainWindow"
+        Title="Moonlight Hub 副屏中心" Width="1240" Height="820" MinWidth="960" MinHeight="620"
+        WindowStartupLocation="CenterScreen" Icon="/Assets/app.ico">
+
+    <Grid ColumnDefinitions="232,*">
+
+        <!-- ===== navigation rail ===== -->
+        <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Top" Margin="20,22,20,18" Orientation="Horizontal">
+                    <Border Width="34" Height="34" CornerRadius="9" Background="{StaticResource AccentSoftBrush}">
+                        <ic:SymbolIcon Symbol="Desktop" FontSize="18" Foreground="{StaticResource AccentBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="Moonlight Hub" FontWeight="SemiBold" FontSize="15" />
+                        <TextBlock x:Name="SubtitleText" Text="副屏中心" Classes="muted" />
+                    </StackPanel>
+                </StackPanel>
+
+                <StackPanel DockPanel.Dock="Bottom" Margin="20,10,20,18">
+                    <StackPanel x:Name="VddRow" Orientation="Horizontal" Margin="0,0,0,6">
+                        <Ellipse x:Name="VddDot" Width="8" Height="8" Fill="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                        <TextBlock x:Name="VddText" Text="Parsec VDD" Classes="muted" Margin="8,0,0,0" />
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                        <Ellipse x:Name="DeskflowDot" Width="8" Height="8" Fill="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                        <TextBlock x:Name="DeskflowText" Text="Deskflow" Classes="muted" Margin="8,0,0,0" MaxWidth="180" TextWrapping="NoWrap" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                    <StackPanel x:Name="WatchdogRow" Orientation="Horizontal" Margin="0,0,0,6">
+                        <Ellipse x:Name="WatchdogDot" Width="8" Height="8" Fill="{StaticResource MutedBrush}" VerticalAlignment="Center" />
+                        <TextBlock x:Name="WatchdogText" Text="守护" Classes="muted" Margin="8,0,0,0" />
+                    </StackPanel>
+                    <TextBlock x:Name="VersionText" Text="v2.0" Classes="muted" Margin="0,8,0,0" />
+                </StackPanel>
+
+                <StackPanel Margin="0,4">
+                    <RadioButton x:Name="NavOverview" Classes="nav" GroupName="nav" IsChecked="True" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="Home" FontSize="16" /><TextBlock Text="概览" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="NavDisplays" Classes="nav" GroupName="nav" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="Desktop" FontSize="16" /><TextBlock Text="显示布局" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="NavClients" Classes="nav" GroupName="nav" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="PhoneLaptop" FontSize="16" /><TextBlock Text="客户端 / Sunshine" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="NavVirtual" Classes="nav" GroupName="nav" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="Tablet" FontSize="16" /><TextBlock Text="虚拟屏 (Parsec VDD)" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="NavDeskflow" Classes="nav" GroupName="nav" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="Keyboard" FontSize="16" /><TextBlock Text="键鼠共享 (Deskflow)" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="NavTools" Classes="nav" GroupName="nav" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="Wrench" FontSize="16" /><TextBlock Text="工具" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="NavLogs" Classes="nav" GroupName="nav" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="DocumentText" FontSize="16" /><TextBlock Text="日志" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                    <RadioButton x:Name="NavSettings" Classes="nav" GroupName="nav" IsCheckedChanged="Nav_Checked">
+                        <StackPanel Orientation="Horizontal" Spacing="12"><ic:SymbolIcon Symbol="Settings" FontSize="16" /><TextBlock Text="设置" VerticalAlignment="Center" /></StackPanel>
+                    </RadioButton>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+
+        <!-- ===== content ===== -->
+        <Grid Grid.Column="1" RowDefinitions="52,Auto,*">
+
+            <!-- title bar (doubles as the drag area when the window draws its own chrome) -->
+            <Grid x:Name="TitleBar" Background="{StaticResource BgBrush}" PointerPressed="TitleBar_PointerPressed" DoubleTapped="TitleBar_DoubleTapped">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="26,0,0,0">
+                    <TextBlock x:Name="PageTitle" Text="概览" Classes="h1" FontSize="18" VerticalAlignment="Center" />
+                    <Border x:Name="ProfilePill" Classes="pill" Background="{StaticResource AccentSoftBrush}" Margin="14,0,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="当前方案" Classes="muted" Margin="0,0,6,0" VerticalAlignment="Center" />
+                            <TextBlock x:Name="ProfileName" Text="—" Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+                <StackPanel x:Name="CaptionButtons" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <Button Classes="icon" ToolTip.Tip="最小化到托盘" Click="Minimize_Click"><ic:SymbolIcon Symbol="Subtract" FontSize="14" /></Button>
+                    <Button Classes="icon" ToolTip.Tip="最大化" Click="Maximize_Click"><ic:SymbolIcon x:Name="MaxIcon" Symbol="Maximize" FontSize="14" /></Button>
+                    <Button Classes="icon close" ToolTip.Tip="关闭（隐藏到托盘）" Click="Close_Click" Margin="0,0,8,0"><ic:SymbolIcon Symbol="Dismiss" FontSize="14" /></Button>
+                </StackPanel>
+            </Grid>
+
+            <!-- progress strip -->
+            <Border x:Name="ProgressStrip" Grid.Row="1" Background="{StaticResource AccentSoftBrush}" Padding="26,8" IsVisible="False">
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <ic:SymbolIcon Symbol="ArrowSync" FontSize="16" Foreground="{StaticResource AccentBrush}" Margin="0,0,10,0" />
+                        <TextBlock x:Name="ProgressText" Text="正在应用方案…" VerticalAlignment="Center" />
+                    </StackPanel>
+                    <ProgressBar IsIndeterminate="True" Margin="0,8,0,0" />
+                </StackPanel>
+            </Border>
+
+            <ContentControl x:Name="PageHost" Grid.Row="2" Margin="26,10,26,20" />
+        </Grid>
+    </Grid>
+</Window>

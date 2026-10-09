@@ -14,10 +14,11 @@ $ErrorActionPreference = 'Stop'
 $layout = [ordered]@{
     'scripts'                 = '仍在使用的 PowerShell/VBS/Python 脚本（显示拓扑、USB 网络、Moonlight 客户端辅助）'
     'scripts/sunshine'        = 'Sunshine 服务/配置/部署脚本与配置文件'
-    'deskflow-touch'          = 'Deskflow 触摸/键鼠隔离相关：脚本、C++ 源码、DLL/EXE 与配置'
-    'deskflow-touch/variants' = '触摸过滤器/启动器的历史编译变体'
-    'deskflow-touch/obj'      = '编译中间文件'
-    'deskflow-touch/source'   = 'deskflow 源码树'
+    'deskflow'                = 'Deskflow 键鼠共享（由 Moonlight Hub 运行）：触摸过滤、源码、运行时文件副本与说明'
+    'deskflow/touch'          = 'Deskflow 触摸/键鼠隔离相关：脚本、C++ 源码、DLL/EXE 与配置'
+    'deskflow/touch/variants' = '触摸过滤器/启动器的历史编译变体'
+    'deskflow/touch/obj'      = '编译中间文件'
+    'deskflow/source'         = 'deskflow 1.26 源码树'
     'tools/probes'            = 'Win32 探针程序源码/可执行文件'
     'tools/latency'           = '延迟测量脚本'
     'moonlight-client'        = 'Android Moonlight 客户端：APK、源码、ADB 工具、数据库/偏好'
@@ -48,8 +49,8 @@ $dirRules = @(
     @{ Match = '^(Sunshine-portable-|sunshine-v\d{4}\.\d+-portable$|sunshine-v\d{4}\.\d+-extracted$)'; Dest = 'sunshine/packages' }
     @{ Match = '^(Sunshine-prerotation-test|Sunshine-v2025-nvenc-test)$'; Dest = 'sunshine/builds' }
     @{ Match = '^(backup-\d+|sunshine-canonical-backup-.*|rollback-prerotation-.*|huorong-db-snapshot-.*)$'; Dest = 'archive/backups' }
-    @{ Match = '^deskflow-\d+\.\d+\.\d+-source$'; Dest = 'deskflow-touch/source' }
-    @{ Match = '^(deskflow-filter-keyboard-sandbox|deskflow-private-selftest|deskflow-local-keyboard-runtime.*|longpress-probe)$'; Dest = 'deskflow-touch' }
+    @{ Match = '^deskflow-\d+\.\d+\.\d+-source$'; Dest = 'deskflow/source' }
+    @{ Match = '^(deskflow-filter-keyboard-sandbox|deskflow-private-selftest|deskflow-local-keyboard-runtime.*|longpress-probe)$'; Dest = 'deskflow/touch' }
     @{ Match = '^(android-platform-tools|moonlight-android-official-.*|moonlight-prerotation-apk)$'; Dest = 'moonlight-client' }
     @{ Match = '^__pycache__$'; Dest = 'archive/misc' }
 )
@@ -67,11 +68,11 @@ $fileRules = @(
     @{ Match = '^(enable-sunshine-service|restart-sunshine-service|stop-sunshine-service|switch-sunshine-service|repair-sunshine-service-path|set-sunshine-minimum-fps|set-active-sunshine-minimum-fps|set-sunshine-nvenc-low-latency|restore-sunshine-identity|apply-final-sunshine-config|install-sunshine-display-startup-guard|start-sunshine-after-parsec|disable-obsolete-sunshine-guard|diagnose-system-automation|restart-sunshine-latency-ab-elevated|invoke-sunshine-latency-ab|sunshine-prerotation-ab|invoke-sunshine-prerotation-elevated|install-sunshine-prerotation-service|invoke-install-sunshine-prerotation-elevated|consolidate-sunshine|consolidate-sunshine-main|invoke-consolidate-sunshine-elevated|deploy-sunshine-wechat|invoke-deploy-sunshine-touch-elevated|deploy-sunshine-compatible|install-sunshine-v2025\.924|install-nvidia-driver|recover-nvidia-566|admin-context-probe)\.ps1$'; Dest = 'scripts/sunshine' }
     @{ Match = '^(sunshine-unified\.conf|sunshine-min90\.conf|sunshine-before-min90\.conf|sunshine\.conf\.optimized|sunshine-min90\.json|sunshine-min120-rollback\.json|sunshine-min90-save-response\.json)$'; Dest = 'scripts/sunshine' }
     # Deskflow / 触摸
-    @{ Match = '^(build-deskflow-touch-filter|build-touch-calibration-overlay|build-touch-mouse-isolator|deploy-deskflow-native-touch-filter|invoke-deploy-deskflow-native-touch-filter-elevated|deploy-independent-touch|restore-deskflow-before-native-touch-filter|sync-deskflow-f24-service|invoke-sync-deskflow-f24-elevated|touch-isolation-watchdog|touch-mouse-isolation|test-wechat-touch-origin)\.ps1$'; Dest = 'deskflow-touch' }
-    @{ Match = '^(Deskflow\.touch-release\.conf|deskflow-.*\.(conf|ini))$'; Dest = 'deskflow-touch' }
-    @{ Match = '^(deskflow_touch_filter|deskflow_touch_launcher|touch_mouse_isolator)\.(generic.*|before-.*|next|native\.next|baseline|independent)\.(dll|exe|obj)$'; Dest = 'deskflow-touch/variants' }
-    @{ Match = '^(deskflow_touch_filter|deskflow_touch_launcher|touch_mouse_isolator|touch_calibration_overlay|touch_route_probe|Weixin(\.dense\.next)?)\.obj$'; Dest = 'deskflow-touch/obj' }
-    @{ Match = '^(deskflow_touch_filter|deskflow_touch_launcher|touch_mouse_isolator|touch_calibration_overlay|touch_route_probe|deskflow_touch_filter_shared|Weixin(\.dense\.next)?)\.(cpp|h|dll|exe)$'; Dest = 'deskflow-touch' }
+    @{ Match = '^(build-deskflow-touch-filter|build-touch-calibration-overlay|build-touch-mouse-isolator|deploy-deskflow-native-touch-filter|invoke-deploy-deskflow-native-touch-filter-elevated|deploy-independent-touch|restore-deskflow-before-native-touch-filter|sync-deskflow-f24-service|invoke-sync-deskflow-f24-elevated|touch-isolation-watchdog|touch-mouse-isolation|test-wechat-touch-origin)\.ps1$'; Dest = 'deskflow/touch' }
+    @{ Match = '^(Deskflow\.touch-release\.conf|deskflow-.*\.(conf|ini))$'; Dest = 'deskflow/touch' }
+    @{ Match = '^(deskflow_touch_filter|deskflow_touch_launcher|touch_mouse_isolator)\.(generic.*|before-.*|next|native\.next|baseline|independent)\.(dll|exe|obj)$'; Dest = 'deskflow/touch/variants' }
+    @{ Match = '^(deskflow_touch_filter|deskflow_touch_launcher|touch_mouse_isolator|touch_calibration_overlay|touch_route_probe|Weixin(\.dense\.next)?)\.obj$'; Dest = 'deskflow/touch/obj' }
+    @{ Match = '^(deskflow_touch_filter|deskflow_touch_launcher|touch_mouse_isolator|touch_calibration_overlay|touch_route_probe|deskflow_touch_filter_shared|Weixin(\.dense\.next)?)\.(cpp|h|dll|exe)$'; Dest = 'deskflow/touch' }
     @{ Match = '\.lnk$'; Dest = 'shortcuts' }
     # 探针
     @{ Match = '^(display_topology_probe|display_path_probe|display_refresh_config|desktop_message_probe|desktop_postmessage_probe|desktop_selection_probe|input_cursor_probe|native_touch_bridge_probe|taskbar_accessible_probe|taskbar_message_probe|taskbar_uia_probe|window_at_point_probe|window_print_probe)(\..*)?\.(cpp|exe|obj)$'; Dest = 'tools/probes' }
@@ -94,7 +95,7 @@ $fileRules = @(
     @{ Match = '^--help$'; Dest = 'archive/misc' }
 )
 
-$keepAtRoot = @('MoonlightHub', 'README.md', 'scripts', 'deskflow-touch', 'tools', 'moonlight-client', 'sunshine', 'archive', 'shortcuts', '.stignore', 'desktop.ini')
+$keepAtRoot = @('MoonlightHub', 'README.md', 'scripts', 'deskflow', 'tools', 'moonlight-client', 'sunshine', 'archive', 'shortcuts', '.stignore', 'desktop.ini')
 
 foreach ($entry in Get-ChildItem -LiteralPath $Root -Force) {
     if ($keepAtRoot -contains $entry.Name) { continue }

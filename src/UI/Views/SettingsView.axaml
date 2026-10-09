@@ -1,0 +1,102 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="MoonlightHub.UI.Views.SettingsView">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+            <!-- Windows only: hidden on Linux (see constructor) -->
+            <Border x:Name="ProfilesCard" Classes="card">
+                <StackPanel>
+                    <TextBlock Text="方案管理" Classes="h2" />
+                    <TextBlock Classes="muted" Margin="0,4,0,10" TextWrapping="Wrap" Text="每个方案定义虚拟屏数量、分辨率/刷新率、摆放位置以及由哪个 Sunshine 实例串流。" />
+                    <StackPanel x:Name="ProfilesPanel" />
+                    <WrapPanel Margin="0,8,0,0">
+                        <Button Content="新建方案" Click="NewProfile_Click" Classes="primary" />
+                        <Button Content="恢复默认方案" Click="ResetProfiles_Click" Classes="ghost" />
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- Windows only -->
+            <Border x:Name="InstancesCard" Classes="card">
+                <StackPanel>
+                    <TextBlock Text="Sunshine 实例" Classes="h2" />
+                    <TextBlock Classes="muted" Margin="0,4,0,10" TextWrapping="Wrap" Text="实例 1 沿用原来的配置目录和已配对客户端；其他实例在 instances 目录下各自保存配置、证书和日志。修改端口后需要在 Moonlight 里重新添加。" />
+                    <StackPanel x:Name="InstancesPanel" />
+                    <Button Content="添加实例" Click="AddInstance_Click" Classes="ghost" HorizontalAlignment="Left" Margin="0,8,0,0" />
+                </StackPanel>
+            </Border>
+
+            <!-- Windows only -->
+            <Border x:Name="PathsCard" Classes="card">
+                <StackPanel>
+                    <TextBlock Text="路径" Classes="h2" Margin="0,0,0,10" />
+                    <CheckBox x:Name="UseEmbedded" Margin="0,0,0,6">
+                        <TextBlock Text="使用随本程序提供的 Sunshine（推荐；配置与配对信息保存在 Hub 数据目录，不依赖单独安装的 Sunshine）" TextWrapping="Wrap" />
+                    </CheckBox>
+                    <TextBlock x:Name="EmbeddedText" Classes="muted" Margin="0,0,0,8" Text="—" TextWrapping="Wrap" />
+                    <Grid ColumnDefinitions="170,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto">
+                        <TextBlock Text="sunshine.exe" Classes="muted" VerticalAlignment="Center" />
+                        <TextBox x:Name="SunshineExe" Grid.Column="1" Margin="0,3" />
+                        <TextBlock Grid.Row="1" Text="实例 1 配置目录" Classes="muted" VerticalAlignment="Center" />
+                        <TextBox x:Name="Instance1Dir" Grid.Row="1" Grid.Column="1" Margin="0,3" />
+                        <TextBlock Grid.Row="2" Text="其他实例根目录" Classes="muted" VerticalAlignment="Center" />
+                        <TextBox x:Name="InstancesRoot" Grid.Row="2" Grid.Column="1" Margin="0,3" />
+                        <TextBlock Grid.Row="3" Text="脚本目录" Classes="muted" VerticalAlignment="Center" />
+                        <TextBox x:Name="ScriptsDir" Grid.Row="3" Grid.Column="1" Margin="0,3" />
+                        <TextBlock Grid.Row="4" Text="ParsecVDisplay.exe" Classes="muted" VerticalAlignment="Center" />
+                        <TextBox x:Name="ParsecExe" Grid.Row="4" Grid.Column="1" Margin="0,3" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- "运行行为": the card itself is shown everywhere; WinRunTop / WinRunBottom are Windows only (hidden on Linux) -->
+            <Border x:Name="RunCard" Classes="card">
+                <StackPanel>
+                    <TextBlock Text="运行行为" Classes="h2" Margin="0,0,0,8" />
+                    <StackPanel x:Name="WinRunTop">
+                        <CheckBox x:Name="AutoApply" Content="启动时自动应用上次的方案" />
+                        <CheckBox x:Name="WatchdogEnabled">
+                            <TextBlock Text="启用守护（自动恢复消失的虚拟屏 / 重启异常的 Sunshine / 睡眠唤醒后复核）" TextWrapping="Wrap" />
+                        </CheckBox>
+                        <CheckBox x:Name="ConfirmStandby">
+                            <TextBlock Text="平板断开时先保留副屏并弹窗询问是否关闭（平板重新连上时提示自动消失；仅“主屏 + 副屏”方案，下次应用方案时生效）" TextWrapping="Wrap" />
+                        </CheckBox>
+                        <CheckBox x:Name="HighPriority" Content="以高优先级运行 Sunshine 进程" />
+                    </StackPanel>
+                    <CheckBox x:Name="CloseToTray" Content="点击关闭按钮时隐藏到托盘" />
+                    <StackPanel x:Name="WinRunBottom">
+                        <CheckBox x:Name="AutoCreds">
+                            <TextBlock Text="自动管理 Sunshine Web 凭据（配对不再需要打开 Sunshine 网页；密码可在“客户端”页查看）" TextWrapping="Wrap" />
+                        </CheckBox>
+                        <CheckBox x:Name="AutoPairPrompt" Content="客户端发起配对时自动弹出 PIN 输入框" />
+                        <CheckBox x:Name="RunElevated" Margin="0,8,0,0">
+                            <TextBlock Text="以管理员权限运行（推荐；驱动异常时自动重启适配器、自动安装驱动、注册分辨率都不再弹 UAC）" TextWrapping="Wrap" />
+                        </CheckBox>
+                        <CheckBox x:Name="AutoRestartAdapter">
+                            <TextBlock Text="Parsec 适配器停止响应时自动重启（显示器热插拔后驱动进程可能挂掉）" TextWrapping="Wrap" />
+                        </CheckBox>
+                        <CheckBox x:Name="AutoInstallDriver" Content="检测不到 Parsec 驱动时自动安装随附的驱动" />
+                        <TextBlock x:Name="ElevationText" Classes="muted" Margin="28,2,0,0" Text="—" />
+                        <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                            <TextBlock Text="keep-alive 间隔 (ms)" Classes="muted" VerticalAlignment="Center" Margin="0,0,8,0" />
+                            <TextBox x:Name="PingMs" Width="70" />
+                            <TextBlock Text="守护检查间隔 (s)" Classes="muted" VerticalAlignment="Center" Margin="18,0,8,0" />
+                            <TextBox x:Name="WatchdogSec" Width="70" />
+                            <TextBlock Text="启动延迟 (s)" Classes="muted" VerticalAlignment="Center" Margin="18,0,8,0" />
+                            <TextBox x:Name="StartupDelay" Width="70" />
+                        </StackPanel>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                        <CheckBox x:Name="AutoStartBox" Content="开机自动启动 Moonlight Hub（登录后 5 秒最小化到托盘，并自动应用上次方案）" IsCheckedChanged="AutoStart_Changed" />
+                    </StackPanel>
+                    <TextBlock x:Name="AutostartText" Text="开机自启：—" Classes="muted" Margin="28,2,0,0" />
+                </StackPanel>
+            </Border>
+
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,20">
+                <Button Content="保存设置" Click="Save_Click" Classes="primary" />
+                <TextBlock x:Name="SaveState" Classes="muted" VerticalAlignment="Center" />
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

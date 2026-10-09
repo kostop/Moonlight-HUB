@@ -1,40 +1,65 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <!--
+    One code base for both computers:
+      net9.0-windows  → Windows build (Sunshine instances, Parsec VDD, display profiles, Deskflow)
+      net9.0          → Linux build (Deskflow keyboard/mouse sharing, shared screen layout, logs, settings)
+    The core compiles for both targets; Windows-only modules are only started on Windows (OperatingSystem.IsWindows()).
+  -->
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetFrameworks>net9.0-windows;net9.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <UseWPF>true</UseWPF>
-    <UseWindowsForms>true</UseWindowsForms>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
-    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <AssemblyName>MoonlightHub</AssemblyName>
     <RootNamespace>MoonlightHub</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>2.0.0</Version>
     <Product>Moonlight Hub</Product>
     <Company>moonlight</Company>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <PlatformTarget>x64</PlatformTarget>
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
-    <NoWarn>$(NoWarn);CA1416;CS8618</NoWarn>
+    <NoWarn>$(NoWarn);CA1416;CS8618;NU1608</NoWarn>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 
-  <!-- WinForms is only used for the tray NotifyIcon; keep its namespaces out of the implicit usings to avoid WPF/WinForms ambiguity. -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net9.0-windows'">
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>
+    <DefineConstants>$(DefineConstants);LINUX</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
-    <Using Remove="System.Windows.Forms" />
-    <Using Remove="System.Drawing" />
+    <PackageReference Include="Avalonia" Version="11.3.22" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.3.22" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.22" />
+    <PackageReference Include="FluentIcons.Avalonia" Version="2.0.321" />
+    <!-- Watchdog: power / display / session notifications (only subscribed on Windows) -->
+    <PackageReference Include="Microsoft.Win32.SystemEvents" Version="9.0.9" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Remove="Assets\app.ico" />
-    <Resource Include="Assets\app.ico" />
+    <AvaloniaResource Include="Assets\**" />
+  </ItemGroup>
+
+  <!-- touch isolation helper (built from moonlight\deskflow\touch\touch_mouse_isolator.cpp, "bridge" mode);
+       native Parsec VDD keep-alive (built from ..\native\vdd-keepalive by its build.ps1) -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0-windows'">
+    <None Update="tools\moonlight-touch-bridge.exe" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="tools\moonlight-vdd-keepalive.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <None Remove="tools\**" />
   </ItemGroup>
 
 </Project>

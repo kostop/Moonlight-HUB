@@ -16,6 +16,9 @@ public sealed class Hub : IDisposable
     public ProfileEngine Engine { get; }
     public Watchdog Watchdog { get; }
     public PairingMonitor Pairing { get; }
+    public DeskflowManager Deskflow { get; }
+    /// <summary>Asks before a disconnected tablet's virtual display is switched off (Windows, Extend profiles).</summary>
+    public StandbyPrompter Standby { get; }
 
     public event Action? Changed;
     /// <summary>A Moonlight client started pairing with an instance and Sunshine is waiting for the PIN.</summary>
@@ -32,12 +35,17 @@ public sealed class Hub : IDisposable
         Vdd = new ParsecVdd { PingIntervalMs = Settings.VddPingMs };
         Instances = new SunshineInstanceManager(Settings);
         Engine = new ProfileEngine(Settings, State, Vdd, Instances);
-        Watchdog = new Watchdog(Settings, State, Vdd, Instances, Engine, subscribeSystemEvents: !headless);
+        Watchdog = new Watchdog(Settings, State, Vdd, Instances, Engine, subscribeSystemEvents: !headless && OperatingSystem.IsWindows());
         Pairing = new PairingMonitor(Settings, Instances);
         Pairing.PairingRequested += req => { try { PairingRequested?.Invoke(req); } catch { } Changed?.Invoke(); };
         Pairing.PairingFinished += (_, _, _, _) => Changed?.Invoke();
         Pairing.ClientModeRequested += OnClientModeRequested;
         Pairing.ClientConnectionChanged += (_, _) => Changed?.Invoke();
+        Deskflow = new DeskflowManager();
+        Standby = new StandbyPrompter(Settings, Instances, Engine, Pairing, () => ActiveProfile);
+        Standby.Requested += _ => Changed?.Invoke();
+        Standby.Resolved += (_, _) => Changed?.Invoke();
+        Deskflow.Changed += () => Changed?.Invoke();
 
         Vdd.StateChanged += () => Changed?.Invoke();
         Instances.Changed += () => Changed?.Invoke();
@@ -47,13 +55,25 @@ public sealed class Hub : IDisposable
         // restore what the last apply wrote so that any code path (CLI included) regenerates the same config
         foreach (var rt in Instances.All)
         {
-            if (State.InstanceDd.TryGetValue(rt.Spec.Id, out var dd)) rt.DesiredDd = dd;
-            if (State.InstanceOutputIds.TryGetValue(rt.Spec.Id, out var oid)) rt.DesiredOutputId = oid;
+            RestoreInstanceTarget(rt, State, ActiveProfile);
         }
         Current = this;
     }
 
     public Profile? ActiveProfile => Settings.Profile(State.ActiveProfileId) ?? Settings.Profile(Settings.ActiveProfileId);
+
+    /// <summary>恢复实例目标；仅主屏或目标缺失时丢弃历史虚拟屏模式，避免后续重写配置时带回旧分辨率。</summary>
+    /// <param name="runtime">需要恢复目标和显示设备配置的实例。</param>
+    /// <param name="state">上次保存的实例输出目标及显示设备配置。</param>
+    /// <param name="profile">当前方案；仅物理主屏方案禁止恢复虚拟屏模式。</param>
+    private static void RestoreInstanceTarget(InstanceRuntime runtime, HubState state, Profile? profile)
+    {
+        var outputId = state.InstanceOutputIds.GetValueOrDefault(runtime.Spec.Id, string.Empty);
+        runtime.DesiredOutputId = profile?.Mode == ProfileMode.MainOnly || string.IsNullOrWhiteSpace(outputId) ? string.Empty : outputId;
+        runtime.DesiredDd = profile is { IdleOff: true, Mode: ProfileMode.Extend or ProfileMode.VirtualOnly } && runtime.DesiredOutputId.Length > 0
+            ? state.InstanceDd.GetValueOrDefault(runtime.Spec.Id) ?? DdOptions.Disabled
+            : DdOptions.Disabled;
+    }
 
     /// <summary>React immediately when a client launches a stream with a specific mode (the watchdog also covers this on its 5 s tick).</summary>
     private void OnClientModeRequested(int instanceId, ClientMode mode, bool sops)
@@ -79,6 +99,15 @@ public sealed class Hub : IDisposable
     /// <summary>Opens the driver, adopts running instances and (optionally) re-applies the active profile.</summary>
     public async Task StartupAsync(bool autoApply)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            // Linux build: Deskflow keyboard/mouse sharing only (no Sunshine, Parsec or display profiles)
+            Log.Info($"Moonlight Hub 启动 (Linux, exe={Paths.ExePath}, 数据目录={Paths.DataDir})");
+            Paths.PruneLogs();
+            if (!Headless) Deskflow.Start();
+            Changed?.Invoke();
+            return;
+        }
         Log.Info($"Moonlight Hub 启动 (exe={Paths.ExePath}, 数据目录={Paths.DataDir}, Sunshine={Settings.SunshineExe}{(Settings.SunshineIsEmbedded ? " [随附]" : string.Empty)})");
         var pruned = Paths.PruneLogs();
         if (pruned > 0) Log.Info($"已清理 {pruned} 个超过 14 天的日志文件");
@@ -102,8 +131,7 @@ public sealed class Hub : IDisposable
 
         foreach (var rt in Instances.All)
         {
-            if (State.InstanceDd.TryGetValue(rt.Spec.Id, out var dd)) rt.DesiredDd = dd;
-            if (State.InstanceOutputIds.TryGetValue(rt.Spec.Id, out var oid)) rt.DesiredOutputId = oid;
+            RestoreInstanceTarget(rt, State, ActiveProfile);
             if (rt.Spec.Enabled && Instances.Adopt(rt.Spec))
             {
                 Log.Info($"接管已运行的实例 {rt.Spec.Id} (pid {rt.Pid})");
@@ -123,6 +151,7 @@ public sealed class Hub : IDisposable
         }
         if (Settings.WatchdogEnabled) Watchdog.Start();
         if (!Headless) Pairing.Start();
+        if (!Headless) Deskflow.Start();
         Changed?.Invoke();
     }
 
@@ -200,6 +229,8 @@ public sealed class Hub : IDisposable
 
     public void Dispose()
     {
+        Standby.Dispose();
+        Deskflow.Dispose();
         Pairing.Dispose();
         Watchdog.Dispose();
         Vdd.Dispose();

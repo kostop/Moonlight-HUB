@@ -1,0 +1,27 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ic="using:FluentIcons.Avalonia"
+        x:Class="MoonlightHub.UI.StandbyPromptWindow"
+        Title="平板已断开 · 副屏还要保留吗？" Width="460" SizeToContent="Height" CanResize="False"
+        Topmost="True" ShowInTaskbar="True" WindowStartupLocation="CenterScreen" Icon="/Assets/app.ico">
+    <Border Padding="22,18">
+        <StackPanel>
+            <StackPanel Orientation="Horizontal">
+                <Border Width="34" Height="34" CornerRadius="9" Background="{StaticResource WarnSoftBrush}" VerticalAlignment="Top">
+                    <ic:SymbolIcon Symbol="Tablet" FontSize="18" Foreground="{StaticResource WarnBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+                    <TextBlock x:Name="HeaderText" Text="平板的 Moonlight 已断开" Classes="h2" />
+                    <TextBlock x:Name="ElapsedText" Text="刚刚断开" Classes="muted" />
+                </StackPanel>
+            </StackPanel>
+            <TextBlock x:Name="BodyText" TextWrapping="Wrap" Margin="0,14,0,0" LineHeight="20"
+                       Text="虚拟副屏和上面的窗口都还保留着。如果只是不小心断开，重新连上就能继续用（连上后这个提示会自动关闭）。" />
+            <TextBlock Text="要关闭这块副屏吗？关闭后副屏上的窗口会移回主屏。" TextWrapping="Wrap" Margin="0,8,0,0" Classes="muted" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+                <Button x:Name="KeepBtn" Content="保留副屏" Classes="ghost" Click="Keep_Click" IsCancel="True" />
+                <Button x:Name="CloseBtn" Content="关闭副屏" Classes="primary" Click="CloseDisplay_Click" Margin="0" />
+            </StackPanel>
+        </StackPanel>
+    </Border>
+</Window>

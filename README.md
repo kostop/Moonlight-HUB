@@ -54,6 +54,8 @@ ISCC.exe ..\installer\MoonlightHub.iss
 
 `tools/update-hub.ps1` 一次完成发布 + 嵌入 + 热替换。编译中间目录默认重定向到 `%LOCALAPPDATA%\MoonlightHub\build`（见 `src/Directory.Build.props`）。
 
+显示目标安全回归：`dotnet run --project tests/DisplaySafetyTests.csproj -c Release`。测试模拟副屏缺失、显示编号被内屏复用、复制共享显示源及历史配置恢复，并禁止调用系统显示接口；详见 [tests/README.md](tests/README.md)。
+
 ## 目录
 
 | 目录 | 内容 |
@@ -68,6 +70,7 @@ ISCC.exe ..\installer\MoonlightHub.iss
 * Parsec VDD 协议：`\\?\root#display#0000#{00b41627-04c4-429e-a26e-0265cf50c8fa}` 设备接口，IOCTL `ADD 0x0022e004 / REMOVE 0x0022a008 / UPDATE 0x0022a00c / VERSION 0x0022e010`；UPDATE 必须持续发送。
 * Sunshine 设备 ID：`UUIDv5(nil, EDID + 实例ID稳定部分 + UTF-16 NUL)`，与 libdisplaydevice 一致，因此可在启动实例前就确定 `output_name`。
 * 待机：实例配置 `dd_configuration_option = ensure_active`（仅副屏方案用 `ensure_only_display`）+ `dd_config_revert_on_disconnect = enabled`。
+* 分辨率保护：布局项绑定设备路径，写入前重新核对目标；虚拟屏缺失、未就绪、显示编号变化或与物理屏共享显示源时拒绝写入。切回仅主屏会清除副屏的自动分辨率配置，复制模式不跟随客户端修改分辨率。
 * 驱动健康：Parsec VDD 是 UMDF（用户态）驱动，显示器热插拔时其宿主进程可能崩溃，设备进入 `CM_PROB_FAILED_POST_START`(43)，设备接口消失；
   Hub 用 `SetupDiGetClassDevs` + `CM_Get_DevNode_Status` 按硬件 ID `Root\Parsec\VDA` 找到设备并判断状态，用 `pnputil /restart-device` 恢复。
   显示设置变化后的 12 秒内不向驱动发 ADD/REMOVE，避免在它处理热插拔时把它打挂。
