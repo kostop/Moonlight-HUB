@@ -364,12 +364,46 @@ public static class DeskflowPeer
     }
 
     /// <summary>
+    /// One link of the server config: <see cref="Peer"/> sits on <see cref="Side"/> of the local screen; only the part of
+    /// the edges where the two screens touch is linked (percent of each edge's length), so the cursor crosses where the
+    /// screens meet in the layout and lands at the same place on the other side — like Windows with two monitors.
+    /// </summary>
+    public sealed record PeerEdge(string Peer, string Side, int LocalFrom = 0, int LocalTo = 100, int PeerFrom = 0, int PeerTo = 100)
+    {
+        private static string Range(int from, int to) => from <= 0 && to >= 100 ? string.Empty : $"({from},{to})";
+        public string LocalLink(string localScreen) => $"{Side}{Range(LocalFrom, LocalTo)} = {Peer}{Range(PeerFrom, PeerTo)}";
+        public string PeerLink(string localScreen) => $"{Opposite(Side)}{Range(PeerFrom, PeerTo)} = {localScreen}{Range(LocalFrom, LocalTo)}";
+        public static string Opposite(string side) => side switch { "left" => "right", "right" => "left", "up" => "down", _ => "up" };
+    }
+
+    /// <summary>
+    /// The link for a peer at pixel rectangle (x, y, w, h) next to the local desktop: its side and the overlapping part
+    /// of the shared edge in percent of the local edge and of the peer's edge. Null when it touches no edge.
+    /// </summary>
+    public static PeerEdge? EdgeFor(string peer, IReadOnlyCollection<LocalRect> local, int x, int y, int w, int h)
+    {
+        var side = SideOf(local, x, y, w, h);
+        if (side == null || local.Count == 0 || w <= 0 || h <= 0) return null;
+        int left = local.Min(d => d.X), top = local.Min(d => d.Y);
+        int right = local.Max(d => d.X + d.Width), bottom = local.Max(d => d.Y + d.Height);
+        var horizontal = side is "up" or "down"; // the shared edge runs along X
+        double localStart = horizontal ? left : top, localLength = horizontal ? right - left : bottom - top;
+        double peerStart = horizontal ? x : y, peerLength = horizontal ? w : h;
+        var from = Math.Max(localStart, peerStart);
+        var to = Math.Min(localStart + localLength, peerStart + peerLength);
+        if (to - from < 1) return null;
+        static int Pct(double v) => (int)Math.Clamp(Math.Round(v * 100), 0, 100);
+        return new PeerEdge(peer, side,
+            Pct((from - localStart) / localLength), Pct((to - localStart) / localLength),
+            Pct((from - peerStart) / peerLength), Pct((to - peerStart) / peerLength));
+    }
+
+    /// <summary>
     /// Rebuilds the "links" section of a Deskflow server config so each peer sits on the given side of the local
     /// screen (and links back), declaring peers that are missing from the "screens" section. Everything else is kept.
     /// </summary>
-    public static string LinkPeersInServerConfig(string config, string localScreen, IReadOnlyList<(string Peer, string Side)> links)
+    public static string LinkPeersInServerConfig(string config, string localScreen, IReadOnlyList<PeerEdge> links)
     {
-        static string Opposite(string side) => side switch { "left" => "right", "right" => "left", "up" => "down", _ => "up" };
         var newline = config.Contains("\r\n") ? "\r\n" : "\n";
         var lines = config.Replace("\r\n", "\n").Split('\n').ToList();
 
@@ -386,11 +420,11 @@ public static class DeskflowPeer
         lines.InsertRange(screensEnd, missing.Select(n => "\t" + n + ":"));
 
         var section = new List<string> { "section: links", $"\t{localScreen}:" };
-        section.AddRange(links.Select(l => $"\t\t{l.Side} = {l.Peer}"));
-        foreach (var (peer, side) in links)
+        section.AddRange(links.Select(l => "\t\t" + l.LocalLink(localScreen)));
+        foreach (var link in links)
         {
-            section.Add($"\t{peer}:");
-            section.Add($"\t\t{Opposite(side)} = {localScreen}");
+            section.Add($"\t{link.Peer}:");
+            section.Add("\t\t" + link.PeerLink(localScreen));
         }
         section.Add("end");
 

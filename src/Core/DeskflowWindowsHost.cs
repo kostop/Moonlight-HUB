@@ -134,16 +134,22 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
         var exe = filtered ? WrapperExe! : CoreExe;
         var mode = role == DeskflowRole.Server ? "server" : "client";
         var args = $"{mode} --settings \"{ConfigPath}\"";
-        // A client injects the server's mouse and keyboard into this desktop. Started with the shell's (medium) token,
-        // UIPI rejects every injected event while an elevated window has the focus — this hub's own window, an admin
-        // terminal — and the cursor just stands still (2026-10-09, qingxian on Windows). The elevated hub therefore starts
-        // the client with its own token; the server keeps the shell token (the touch filter and the medium-IL touch
-        // route mapping need it, and capturing input through low-level hooks works at any level).
-        var pid = role == DeskflowRole.Client && ProcessUtil.IsElevated() ? StartWithOwnToken(exe, args) : ProcessUtil.StartAsShellUserPid(exe, args, hidden: true);
+        var pid = StartDeskflowProcess(exe, args);
         if (pid <= 0) throw new InvalidOperationException("无法启动 " + exe);
         Log.Info($"Deskflow: 已启动 {(filtered ? "触摸过滤包装器" : "deskflow-core")} {mode} (pid {pid})");
         return pid;
     }
+
+    /// <summary>
+    /// Deskflow core, touch isolator and keyboard-release monitor run with the elevated hub's own token. UIPI hides input
+    /// from lower-integrity processes while an elevated window has the focus — this hub's window, an admin terminal: a
+    /// medium-level client could not inject (qingxian's cursor stood still) and a medium-level server's low-level mouse
+    /// hook saw nothing, so the cursor no longer crossed to the other computer right after a click in the hub
+    /// (2026-10-09, 15:10 / 15:49 / 16:20). Sunshine, which owns the touch route mapping, runs elevated too, so all
+    /// processes sharing it are at the same level.
+    /// </summary>
+    private static int StartDeskflowProcess(string exe, string arguments) =>
+        ProcessUtil.IsElevated() ? StartWithOwnToken(exe, arguments) : ProcessUtil.StartAsShellUserPid(exe, arguments, hidden: true);
 
     private static int StartWithOwnToken(string exe, string arguments)
     {
@@ -276,7 +282,7 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
         if ((DateTime.UtcNow - _lastBridgeStartUtc) < TimeSpan.FromSeconds(10)) return;
         StopTouchHelper("moonlight-touch-keyboard-release");
         _lastBridgeStartUtc = DateTime.UtcNow;
-        var ok = ProcessUtil.StartAsShellUser(BridgeExe, "bridge", hidden: true);
+        var ok = StartDeskflowProcess(BridgeExe, "bridge") > 0;
         Log.Info("Deskflow: 触摸隔离器（桥接模式）" + (ok ? "已启动：平板触摸不再移动本机鼠标" : "启动失败"));
     }
 
@@ -333,7 +339,7 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
             && (DateTime.UtcNow - _lastMonitorStartUtc) > TimeSpan.FromSeconds(30))
         {
             _lastMonitorStartUtc = DateTime.UtcNow;
-            var ok = ProcessUtil.StartAsShellUser(monitor, "keyboard-release", hidden: true);
+            var ok = StartDeskflowProcess(monitor, "keyboard-release") > 0;
             Log.Info("Deskflow: 启动触摸释放键盘监视器 " + (ok ? "成功" : "失败"));
         }
 

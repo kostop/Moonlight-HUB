@@ -49,6 +49,12 @@ public sealed class Hub : IDisposable
         Standby.Requested += _ => Changed?.Invoke();
         Standby.Resolved += (_, _) => Changed?.Invoke();
         Deskflow.Changed += () => Changed?.Invoke();
+        if (!headless && OperatingSystem.IsWindows())
+        {
+            // monitors and their scale may have changed: the per-screen pointer speeds are recomputed
+            try { Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged; }
+            catch (Exception ex) { Log.Warn("注册显示变化事件失败: " + ex.Message); }
+        }
 
         Vdd.StateChanged += () => Changed?.Invoke();
         Instances.Changed += () => Changed?.Invoke();
@@ -64,6 +70,8 @@ public sealed class Hub : IDisposable
     }
 
     public Profile? ActiveProfile => Settings.Profile(State.ActiveProfileId) ?? Settings.Profile(Settings.ActiveProfileId);
+
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e) => PointerSpeed.Invalidate();
 
     /// <summary>恢复实例目标；仅主屏或目标缺失时丢弃历史虚拟屏模式，避免后续重写配置时带回旧分辨率。</summary>
     /// <param name="runtime">需要恢复目标和显示设备配置的实例。</param>
@@ -233,6 +241,10 @@ public sealed class Hub : IDisposable
 
     public void Dispose()
     {
+        if (!Headless && OperatingSystem.IsWindows())
+        {
+            try { Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged; } catch { }
+        }
         Standby.Dispose();
         PointerSpeed.Dispose();
         Deskflow.Dispose();

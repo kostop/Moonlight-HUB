@@ -831,13 +831,12 @@ public sealed class DeskflowManager : IDisposable
         if (!CanLinkLocally) throw new InvalidOperationException("本机不是 Deskflow 服务端，无法在本机修改屏幕位置");
         var snapshot = Layout ?? throw new InvalidOperationException("还没有读到过 Deskflow 布局，不知道对端屏幕的大小");
         var sizes = DeskflowPeer.MapPeers(snapshot, localDisplays).ToDictionary(p => p.Name, StringComparer.OrdinalIgnoreCase);
-        var links = new List<(string Peer, string Side)>();
+        var links = new List<DeskflowPeer.PeerEdge>();
         foreach (var (name, x, y) in peers)
         {
             if (!sizes.TryGetValue(name, out var size)) continue;
-            var side = DeskflowPeer.SideOf(localDisplays, x, y, size.Width, size.Height)
-                ?? throw new InvalidOperationException($"{name} 与本机显示器重叠，请把它拖到某条边的外侧");
-            links.Add((name, side));
+            links.Add(DeskflowPeer.EdgeFor(name, localDisplays, x, y, size.Width, size.Height)
+                ?? throw new InvalidOperationException($"{name} 没有贴住本机显示器的某条边（或与它重叠），请把它拖到紧挨某条边的位置"));
         }
         if (links.Count == 0) throw new InvalidOperationException("没有可摆放的对端屏幕");
 
@@ -845,7 +844,8 @@ public sealed class DeskflowManager : IDisposable
         var old = File.ReadAllText(path);
         var updated = DeskflowPeer.LinkPeersInServerConfig(old, LocalScreenName, links);
         string SideName(string s) => s switch { "left" => "左侧", "right" => "右侧", "up" => "上方", _ => "下方" };
-        var summary = string.Join("、", links.Select(l => $"{l.Peer} 在{SideName(l.Side)}"));
+        string Part(DeskflowPeer.PeerEdge l) => l.LocalFrom <= 0 && l.LocalTo >= 100 ? "整条边" : $"边上 {l.LocalFrom}%–{l.LocalTo}% 的一段";
+        var summary = string.Join("、", links.Select(l => $"{l.Peer} 在{SideName(l.Side)}（{Part(l)}）"));
         if (updated != old)
         {
             File.Copy(path, path + ".bak-hub-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"), true);
