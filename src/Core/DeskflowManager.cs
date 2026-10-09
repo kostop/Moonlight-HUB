@@ -126,6 +126,8 @@ public sealed class DeskflowStatus
     public string ScreenName { get; init; } = string.Empty;
     public int Port { get; init; } = 24800;
     public bool Tls { get; init; }
+    /// <summary>Deskflow.conf has TLS and fingerprint pairing switched off explicitly (Deskflow's defaults are on).</summary>
+    public bool SecurityOff { get; init; }
     public DateTime TimeUtc { get; init; } = DateTime.UtcNow;
 
     public string Summary => !Installed ? "未安装"
@@ -544,6 +546,10 @@ public sealed class DeskflowManager : IDisposable
         if (s.Role == DeskflowRole.Client) updated = IniSet(updated, "client", "remoteHost", s.RemoteHost);
         // the Deskflow GUI (if someone opens it) must never start a core of its own
         updated = IniSet(updated, "gui", "startCoreWithGui", "false");
+        // no TLS and no fingerprint pairing (the user's choice, 2026-10-09: the trust prompts and fingerprint files kept
+        // breaking the link). Both ends must agree, and every hub writes the same, whichever role it has.
+        updated = IniSet(updated, "security", "tlsEnabled", "false");
+        updated = IniSet(updated, "security", "checkPeerFingerprints", "false");
         if (updated == text) return;
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var tmp = path + ".hub.tmp";
@@ -630,6 +636,7 @@ public sealed class DeskflowManager : IDisposable
     {
         if (s.Role == DeskflowRole.Off) return true;
         if (st.ConfiguredRole != s.Role) return false;
+        if (!st.SecurityOff) return false; // rewritten (and the core restarted) by the repair below
         return s.Role != DeskflowRole.Client || string.Equals(st.RemoteHost, s.RemoteHost, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -654,7 +661,8 @@ public sealed class DeskflowManager : IDisposable
         var parts = new List<string>();
         if (st.RunningRole != s.Role) parts.Add($"运行中={RoleName(st.RunningRole)} 期望={RoleName(s.Role)}");
         if (st.MainCores > 1) parts.Add($"有 {st.MainCores} 个 core 同时运行");
-        if (!ConfMatches(s, st)) parts.Add($"配置 coreMode={RoleName(st.ConfiguredRole)}{(s.Role == DeskflowRole.Client ? " remoteHost=" + st.RemoteHost : string.Empty)}");
+        if (s.Role != DeskflowRole.Off && !st.SecurityOff) parts.Add("TLS / 指纹校验尚未关闭");
+        else if (!ConfMatches(s, st)) parts.Add($"配置 coreMode={RoleName(st.ConfiguredRole)}{(s.Role == DeskflowRole.Client ? " remoteHost=" + st.RemoteHost : string.Empty)}");
         if (s.Role == DeskflowRole.Server)
         {
             if (!st.Listening) parts.Add($"端口 {st.Port} 未监听");
@@ -709,6 +717,8 @@ public sealed class DeskflowManager : IDisposable
             ScreenName = IniGet(conf, "core", "computerName") ?? Environment.MachineName,
             Port = port,
             Tls = IniBool(conf, "security", "tlsEnabled"),
+            SecurityOff = string.Equals(IniGet(conf, "security", "tlsEnabled"), "false", StringComparison.OrdinalIgnoreCase)
+                          && string.Equals(IniGet(conf, "security", "checkPeerFingerprints"), "false", StringComparison.OrdinalIgnoreCase),
         };
         Status = st;
         return st;

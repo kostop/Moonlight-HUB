@@ -150,6 +150,10 @@ public sealed class HubSettings
     public bool ConfirmStandbyOnDisconnect { get; set; } = true;
     /// <summary>Set once the legacy Sunshine config was copied into the hub data directory.</summary>
     public bool SunshineConfigMigrated { get; set; }
+    /// <summary>Switch the pointer speed when the cursor enters another screen (local monitors and Deskflow peers).</summary>
+    public bool PointerSpeedEnabled { get; set; } = true;
+    /// <summary>Pointer speed (1..20) the user picked per screen ("monitor:&lt;device id&gt;" / "peer:&lt;screen&gt;"); missing = automatic.</summary>
+    public Dictionary<string, int> PointerSpeeds { get; set; } = new();
 
     [JsonIgnore] public string SunshineDir => Path.GetDirectoryName(SunshineExe) ?? @"D:\YingYong\Sunshine";
     [JsonIgnore] public bool SunshineIsEmbedded => string.Equals(SunshineExe, Paths.EmbeddedSunshineExe, StringComparison.OrdinalIgnoreCase);

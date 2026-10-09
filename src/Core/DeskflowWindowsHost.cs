@@ -211,7 +211,16 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
     public bool? CheckFilter(IReadOnlyCollection<CoreProcess> cores)
     {
         var wrapper = WrapperExe;
-        if (wrapper == null || !cores.Any(c => c.IsWrapper)) return null;
+        var wrapperCore = cores.FirstOrDefault(c => c.IsWrapper);
+        if (wrapper == null || wrapperCore == null) return null;
+        // the filter only reports installed once Deskflow has set up its hooks: a check in the first seconds after a
+        // (re)start said "unhealthy" and caused a second restart, doubling the time the client was cut off
+        try
+        {
+            using var proc = Process.GetProcessById(wrapperCore.Pid);
+            if ((DateTime.Now - proc.StartTime) < TimeSpan.FromSeconds(20)) return null;
+        }
+        catch { }
         if ((DateTime.UtcNow - _lastFilterCheckUtc) < TimeSpan.FromSeconds(30)) return _lastFilterHealthy;
         _lastFilterCheckUtc = DateTime.UtcNow;
         try

@@ -214,17 +214,30 @@ public static class DeskflowPeer
         {
             if (kv.Key == snapshot.LocalScreen || kv.Value is not JsonObject rect) continue;
             var res = rect["resolution"] as JsonObject;
-            list.Add(new PeerScreen(
-                kv.Key,
-                minX + (int)Math.Round((Num(rect, "x") - lx) / k),
-                minY + (int)Math.Round((Num(rect, "y") - ly) / k),
-                (int)Math.Round(Num(rect, "w") / k),
-                (int)Math.Round(Num(rect, "h") / k),
-                (int)(res?["width"]?.GetValue<double>() ?? 0),
-                (int)(res?["height"]?.GetValue<double>() ?? 0),
-                string.Equals(kv.Key, snapshot.Server, StringComparison.OrdinalIgnoreCase)));
+            var resW = (int)(res?["width"]?.GetValue<double>() ?? 0);
+            var resH = (int)(res?["height"]?.GetValue<double>() ?? 0);
+            // the layout service sizes screens in its own (scale-adjusted) units, which drew a 2560x1440 peer next to a
+            // 2000x1200 display at about 1185x667; Deskflow moves the cursor pixel for pixel, so the peer is drawn at its
+            // real resolution, grown away from the edge it touches (see PeerRect / MovePeers for the inverse)
+            var ux = minX + (int)Math.Round((Num(rect, "x") - lx) / k);
+            var uy = minY + (int)Math.Round((Num(rect, "y") - ly) / k);
+            var uw = (int)Math.Round(Num(rect, "w") / k);
+            var uh = (int)Math.Round(Num(rect, "h") / k);
+            var (x, y, w, h) = PeerRect(localDisplays, ux, uy, uw, uh, resW, resH);
+            list.Add(new PeerScreen(kv.Key, x, y, w, h, resW, resH, string.Equals(kv.Key, snapshot.Server, StringComparison.OrdinalIgnoreCase)));
         }
         return list;
+    }
+
+    /// <summary>
+    /// Pixel rectangle of a peer whose layout rectangle (in pixels of the local desktop) is <c>(ux, uy, uw, uh)</c>: its
+    /// real resolution, anchored at the edge it shares with the local desktop so it never grows over a local display.
+    /// </summary>
+    private static (int X, int Y, int W, int H) PeerRect(IReadOnlyCollection<LocalRect> local, int ux, int uy, int uw, int uh, int resW, int resH)
+    {
+        if (resW <= 0 || resH <= 0) return (ux, uy, uw, uh);
+        var side = SideOf(local, ux, uy, uw, uh);
+        return (side == "left" ? ux + uw - resW : ux, side == "up" ? uy + uh - resH : uy, resW, resH);
     }
 
     /// <summary>
@@ -315,8 +328,16 @@ public static class DeskflowPeer
         foreach (var (name, x, y) in peers)
         {
             if (screens[name] is not JsonObject rect) continue;
-            rect["x"] = lx + (x - minX) * k;
-            rect["y"] = ly + (y - minY) * k;
+            // inverse of PeerRect: the canvas shows the peer at its resolution, the layout keeps it in its own units,
+            // anchored at the shared edge
+            var res = rect["resolution"] as JsonObject;
+            var resW = (int)(res?["width"]?.GetValue<double>() ?? 0);
+            var resH = (int)(res?["height"]?.GetValue<double>() ?? 0);
+            var w = resW > 0 && resH > 0 ? resW : (int)Math.Round(Num(rect, "w") / k);
+            var h = resW > 0 && resH > 0 ? resH : (int)Math.Round(Num(rect, "h") / k);
+            var side = SideOf(localDisplays, x, y, w, h);
+            rect["x"] = side == "left" ? lx + (x + w - minX) * k - Num(rect, "w") : lx + (x - minX) * k;
+            rect["y"] = side == "up" ? ly + (y + h - minY) * k - Num(rect, "h") : ly + (y - minY) * k;
         }
     }
 

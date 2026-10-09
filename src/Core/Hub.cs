@@ -19,6 +19,8 @@ public sealed class Hub : IDisposable
     public DeskflowManager Deskflow { get; }
     /// <summary>Asks before a disconnected tablet's virtual display is switched off (Windows, Extend profiles).</summary>
     public StandbyPrompter Standby { get; }
+    /// <summary>Switches the pointer speed per screen (Windows).</summary>
+    public PointerSpeedManager PointerSpeed { get; }
 
     public event Action? Changed;
     /// <summary>A Moonlight client started pairing with an instance and Sunshine is waiting for the PIN.</summary>
@@ -42,6 +44,7 @@ public sealed class Hub : IDisposable
         Pairing.ClientModeRequested += OnClientModeRequested;
         Pairing.ClientConnectionChanged += (_, _) => Changed?.Invoke();
         Deskflow = new DeskflowManager();
+        PointerSpeed = new PointerSpeedManager(Settings, Deskflow);
         Standby = new StandbyPrompter(Settings, Instances, Engine, Pairing, () => ActiveProfile);
         Standby.Requested += _ => Changed?.Invoke();
         Standby.Resolved += (_, _) => Changed?.Invoke();
@@ -152,6 +155,7 @@ public sealed class Hub : IDisposable
         if (Settings.WatchdogEnabled) Watchdog.Start();
         if (!Headless) Pairing.Start();
         if (!Headless) Deskflow.Start();
+        if (!Headless) PointerSpeed.Start();
         Changed?.Invoke();
     }
 
@@ -230,6 +234,7 @@ public sealed class Hub : IDisposable
     public void Dispose()
     {
         Standby.Dispose();
+        PointerSpeed.Dispose();
         Deskflow.Dispose();
         Pairing.Dispose();
         Watchdog.Dispose();

@@ -34,6 +34,7 @@ public partial class DisplaysView : UserControl, IRefreshable
             // Linux: the desktop's own display settings arrange the monitors; here only the other computers are placed
             LayoutCanvas.LockDisplays = true;
             ExtendBtn.IsVisible = ReapplyBtn.IsVisible = false;
+            PointerCard.IsVisible = false;
             HelpText.Text = "灰色是本机显示器（在系统显示设置里摆放），琥珀色是 Deskflow 的另一台电脑。拖动琥珀色方块到本机显示器的某条边，然后点“应用摆放”：鼠标从那条边移过去就会切过去。";
         }
     }
@@ -137,6 +138,7 @@ public partial class DisplaysView : UserControl, IRefreshable
         }
         if (!LayoutCanvas.HasChanges) LayoutCanvas.SetDisplays(_displays);
         RefreshPeers();
+        if (OperatingSystem.IsWindows()) RefreshPointer();
         var sig = string.Join("|", _displays.Select(d => d.ToString()))
                   + (OperatingSystem.IsWindows() ? "#" + ParsecModes.Signature() + "#" + string.Join(",", Hub.State.PendingReplugSlots) : string.Empty);
         if (sig == _signature) return;
@@ -150,6 +152,71 @@ public partial class DisplaysView : UserControl, IRefreshable
         {
             DisplayList.Children.Add(Ui.T("没有找到显示器", "Muted"));
         }
+    }
+
+    // ------------------------------------------------------------------ pointer speed per screen
+    private string _pointerSignature = string.Empty;
+    private bool _buildingPointer;
+
+    private void RefreshPointer()
+    {
+        var ps = Hub.PointerSpeed;
+        var enabled = Hub.Settings.PointerSpeedEnabled;
+        var screens = ps.Screens;
+        var sig = $"{enabled}|{ps.Baseline}|{ps.CurrentKey}|" + string.Join(";", screens.Select(s => $"{s.Key},{s.Label},{s.Scale:0.00},{s.AutoSpeed},{s.ManualSpeed}"));
+        if (sig == _pointerSignature) return;
+        _pointerSignature = sig;
+        _buildingPointer = true;
+        try
+        {
+            PointerToggle.IsChecked = enabled;
+            PointerList.Children.Clear();
+            PointerList.Children.Add(Ui.T($"Windows 里设置的鼠标速度：{ps.Baseline}（作为主物理屏的速度；没有激活物理屏时按 100% 缩放的屏计算）", "Muted"));
+            if (screens.Count == 0)
+            {
+                PointerList.Children.Add(Ui.T(enabled ? "正在读取屏幕…" : "已关闭：始终使用 Windows 里设置的速度", "Muted"));
+                return;
+            }
+            foreach (var s in screens)
+            {
+                var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), Margin = new Thickness(0, 6, 0, 0) };
+                var info = new StackPanel();
+                var head = Ui.Row(new TextBlock { Text = s.IsPeer ? $"{s.Label}（Deskflow 另一台电脑）" : s.Label, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center });
+                if (enabled && s.Key == ps.CurrentKey) head.Children.Add(Ui.Pill("光标在这里 · 速度 " + ps.CurrentSpeed, "ok"));
+                info.Children.Add(head);
+                info.Children.Add(Ui.T($"缩放 {s.Scale * 100:0}%{(s.IsPeer && Hub.Deskflow.PeerHub?.DpiScale is not > 0 ? "（对端未报告，按 100%）" : string.Empty)} · 自动速度 {s.AutoSpeed}", "Muted"));
+                grid.Children.Add(info);
+
+                var combo = new ComboBox { Width = 150, IsEnabled = enabled, VerticalAlignment = VerticalAlignment.Center };
+                combo.Items.Add($"自动（{s.AutoSpeed}）");
+                for (var i = 1; i <= 20; i++) combo.Items.Add(i.ToString());
+                combo.SelectedIndex = s.ManualSpeed ?? 0;
+                var key = s.Key;
+                combo.SelectionChanged += (_, _) =>
+                {
+                    if (_buildingPointer || combo.SelectedIndex < 0) return;
+                    Hub.PointerSpeed.SetManual(key, combo.SelectedIndex == 0 ? null : combo.SelectedIndex);
+                    Log.Info($"鼠标速度: {key} → {(combo.SelectedIndex == 0 ? "自动" : combo.SelectedIndex.ToString())}");
+                };
+                Grid.SetColumn(combo, 1);
+                grid.Children.Add(combo);
+                PointerList.Children.Add(grid);
+            }
+        }
+        finally
+        {
+            _buildingPointer = false;
+        }
+    }
+
+    private void PointerToggle_Changed(object? sender, RoutedEventArgs e)
+    {
+        if (_buildingPointer) return;
+        Hub.Settings.PointerSpeedEnabled = PointerToggle.IsChecked == true;
+        Hub.Settings.Save();
+        Hub.PointerSpeed.Invalidate();
+        Log.Info("按屏幕切换鼠标速度: " + (Hub.Settings.PointerSpeedEnabled ? "开" : "关"));
+        _pointerSignature = string.Empty;
     }
 
     private Border BuildLinuxRow(DisplayInfo d)

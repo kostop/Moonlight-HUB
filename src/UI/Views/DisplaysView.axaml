@@ -24,6 +24,19 @@
                     <ui:DisplayCanvas x:Name="LayoutCanvas" Height="320" Interactive="True" />
                 </DockPanel>
             </Border>
+            <Border x:Name="PointerCard" Classes="card">
+                <StackPanel>
+                    <DockPanel>
+                        <ToggleSwitch x:Name="PointerToggle" DockPanel.Dock="Right" OnContent="自动切换" OffContent="关闭" VerticalAlignment="Top" IsCheckedChanged="PointerToggle_Changed" />
+                        <StackPanel>
+                            <TextBlock Text="鼠标速度（每块屏）" Classes="h2" />
+                            <TextBlock x:Name="PointerHelp" Classes="muted" TextWrapping="Wrap" MaxWidth="760" HorizontalAlignment="Left"
+                                       Text="光标进入哪块屏就用那块屏的速度。“自动”按屏幕缩放计算（相对主物理屏；平板这种高密度屏会更快），也可以给每块屏手动选 1–20。Deskflow 的另一台电脑也在这里：它的光标是按本机的速度移动的。" />
+                        </StackPanel>
+                    </DockPanel>
+                    <StackPanel x:Name="PointerList" Margin="0,8,0,0" />
+                </StackPanel>
+            </Border>
             <TextBlock Text="显示器" Classes="h2" Margin="0,4,0,10" />
             <StackPanel x:Name="DisplayList" />
         </StackPanel>

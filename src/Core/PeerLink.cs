@@ -9,7 +9,7 @@ using System.Text.Json.Nodes;
 namespace MoonlightHub.Core;
 
 /// <summary>What the other computer's hub reports about itself.</summary>
-public sealed record PeerHubInfo(string Screen, string Os, string Version, DeskflowRole Role, DeskflowRole Running, List<string> Peers)
+public sealed record PeerHubInfo(string Screen, string Os, string Version, DeskflowRole Role, DeskflowRole Running, List<string> Peers, double DpiScale = 0)
 {
     public string Text => $"{Screen} ({Os}, v{Version}) · {DeskflowManager.RoleName(Running)}" + (Peers.Count > 0 ? " · 已连接 " + string.Join(", ", Peers) : string.Empty);
 }
@@ -151,6 +151,8 @@ public sealed class PeerLink : IDisposable
             role = _deskflow.Settings.Role.ToString().ToLowerInvariant(),
             running = st.RunningRole.ToString().ToLowerInvariant(),
             peers = st.Peers,
+            // the other hub sets its pointer speed for this screen from it (Deskflow moves this cursor by its pixel deltas)
+            dpiScale = PointerSpeedManager.PrimaryScale(),
         };
     }
 
@@ -220,7 +222,8 @@ public sealed class PeerLink : IDisposable
             o["version"]?.GetValue<string>() ?? "?",
             ParseRoleName(o["role"]?.GetValue<string>()) ?? DeskflowRole.Off,
             ParseRoleName(o["running"]?.GetValue<string>()) ?? DeskflowRole.Off,
-            (o["peers"] as JsonArray)?.Select(p => p?.GetValue<string>() ?? string.Empty).Where(p => p.Length > 0).ToList() ?? new List<string>());
+            (o["peers"] as JsonArray)?.Select(p => p?.GetValue<string>() ?? string.Empty).Where(p => p.Length > 0).ToList() ?? new List<string>(),
+            o["dpiScale"] is JsonValue scale && scale.TryGetValue<double>(out var dpi) ? dpi : 0);
     }
 
     public void Dispose()
