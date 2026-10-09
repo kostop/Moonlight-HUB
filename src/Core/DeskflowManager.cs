@@ -862,6 +862,22 @@ public sealed class DeskflowManager : IDisposable
             : $"本机 Deskflow 服务端配置已经是：{summary}";
     }
 
+    /// <summary>
+    /// The other computer's desktop as its hub reports it replaces the size kept in the layout: qingxian dual-boots and
+    /// runs 2560x1440 on Ubuntu but 1920x1080 on Windows, and the stored layout only knew the former (2026-10-09).
+    /// </summary>
+    private void ApplyPeerDesktopSize(PeerHubInfo? hub)
+    {
+        if (hub is not { DesktopWidth: > 0, DesktopHeight: > 0 } || Layout?.Layout["screens"] is not JsonObject screens) return;
+        var name = screens.Select(kv => kv.Key).FirstOrDefault(k => k.Equals(hub.Screen, StringComparison.OrdinalIgnoreCase));
+        if (name == null || screens[name] is not JsonObject rect) return;
+        var res = rect["resolution"] as JsonObject;
+        if ((int)(res?["width"]?.GetValue<double>() ?? 0) == hub.DesktopWidth && (int)(res?["height"]?.GetValue<double>() ?? 0) == hub.DesktopHeight) return;
+        rect["resolution"] = new JsonObject { ["width"] = hub.DesktopWidth, ["height"] = hub.DesktopHeight };
+        Log.Info($"Deskflow: {name} 报告桌面为 {hub.DesktopWidth}x{hub.DesktopHeight}（{hub.Os}），更新布局中的尺寸");
+        SaveLayoutCache(Layout);
+    }
+
     private async Task RefreshPeerHubAsync()
     {
         var s = Settings;
@@ -872,6 +888,7 @@ public sealed class DeskflowManager : IDisposable
             _lastPeerStatusUtc = DateTime.UtcNow;
             PeerHub = await PeerLink.GetStatusAsync(s.RemoteHost, TimeSpan.FromSeconds(4)).ConfigureAwait(false);
             PeerHubError = string.Empty;
+            ApplyPeerDesktopSize(PeerHub);
         }
         catch (Exception ex)
         {

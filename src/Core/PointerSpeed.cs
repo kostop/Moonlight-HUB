@@ -300,6 +300,14 @@ public sealed class PointerSpeedManager : IDisposable
         }
     }
 
+    /// <summary>Size of the whole desktop (all active monitors) in physical pixels — what Deskflow uses as this screen.</summary>
+    public static (int Width, int Height) DesktopSize()
+    {
+        if (!OperatingSystem.IsWindows()) return (0, 0);
+        try { return (GetSystemMetrics(78 /* SM_CXVIRTUALSCREEN */), GetSystemMetrics(79 /* SM_CYVIRTUALSCREEN */)); }
+        catch { return (0, 0); }
+    }
+
     public void Dispose()
     {
         _stop = true;
@@ -328,6 +336,7 @@ public sealed class PointerSpeedManager : IDisposable
 
     private delegate bool MonitorEnumProc(IntPtr monitor, IntPtr hdc, IntPtr rect, IntPtr data);
 
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] private static extern bool GetCursorPos(out POINT point);
     [DllImport("user32.dll")] private static extern IntPtr MonitorFromPoint(POINT point, uint flags);
     [DllImport("user32.dll")] private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
