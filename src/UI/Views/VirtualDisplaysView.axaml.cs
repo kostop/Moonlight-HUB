@@ -86,7 +86,7 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
         }
 
         var modes = ParsecModes.Read();
-        var msig = string.Join("|", modes);
+        var msig = string.Join("|", modes) + "#" + _editingMode;
         if (msig != _modeSignature)
         {
             _modeSignature = msig;
@@ -94,24 +94,85 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
             if (modes.Count == 0) ModesPanel.Children.Add(Ui.T("没有自定义模式", "Muted"));
             foreach (var m in modes)
             {
-                var row = Ui.Row(Ui.Pill($"#{m.Index}", "muted"), new TextBlock { Text = m.ToString(), Width = 200, VerticalAlignment = VerticalAlignment.Center });
-                var del = Ui.B("删除", (_, _) =>
-                {
-                    Ui.RunAsync(_window, async () =>
-                    {
-                        var (ok, msg) = ParsecModes.Remove(m.Index);
-                        if (!ok) throw new InvalidOperationException(msg);
-                        var note = await Hub.Engine.RefreshModesAsync("删除了自定义模式").ConfigureAwait(false);
-                        _window.Toast("自定义模式", $"已删除 {m}。{note}");
-                        Dispatcher.UIThread.Post(() => { _modeSignature = string.Empty; Invalidate(); });
-                    });
-                }, "GhostButton");
-                del.Padding = new Thickness(8, 3, 8, 3);
-                row.Children.Add(del);
+                var row = m.Index == _editingMode ? ModeEditRow(m) : ModeRow(m);
                 row.Margin = new Thickness(0, 2, 0, 2);
                 ModesPanel.Children.Add(row);
             }
         }
+    }
+
+    /// <summary>Registered mode being edited in place (null = none).</summary>
+    private int? _editingMode;
+
+    private StackPanel ModeRow(ParsecCustomMode m)
+    {
+        var row = Ui.Row(Ui.Pill($"#{m.Index}", "muted"), new TextBlock { Text = m.ToString(), Width = 200, VerticalAlignment = VerticalAlignment.Center });
+        var edit = Ui.B("编辑", (_, _) => { _editingMode = m.Index; Refresh(); }, "GhostButton");
+        edit.Padding = new Thickness(8, 3, 8, 3);
+        row.Children.Add(edit);
+        var del = Ui.B("删除", (_, _) =>
+        {
+            Ui.RunAsync(_window, async () =>
+            {
+                var (ok, msg) = ParsecModes.Remove(m.Index);
+                if (!ok) throw new InvalidOperationException(msg);
+                var note = await Hub.Engine.RefreshModesAsync("删除了自定义模式").ConfigureAwait(false);
+                _window.Toast("自定义模式", $"已删除 {m}。{note}");
+                Dispatcher.UIThread.Post(() => { _modeSignature = string.Empty; Invalidate(); });
+            });
+        }, "GhostButton");
+        del.Padding = new Thickness(8, 3, 8, 3);
+        row.Children.Add(del);
+        return row;
+    }
+
+    /// <summary>The registered mode as width / height / rate boxes: saving rewrites the same registry entry.</summary>
+    private StackPanel ModeEditRow(ParsecCustomMode m)
+    {
+        var w = new TextBox { Width = 70, Text = m.Width.ToString() };
+        var h = new TextBox { Width = 70, Text = m.Height.ToString() };
+        var hz = new TextBox { Width = 60, Text = m.Hz.ToString() };
+        var row = Ui.Row(Ui.Pill($"#{m.Index}", "muted"), w,
+            new TextBlock { Text = "×", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0) }, h,
+            new TextBlock { Text = "@", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0) }, hz);
+        var save = Ui.B("保存", (_, _) =>
+        {
+            if (!TryReadMode(w.Text, h.Text, hz.Text, out var nw, out var nh, out var nhz)) return;
+            if (nw == m.Width && nh == m.Height && nhz == m.Hz)
+            {
+                _editingMode = null;
+                Refresh();
+                return;
+            }
+            Ui.RunAsync(_window, async () =>
+            {
+                var (ok, msg) = ParsecModes.Update(m.Index, nw, nh, nhz);
+                if (!ok) throw new InvalidOperationException(msg);
+                Dispatcher.UIThread.Post(() => { _editingMode = null; _modeSignature = string.Empty; Refresh(); });
+                // like registering: the driver reads the table only for a freshly plugged monitor
+                var note = await Hub.Engine.RefreshModesAsync("修改了自定义模式").ConfigureAwait(false);
+                _window.Toast("自定义模式", $"已把 #{m.Index} 从 {m} 改为 {nw}×{nh}@{nhz}Hz。{note}");
+                Dispatcher.UIThread.Post(() => Invalidate());
+            });
+        }, "GhostButton");
+        save.Padding = new Thickness(8, 3, 8, 3);
+        save.Margin = new Thickness(10, 0, 0, 0);
+        row.Children.Add(save);
+        var cancel = Ui.B("取消", (_, _) => { _editingMode = null; Refresh(); }, "GhostButton");
+        cancel.Padding = new Thickness(8, 3, 8, 3);
+        row.Children.Add(cancel);
+        return row;
+    }
+
+    private bool TryReadMode(string? wText, string? hText, string? hzText, out int w, out int h, out int hz)
+    {
+        h = hz = 0;
+        if (!int.TryParse(wText, out w) || !int.TryParse(hText, out h) || !int.TryParse(hzText, out hz) || w < 320 || h < 240 || hz < 24 || hz > 500)
+        {
+            _window.Toast("参数无效", "请输入有效的宽、高和刷新率", true);
+            return false;
+        }
+        return true;
     }
 
     private void Invalidate()
@@ -184,11 +245,7 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
 
     private void AddMode_Click(object? sender, RoutedEventArgs e)
     {
-        if (!int.TryParse(ModeW.Text, out var w) || !int.TryParse(ModeH.Text, out var h) || !int.TryParse(ModeHz.Text, out var hz) || w < 320 || h < 240 || hz < 24 || hz > 500)
-        {
-            _window.Toast("参数无效", "请输入有效的宽、高和刷新率", true);
-            return;
-        }
+        if (!TryReadMode(ModeW.Text, ModeH.Text, ModeHz.Text, out var w, out var h, out var hz)) return;
         Ui.RunAsync(_window, async () =>
         {
             var (ok, msg) = ParsecModes.EnsureRegistered(w, h, hz);

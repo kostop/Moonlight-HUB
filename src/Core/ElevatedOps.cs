@@ -20,6 +20,14 @@ public static class ElevatedOps
                         Log.Info("[elevated] add-parsec-mode: " + msg);
                         return ok ? 0 : 2;
                     }
+                case "update-parsec-mode":
+                    {
+                        var m = Regex.Match(args.Length > 2 ? args[2] : string.Empty, @"^(\d+)x(\d+)@(\d+)$");
+                        if (!m.Success || !int.TryParse(args[1], out var index)) return 1;
+                        var (ok, msg) = ParsecModes.Update(index, int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), int.Parse(m.Groups[3].Value));
+                        Log.Info("[elevated] update-parsec-mode: " + msg);
+                        return ok ? 0 : 2;
+                    }
                 case "remove-parsec-mode":
                     {
                         if (args.Length < 2 || !int.TryParse(args[1], out var index)) return 1;

@@ -141,6 +141,36 @@ public static class ParsecModes
         }
     }
 
+    /// <summary>Changes registered mode #<paramref name="index"/> in place (same registry entry); when not elevated, spawns an elevated copy of the hub.</summary>
+    public static (bool Ok, string Message) Update(int index, int width, int height, int hz)
+    {
+        var existing = Read();
+        if (existing.All(m => m.Index != index)) return (false, $"模式 #{index} 不存在（可能已被删除）");
+        if (existing.Any(m => m.Index == index && m.Width == width && m.Height == height && m.Hz == hz)) return (true, "模式未变化");
+        if (existing.FirstOrDefault(m => m.Index != index && m.Width == width && m.Height == height && m.Hz == hz) is { } twin)
+            return (false, $"{width}×{height}@{hz}Hz 已经注册为模式 #{twin.Index}");
+        if (!ProcessUtil.IsElevated())
+        {
+            var code = ProcessUtil.RunSelfElevated($"--elevated update-parsec-mode {index} {width}x{height}@{hz}");
+            return code == 0 ? (true, "已修改") : (false, code == -1 ? "用户取消了 UAC 提示" : $"提权修改失败，退出码 {code}");
+        }
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey($@"{RegistryPath}\{index}", true);
+            if (key == null) return (false, $"模式 #{index} 不存在（可能已被删除）");
+            var old = existing.First(m => m.Index == index);
+            key.SetValue("width", width, RegistryValueKind.DWord);
+            key.SetValue("height", height, RegistryValueKind.DWord);
+            key.SetValue("hz", hz, RegistryValueKind.DWord);
+            Log.Info($"已修改 Parsec 自定义模式 #{index}: {old.Width}x{old.Height}@{old.Hz} → {width}x{height}@{hz}");
+            return (true, "已修改");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
     public static (bool Ok, string Message) Remove(int index)
     {
         if (!ProcessUtil.IsElevated())
