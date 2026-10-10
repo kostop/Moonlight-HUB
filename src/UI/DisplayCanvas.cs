@@ -63,8 +63,21 @@ public sealed class DisplayCanvas : Canvas
         if (sig == _signature) return;
         if (_dragItem != null) return; // do not clobber an in-progress drag
         _signature = sig;
+        // a dragged display keeps its draft while Windows still has it at the same place; a display that went away
+        // (detached, unplugged) drops out — kept in the draft, "应用摆放" sent it back and was refused (2026-10-10)
+        var drafts = new Dictionary<string, Item>(StringComparer.OrdinalIgnoreCase);
+        foreach (var i in _items.Where(i => i.Display != null && i.Moved)) drafts[i.Display!.GdiName] = i;
         _items.RemoveAll(i => i.Display != null);
-        _items.InsertRange(0, list.Select(d => new Item { Display = d, X = d.PositionX, Y = d.PositionY, OrigX = d.PositionX, OrigY = d.PositionY, W = d.Width, H = d.Height }));
+        _items.InsertRange(0, list.Select(d =>
+        {
+            var item = new Item { Display = d, X = d.PositionX, Y = d.PositionY, OrigX = d.PositionX, OrigY = d.PositionY, W = d.Width, H = d.Height };
+            if (drafts.TryGetValue(d.GdiName, out var old) && old.OrigX == d.PositionX && old.OrigY == d.PositionY && old.W == d.Width && old.H == d.Height)
+            {
+                item.X = old.X;
+                item.Y = old.Y;
+            }
+            return item;
+        }));
         Redraw();
         DraftChanged?.Invoke();
     }

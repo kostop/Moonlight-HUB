@@ -46,8 +46,17 @@ public partial class DisplaysView : UserControl, IRefreshable
     private void ApplyLayout_Click(object? sender, RoutedEventArgs e)
     {
         var draft = LayoutCanvas.DraftPositions;
+        var gone = new List<string>();
+        if (OperatingSystem.IsWindows())
+        {
+            // a display detached or unplugged since the canvas was drawn is left out: Windows refuses a layout naming it
+            var active = DisplayManager.Enumerate().Where(d => d.Active && d.Width > 0).Select(d => d.GdiName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            gone = draft.Where(p => !active.Contains(p.Display.GdiName)).Select(p => p.Display.GdiName).ToList();
+            draft = draft.Where(p => active.Contains(p.Display.GdiName)).ToList();
+            if (gone.Count > 0) Invalidate();
+        }
         if (draft.Count == 0) return;
-        var displaysChanged = OperatingSystem.IsWindows() && LayoutCanvas.HasDisplayChanges;
+        var displaysChanged = OperatingSystem.IsWindows() && draft.Any(p => p.X != p.Display.PositionX || p.Y != p.Display.PositionY);
         var peersChanged = LayoutCanvas.HasPeerChanges;
         var peers = LayoutCanvas.DraftPeers;
         var localRects = draft.Select(p => LocalRect.From(p.Display, p.X, p.Y)).ToList();
@@ -59,42 +68,52 @@ public partial class DisplaysView : UserControl, IRefreshable
         Ui.RunAsync(_window, async () =>
         {
             var notes = new List<string>();
-            if (displaysChanged)
+            if (gone.Count > 0) notes.Add("已忽略已断开的 " + string.Join("、", gone));
+            try
             {
-                var r = await Task.Run(() => DisplayManager.ApplyLayout(items)).ConfigureAwait(false);
-                Log.Info("手动摆放显示器: " + r);
-                if (!r.Success) throw new InvalidOperationException(r.ToString());
-                await Task.Delay(800).ConfigureAwait(false);
-                Hub.Engine.RememberLayout(DisplayManager.Enumerate(), force: true);
-                notes.Add("Windows 显示器位置已应用");
+                if (displaysChanged)
+                {
+                    var r = await Task.Run(() => DisplayManager.ApplyLayout(items)).ConfigureAwait(false);
+                    Log.Info("手动摆放显示器: " + r);
+                    if (!r.Success) throw new InvalidOperationException(r.ToString());
+                    await Task.Delay(800).ConfigureAwait(false);
+                    Hub.Engine.RememberLayout(DisplayManager.Enumerate(), force: true);
+                    notes.Add("Windows 显示器位置已应用");
+                }
+                if (deskflowReady && (displaysChanged || peersChanged))
+                {
+                    try
+                    {
+                        if (OperatingSystem.IsWindows())
+                        {
+                            // the layout service must know the new monitor topology before peers are placed against it
+                            var active = DisplayManager.Enumerate().Where(d => d.Active && d.Width > 0).Select(d => LocalRect.From(d)).ToList();
+                            var (changed, _) = await DeskflowPeer.ReportDisplaysAsync(host, screen, active).ConfigureAwait(false);
+                            if (changed) notes.Add("已把新的显示器拓扑同步到 Deskflow 共享布局");
+                        }
+                        if (peersChanged)
+                        {
+                            await DeskflowPeer.ApplyPeerPositionsAsync(host, screen, localRects, peers).ConfigureAwait(false);
+                            notes.Add("Deskflow 屏幕位置已写入共享布局（两台电脑的 Deskflow 会在几秒内按新位置重载）");
+                        }
+                    }
+                    catch (Exception ex) when (DeskflowPeer.IsUnreachable(ex))
+                    {
+                        // the layout service runs on the Linux side only (gone while the other computer is booted into Windows)
+                        if (peersChanged && Hub.Deskflow.CanLinkLocally)
+                            notes.Add(await Task.Run(() => Hub.Deskflow.ApplyPeerEdgesLocally(localRects, peers)).ConfigureAwait(false));
+                        else if (peersChanged)
+                            throw new InvalidOperationException($"布局服务 {host}:{DeskflowPeer.LayoutPort} 不可用（对端可能正运行 Windows 或没开机），本机又不是 Deskflow 服务端，无法修改屏幕位置");
+                        else
+                            notes.Add($"布局服务 {host}:{DeskflowPeer.LayoutPort} 不可用，新的显示器排列没有同步到共享布局（服务恢复后布局同步会自动上报）");
+                    }
+                }
             }
-            if (deskflowReady && (displaysChanged || peersChanged))
+            catch (Exception ex)
             {
-                try
-                {
-                    if (OperatingSystem.IsWindows())
-                    {
-                        // the layout service must know the new monitor topology before peers are placed against it
-                        var active = DisplayManager.Enumerate().Where(d => d.Active && d.Width > 0).Select(d => LocalRect.From(d)).ToList();
-                        var (changed, _) = await DeskflowPeer.ReportDisplaysAsync(host, screen, active).ConfigureAwait(false);
-                        if (changed) notes.Add("已把新的显示器拓扑同步到 Deskflow 共享布局");
-                    }
-                    if (peersChanged)
-                    {
-                        await DeskflowPeer.ApplyPeerPositionsAsync(host, screen, localRects, peers).ConfigureAwait(false);
-                        notes.Add("Deskflow 屏幕位置已写入共享布局（两台电脑的 Deskflow 会在几秒内按新位置重载）");
-                    }
-                }
-                catch (Exception ex) when (DeskflowPeer.IsUnreachable(ex))
-                {
-                    // the layout service runs on the Linux side only (gone while the other computer is booted into Windows)
-                    if (peersChanged && Hub.Deskflow.CanLinkLocally)
-                        notes.Add(await Task.Run(() => Hub.Deskflow.ApplyPeerEdgesLocally(localRects, peers)).ConfigureAwait(false));
-                    else if (peersChanged)
-                        throw new InvalidOperationException($"布局服务 {host}:{DeskflowPeer.LayoutPort} 不可用（对端可能正运行 Windows 或没开机），本机又不是 Deskflow 服务端，无法修改屏幕位置");
-                    else
-                        notes.Add($"布局服务 {host}:{DeskflowPeer.LayoutPort} 不可用，新的显示器排列没有同步到共享布局（服务恢复后布局同步会自动上报）");
-                }
+                // the status line said "正在应用…" for good after a refused layout
+                await Dispatcher.UIThread.InvokeAsync(() => DeskflowLayoutText.Text = "应用失败：" + ex.Message);
+                throw;
             }
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
@@ -136,7 +155,7 @@ public partial class DisplaysView : UserControl, IRefreshable
             _lastEnumerate = DateTime.UtcNow;
             try { _displays = EnumerateLocal(); } catch (Exception ex) { Log.Warn("枚举显示器失败: " + ex.Message); }
         }
-        if (!LayoutCanvas.HasChanges) LayoutCanvas.SetDisplays(_displays);
+        LayoutCanvas.SetDisplays(_displays); // keeps the drafts of displays that are still there
         RefreshPeers();
         if (OperatingSystem.IsWindows()) RefreshPointer();
         var sig = string.Join("|", _displays.Select(d => d.ToString()))
