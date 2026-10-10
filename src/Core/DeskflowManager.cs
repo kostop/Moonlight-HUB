@@ -115,6 +115,8 @@ public sealed class DeskflowStatus
     /// <summary>Windows: the running server core was started through the touch filter wrapper.</summary>
     public bool Filtered { get; init; }
     public bool? FilterHealthy { get; init; }
+    /// <summary>Windows client: the core runs as SYSTEM and so also reaches the lock screen (null = not required / unknown).</summary>
+    public bool? CoreAsSystem { get; init; }
     public bool F24Rule { get; init; }
     public bool Listening { get; init; }
     /// <summary>Server mode: connected clients; client mode: the server this computer is connected to.</summary>
@@ -647,7 +649,7 @@ public sealed class DeskflowManager : IDisposable
             case DeskflowRole.Off:
                 return st.MainCores == 0;
             case DeskflowRole.Client:
-                return st.RunningRole == DeskflowRole.Client && st.MainCores == 1 && !st.Filtered;
+                return st.RunningRole == DeskflowRole.Client && st.MainCores == 1 && !st.Filtered && st.CoreAsSystem != false;
             default:
                 if (st.RunningRole != DeskflowRole.Server || !st.Listening || st.MainCores != 1) return false;
                 var wantFilter = OperatingSystem.IsWindows() && s.UseTouchFilter && DeskflowWindowsHost.WrapperExe != null;
@@ -663,6 +665,7 @@ public sealed class DeskflowManager : IDisposable
         if (st.MainCores > 1) parts.Add($"有 {st.MainCores} 个 core 同时运行");
         if (s.Role != DeskflowRole.Off && !st.SecurityOff) parts.Add("TLS / 指纹校验尚未关闭");
         else if (!ConfMatches(s, st)) parts.Add($"配置 coreMode={RoleName(st.ConfiguredRole)}{(s.Role == DeskflowRole.Client ? " remoteHost=" + st.RemoteHost : string.Empty)}");
+        if (s.Role == DeskflowRole.Client && st.CoreAsSystem == false) parts.Add("客户端 core 未以 SYSTEM 运行，锁屏时无法输入");
         if (s.Role == DeskflowRole.Server)
         {
             if (!st.Listening) parts.Add($"端口 {st.Port} 未监听");
@@ -708,6 +711,7 @@ public sealed class DeskflowManager : IDisposable
             MainCores = mainCores,
             Filtered = filtered,
             FilterHealthy = role == DeskflowRole.Server && filtered ? _host.CheckFilter(cores) : null,
+            CoreAsSystem = (_host as DeskflowWindowsHost)?.ClientCoreAsSystem(role, main?.Pid),
             F24Rule = _host.F24RulePresent(),
             Listening = listening,
             Peers = peers,

@@ -10,8 +10,8 @@ using System.Text.RegularExpressions;
 namespace MoonlightHub.Core;
 
 /// <summary>
-/// Windows: the hub starts deskflow-core itself (through the touch filter wrapper in server mode) with the user's
-/// normal token, instead of the Deskflow service. Deskflow's own autostart pieces (service, GUI, priority / keepalive /
+/// Windows: the hub starts deskflow-core itself (through the touch filter wrapper in server mode; a client as SYSTEM in
+/// the user's session, like the service's "elevate"), instead of the Deskflow service. Deskflow's own autostart pieces (service, GUI, priority / keepalive /
 /// touch-guard tasks) are switched off, the side-channel scripts formerly started by scheduled tasks run under the hub's
 /// supervision, and the hub answers on the Deskflow service's pipe so existing scripts can still ask for a reload.
 /// </summary>
@@ -49,6 +49,7 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
         _settings = settings;
         _update = update;
         _reloadRequested = reloadRequested;
+        ProcessUtil.EnableDebugPrivilege(); // FindCores must read the command line of a SYSTEM client core too
     }
 
     // ------------------------------------------------------------------ paths
@@ -134,10 +135,32 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
         var exe = filtered ? WrapperExe! : CoreExe;
         var mode = role == DeskflowRole.Server ? "server" : "client";
         var args = $"{mode} --settings \"{ConfigPath}\"";
-        var pid = StartDeskflowProcess(exe, args);
+        var asSystem = false;
+        var pid = 0;
+        if (role == DeskflowRole.Client && ProcessUtil.IsElevated() && !_systemStartFailed)
+        {
+            pid = ProcessUtil.StartAsSessionSystemPid(exe, args, hidden: true);
+            asSystem = pid > 0;
+            _systemStartFailed = !asSystem; // fall back to the hub's token, and stop asking for SYSTEM until the hub restarts
+        }
+        if (pid <= 0) pid = StartDeskflowProcess(exe, args);
         if (pid <= 0) throw new InvalidOperationException("无法启动 " + exe);
-        Log.Info($"Deskflow: 已启动 {(filtered ? "触摸过滤包装器" : "deskflow-core")} {mode} (pid {pid})");
+        Log.Info($"Deskflow: 已启动 {(filtered ? "触摸过滤包装器" : "deskflow-core")} {mode}{(asSystem ? "（SYSTEM，锁屏可用）" : string.Empty)} (pid {pid})");
         return pid;
+    }
+
+    private bool _systemStartFailed;
+
+    /// <summary>
+    /// A client core must run as SYSTEM (see <see cref="ProcessUtil.StartAsSessionSystemPid"/>): with the hub's token it
+    /// cannot open the Winlogon desktop, so the cursor crossed to qingxian's lock screen but the password box got no
+    /// input (2026-10-10). False = a client core runs with another token and should be restarted; null = no
+    /// requirement (server, not elevated, SYSTEM start unavailable) or unknown.
+    /// </summary>
+    public bool? ClientCoreAsSystem(DeskflowRole role, int? pid)
+    {
+        if (role != DeskflowRole.Client || pid is not { } p || !ProcessUtil.IsElevated() || _systemStartFailed) return null;
+        return ProcessUtil.RunsAsSystem(p);
     }
 
     /// <summary>
