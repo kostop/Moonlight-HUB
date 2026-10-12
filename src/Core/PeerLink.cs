@@ -10,7 +10,7 @@ namespace MoonlightHub.Core;
 
 /// <summary>What the other computer's hub reports about itself.</summary>
 public sealed record PeerHubInfo(string Screen, string Os, string Version, DeskflowRole Role, DeskflowRole Running, List<string> Peers,
-    double DpiScale = 0, int DesktopWidth = 0, int DesktopHeight = 0)
+    double DpiScale = 0, int DesktopWidth = 0, int DesktopHeight = 0, List<SharedMonitor>? Monitors = null)
 {
     public string Text => $"{Screen} ({Os}, v{Version}) · {DeskflowManager.RoleName(Running)}" + (Peers.Count > 0 ? " · 已连接 " + string.Join(", ", Peers) : string.Empty);
 }
@@ -111,6 +111,47 @@ public sealed class PeerLink : IDisposable
                 await Reply(response, 200, StatusPayload()).ConfigureAwait(false);
                 return;
             }
+            if (OperatingSystem.IsWindows() && path is "/api/hub/display-layout" or "/api/hub/displays")
+            {
+                var hub = Hub.Current ?? throw new InvalidOperationException("Hub is starting");
+                if (request.HttpMethod == "GET")
+                {
+                    if (path == "/api/hub/displays") await Reply(response, 200, SharedDisplayLayout.LocalMonitors(hub)).ConfigureAwait(false);
+                    else if (hub.Deskflow.Settings.Role == DeskflowRole.Server)
+                        await Reply(response, 200, await SharedDisplayLayout.SnapshotAsync(hub).ConfigureAwait(false)).ConfigureAwait(false);
+                    else await Reply(response, 409, new { error = "Shared layout is owned by the Deskflow server" }).ConfigureAwait(false);
+                    return;
+                }
+                if (request.HttpMethod == "POST")
+                {
+                    using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
+                    var text = await reader.ReadToEndAsync().ConfigureAwait(false);
+                    if (path == "/api/hub/displays")
+                    {
+                        var positions = JsonSerializer.Deserialize<List<MonitorPlacement>>(text, Json) ?? throw new InvalidDataException("Positions missing");
+                        await Reply(response, 200, await SharedDisplayLayout.ApplyLocalAsync(hub, positions).ConfigureAwait(false)).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        if (hub.Deskflow.Settings.Role != DeskflowRole.Server) { await Reply(response, 409, new { error = "Only the Deskflow server can commit layouts" }).ConfigureAwait(false); return; }
+                        var draft = JsonSerializer.Deserialize<SharedDisplayDocument>(text, Json) ?? throw new InvalidDataException("Layout missing");
+                        await Reply(response, 200, await SharedDisplayLayout.ApplyAsync(hub, draft).ConfigureAwait(false)).ConfigureAwait(false);
+                    }
+                    return;
+                }
+            }
+            if (request.HttpMethod == "POST" && path == "/api/hub/scale" && OperatingSystem.IsWindows())
+            {
+                using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
+                var body = JsonNode.Parse(await reader.ReadToEndAsync().ConfigureAwait(false)) as JsonObject;
+                if (body?["slot"]?.GetValue<int>() is not { } slot || body?["percent"]?.GetValue<int>() is not { } percent)
+                { await Reply(response, 400, new { error = "slot and percent are required" }).ConfigureAwait(false); return; }
+                var hub = Hub.Current;
+                if (hub == null) { await Reply(response, 503, new { error = "Hub is starting" }).ConfigureAwait(false); return; }
+                var (ok, message) = await hub.Engine.SetVirtualContentScaleAsync(slot, percent).ConfigureAwait(false);
+                await Reply(response, ok ? 200 : 400, new { ok, message }).ConfigureAwait(false);
+                return;
+            }
             if (request.HttpMethod == "POST" && path == "/api/hub/role")
             {
                 using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
@@ -158,6 +199,7 @@ public sealed class PeerLink : IDisposable
             // system, so the other hub draws this screen from what is reported here rather than from a stored layout
             desktopWidth = PointerSpeedManager.DesktopSize().Width,
             desktopHeight = PointerSpeedManager.DesktopSize().Height,
+            monitors = OperatingSystem.IsWindows() && Hub.Current is { } hub ? SharedDisplayLayout.LocalMonitors(hub) : null,
         };
     }
 
@@ -218,6 +260,58 @@ public sealed class PeerLink : IDisposable
         }
     }
 
+    /// <param name="host">运行 Hub 的主机地址。</param>
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="percent">额外画面大小百分比。</param>
+    public static async Task<(bool Ok, string Message)> RequestContentScaleAsync(string host, int slot, int percent)
+    {
+        try
+        {
+            using var request = Request(HttpMethod.Post, host, "/api/hub/scale", new { slot, percent });
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+            using var response = await Http.SendAsync(request, timeout.Token).ConfigureAwait(false);
+            var node = JsonNode.Parse(await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false));
+            return (response.IsSuccessStatusCode, node?["message"]?.GetValue<string>() ?? node?["error"]?.GetValue<string>() ?? "操作失败");
+        }
+        catch (Exception ex) { return (false, ex.GetBaseException().Message); }
+    }
+
+    /// <param name="host">共享布局服务端地址。</param>
+    public static Task<SharedDisplayDocument> GetSharedDisplaysAsync(string host)
+        => DisplayRequestAsync<SharedDisplayDocument>(host, "/api/hub/display-layout", null);
+
+    /// <param name="host">显示器所属电脑的地址。</param>
+    /// <param name="positions">期望的显示器位置。</param>
+    public static Task<List<SharedMonitor>> ApplyMonitorPositionsAsync(string host, IReadOnlyList<MonitorPlacement> positions)
+        => DisplayRequestAsync<List<SharedMonitor>>(host, "/api/hub/displays", positions);
+
+    /// <param name="host">统一提交布局的服务端地址。</param>
+    /// <param name="layout">界面生成的布局草稿。</param>
+    public static Task<SharedDisplayDocument> ApplySharedDisplaysAsync(string host, SharedDisplayDocument layout)
+        => DisplayRequestAsync<SharedDisplayDocument>(host, "/api/hub/display-layout", layout);
+
+    /// <param name="host">这块虚拟屏所属电脑的 Hub 地址。</param>
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="percent">保存到对应电脑方案中的额外缩放百分比。</param>
+    public static async Task<string> SetContentScaleAsync(string host, int slot, int percent)
+    {
+        using var request = Request(HttpMethod.Post, host, "/api/hub/scale", new { slot, percent });
+        using var response = await Http.SendAsync(request).ConfigureAwait(false);
+        var result = JsonNode.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+        var message = result?["message"]?.ToString() ?? result?["error"]?.ToString() ?? "调整失败";
+        if (!response.IsSuccessStatusCode) throw new InvalidOperationException(message);
+        return message;
+    }
+
+    private static async Task<T> DisplayRequestAsync<T>(string host, string path, object? body)
+    {
+        using var request = Request(body == null ? HttpMethod.Get : HttpMethod.Post, host, path, body);
+        using var response = await Http.SendAsync(request).ConfigureAwait(false);
+        var text = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode) throw new InvalidOperationException(JsonNode.Parse(text)?["error"]?.ToString() ?? text);
+        return JsonSerializer.Deserialize<T>(text, Json) ?? throw new InvalidDataException("Empty layout response");
+    }
+
     private static PeerHubInfo? ParseInfo(JsonObject? o)
     {
         if (o == null) return null;
@@ -230,7 +324,8 @@ public sealed class PeerLink : IDisposable
             (o["peers"] as JsonArray)?.Select(p => p?.GetValue<string>() ?? string.Empty).Where(p => p.Length > 0).ToList() ?? new List<string>(),
             o["dpiScale"] is JsonValue scale && scale.TryGetValue<double>(out var dpi) ? dpi : 0,
             o["desktopWidth"] is JsonValue dw && dw.TryGetValue<int>(out var w) ? w : 0,
-            o["desktopHeight"] is JsonValue dh && dh.TryGetValue<int>(out var h) ? h : 0);
+            o["desktopHeight"] is JsonValue dh && dh.TryGetValue<int>(out var h) ? h : 0,
+            o["monitors"]?.Deserialize<List<SharedMonitor>>(Json));
     }
 
     public void Dispose()

@@ -20,6 +20,7 @@ public sealed class DisplayCanvas : Canvas
     {
         public DisplayInfo? Display;
         public PeerScreen? Peer;
+        public SharedMonitor? Shared;
         public int X;
         public int Y;
         public int OrigX;
@@ -31,9 +32,14 @@ public sealed class DisplayCanvas : Canvas
     }
 
     private readonly List<Item> _items = new();
+    private sealed record ResizeDraft(Item Item, Point Start, int Width, int Height, int Percent);
+    private ResizeDraft? _resize;
+    private int _resizePercent;
     private string _signature = string.Empty;
     private string _peerSignature = string.Empty;
     private Item? _dragItem;
+    private bool _dragGroup;
+    private Dictionary<Item, (int X, int Y)> _groupOrigins = new();
     private Point _dragStart;
     private int _dragOriginX, _dragOriginY;
     private double _scale = 1;
@@ -43,10 +49,13 @@ public sealed class DisplayCanvas : Canvas
     public bool Interactive { get; set; }
     /// <summary>Local displays are shown but cannot be dragged (Linux: the desktop's own display settings own them).</summary>
     public bool LockDisplays { get; set; }
-    public bool HasChanges => HasDisplayChanges || HasPeerChanges;
+    public SharedDisplayDocument? SharedDocument { get; private set; }
+    public bool HasSharedChanges => _items.Any(i => i.Shared != null && i.Moved);
+    public bool HasChanges => HasDisplayChanges || HasPeerChanges || HasSharedChanges;
     public bool HasDisplayChanges => _items.Any(i => i.Display != null && i.Moved);
     public bool HasPeerChanges => _items.Any(i => i.Peer != null && i.Moved);
     public event Action? DraftChanged;
+    public event Action<SharedMonitor, int>? ScaleRequested;
 
     public DisplayCanvas()
     {
@@ -56,8 +65,45 @@ public sealed class DisplayCanvas : Canvas
         SizeChanged += (_, _) => Redraw();
     }
 
+    /// <param name="document">两台电脑共同使用的逻辑桌面布局。</param>
+    public void SetSharedDisplays(SharedDisplayDocument document)
+    {
+        if (_dragItem != null || _resize != null || HasChanges || SharedDocument?.Revision == document.Revision) return;
+        SharedDocument = SharedDisplayLayout.Clone(document);
+        _items.Clear();
+        _items.AddRange(document.Monitors.Select(m => new Item { Shared = m, X = m.X, Y = m.Y,
+            OrigX = m.X, OrigY = m.Y, W = m.CanvasWidth, H = m.CanvasHeight }));
+        Redraw(); DraftChanged?.Invoke();
+    }
+
+    public SharedDisplayDocument? DraftSharedDisplays
+    {
+        get
+        {
+            if (SharedDocument == null) return null;
+            var draft = SharedDisplayLayout.Clone(SharedDocument);
+            draft.Monitors = _items.Where(i => i.Shared != null).Select(i => i.Shared! with { X = i.X, Y = i.Y }).ToList();
+            return draft;
+        }
+    }
+
+    /// <param name="document">缩放操作后服务端确认的新版本，保留尚未应用的位置草稿。</param>
+    public void RebaseSharedDisplays(SharedDisplayDocument document)
+    {
+        if (_dragItem != null || _resize != null) return;
+        var positions = _items.Where(i => i.Shared != null && i.Moved)
+            .ToDictionary(i => (i.Shared!.Owner, i.Shared.Id), i => (i.X, i.Y));
+        SharedDocument = null;
+        _items.Clear();
+        SetSharedDisplays(document);
+        foreach (var item in _items.Where(i => i.Shared != null))
+            if (positions.TryGetValue((item.Shared!.Owner, item.Shared.Id), out var position)) { item.X = position.X; item.Y = position.Y; }
+        Redraw(); DraftChanged?.Invoke();
+    }
+
     public void SetDisplays(IEnumerable<DisplayInfo> displays)
     {
+        if (SharedDocument != null) return;
         var list = displays.Where(d => d.Active && d.Width > 0).ToList();
         var sig = string.Join("|", list.Select(d => $"{d.GdiName}:{d.PositionX},{d.PositionY},{d.Width},{d.Height},{d.RefreshRate},{d.Primary},{d.IsParsec}"));
         if (sig == _signature) return;
@@ -85,6 +131,7 @@ public sealed class DisplayCanvas : Canvas
     /// <summary>Screens of the other Deskflow computers, already mapped into local desktop pixels (see <see cref="DeskflowPeer.MapPeers"/>).</summary>
     public void SetPeers(IEnumerable<PeerScreen> peers)
     {
+        if (SharedDocument != null) return;
         var list = peers.Where(p => p.Width > 0 && p.Height > 0).ToList();
         var sig = string.Join("|", list.Select(p => $"{p.Name}:{p.X},{p.Y},{p.Width},{p.Height},{p.IsServer}"));
         if (sig == _peerSignature) return;
@@ -112,11 +159,12 @@ public sealed class DisplayCanvas : Canvas
     /// <summary>Drops the peer draft so the next <see cref="SetPeers"/> shows what the layout service stored.</summary>
     public void ClearPeerDraft()
     {
+        if (SharedDocument != null) { SharedDocument = null; _items.Clear(); return; }
         _peerSignature = string.Empty;
         foreach (var i in _items.Where(i => i.Peer != null)) { i.X = i.OrigX; i.Y = i.OrigY; }
     }
 
-    private bool CanDrag(Item item) => Interactive && (item.Peer != null || !LockDisplays);
+    private bool CanDrag(Item item) => Interactive && (item.Shared != null || item.Peer != null || !LockDisplays);
 
     private void Redraw()
     {
@@ -148,7 +196,7 @@ public sealed class DisplayCanvas : Canvas
 
         foreach (var item in _items)
         {
-            var border = item.Display is { } d ? DisplayVisual(item, d) : PeerVisual(item, item.Peer!);
+            var border = item.Shared is { } shared ? SharedVisual(item, shared, _items.IndexOf(item) + 1) : item.Display is { } d ? DisplayVisual(item, d) : PeerVisual(item, item.Peer!);
             item.Visual = border;
             SetLeft(border, _offX + (item.X - _minX) * _scale + 2);
             SetTop(border, _offY + (item.Y - _minY) * _scale + 2);
@@ -190,6 +238,72 @@ public sealed class DisplayCanvas : Canvas
         return border;
     }
 
+    /// <param name="item">按可用桌面尺寸绘制的屏幕。</param>
+    /// <param name="monitor">该屏幕的完整信息，显示在图例和提示中。</param>
+    /// <param name="number">与下方图例对应的屏幕编号。</param>
+    private Border SharedVisual(Item item, SharedMonitor monitor, int number)
+    {
+        var border = new Border { Width = Math.Max(24, item.W * _scale - 4), Height = Math.Max(18, item.H * _scale - 4),
+            CornerRadius = new CornerRadius(6), Background = Ui.Res(monitor.Virtual ? "AccentSoftBrush" : "Surface3Brush"),
+            BorderBrush = Ui.Res(monitor.Virtual ? "AccentBrush" : "BorderBrush"), BorderThickness = new Thickness(monitor.Primary ? 2 : 1),
+            Padding = new Thickness(4), ClipToBounds = true, Tag = item, Opacity = monitor.Active ? 1 : .6 };
+        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n渲染 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\nWindows {monitor.WindowsScalePercent}% · 额外 {monitor.ContentScalePercent}%{(monitor.ScalePending ? " · 待生效" : "")}\n拖动主屏或按 Shift 可移动整台电脑，其它屏幕单独移动。间隙自动跨越。" );
+        // 屏幕框只显示编号，文字信息放到图例，避免小屏缩放后被裁切；边框尺寸仍严格保持比例。
+        var content = new Grid();
+        content.Children.Add(new Viewbox { Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly,
+            HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
+            Child = new TextBlock { Text = number.ToString(), FontSize = 24, FontWeight = FontWeight.SemiBold,
+                Foreground = Ui.Res(monitor.Virtual ? "AccentBrush" : "TextBrush") } });
+        if (monitor.CanScale && Interactive)
+        {
+            var handle = new Border { Width = 14, Height = 14, HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Bottom, Cursor = new Cursor(StandardCursorType.BottomRightCorner),
+                Background = Brushes.Transparent, BorderBrush = Ui.Res("AccentBrush"), BorderThickness = new Thickness(0, 0, 3, 3) };
+            ToolTip.SetTip(handle, "拖动调节缩放：缩小矩形会放大文字，放大矩形会显示更多内容；松开自动保存。");
+            handle.PointerPressed += (_, e) =>
+            {
+                if (!e.GetCurrentPoint(handle).Properties.IsLeftButtonPressed) return;
+                _resize = new ResizeDraft(item, e.GetPosition(this), item.W, item.H, monitor.ContentScalePercent);
+                _resizePercent = monitor.ContentScalePercent;
+                e.Pointer.Capture(handle); e.Handled = true;
+            };
+            handle.PointerMoved += Resize_PointerMoved;
+            handle.PointerReleased += (_, e) =>
+            {
+                if (_resize is not { } draft) return;
+                _resize = null; e.Pointer.Capture(null); e.Handled = true;
+                if (_resizePercent != draft.Percent) ScaleRequested?.Invoke(monitor, _resizePercent);
+                else ResetSizePreview();
+            };
+            content.Children.Add(handle);
+        }
+        border.Child = content;
+        return border;
+    }
+
+    /// <param name="sender">虚拟屏右下角的尺寸手柄。</param>
+    /// <param name="e">画布坐标下的拖动事件。</param>
+    private void Resize_PointerMoved(object? sender, PointerEventArgs e)
+    {
+        if (_resize is not { } draft || draft.Item.Visual is not { } visual) return;
+        var delta = (e.GetPosition(this) - draft.Start) / _scale;
+        var factor = Math.Abs(delta.X / draft.Width) >= Math.Abs(delta.Y / draft.Height)
+            ? 1 + delta.X / draft.Width : 1 + delta.Y / draft.Height;
+        _resizePercent = Math.Clamp((int)Math.Round(draft.Percent / Math.Max(.01, factor)), VirtualContentScale.Minimum, VirtualContentScale.Maximum);
+        draft.Item.W = Math.Max(1, (int)Math.Round(draft.Width * (double)draft.Percent / _resizePercent));
+        draft.Item.H = Math.Max(1, (int)Math.Round(draft.Height * (double)draft.Percent / _resizePercent));
+        visual.Width = Math.Max(24, draft.Item.W * _scale - 4);
+        visual.Height = Math.Max(18, draft.Item.H * _scale - 4);
+        ToolTip.SetTip(visual, $"额外放大 {_resizePercent}% · 松开自动保存");
+        e.Handled = true;
+    }
+
+    public void ResetSizePreview()
+    {
+        foreach (var item in _items.Where(i => i.Shared != null)) { item.W = item.Shared!.CanvasWidth; item.H = item.Shared.CanvasHeight; }
+        Redraw();
+    }
+
     private Border PeerVisual(Item item, PeerScreen p)
     {
         var border = new Border
@@ -222,6 +336,8 @@ public sealed class DisplayCanvas : Canvas
         _dragStart = e.GetPosition(this);
         _dragOriginX = item.X;
         _dragOriginY = item.Y;
+        _dragGroup = item.Shared != null && (item.Shared.Primary || e.KeyModifiers.HasFlag(KeyModifiers.Shift));
+        _groupOrigins = _dragGroup ? _items.Where(i => i.Shared?.Owner == item.Shared!.Owner).ToDictionary(i => i, i => (i.X, i.Y)) : new();
         e.Pointer.Capture(border);
         e.Handled = true;
     }
@@ -234,6 +350,14 @@ public sealed class DisplayCanvas : Canvas
         var dy = (p.Y - _dragStart.Y) / _scale;
         _dragItem.X = _dragOriginX + (int)Math.Round(dx);
         _dragItem.Y = _dragOriginY + (int)Math.Round(dy);
+        if (_dragGroup)
+        {
+            foreach (var (other, origin) in _groupOrigins)
+            {
+                other.X = origin.X + (int)Math.Round(dx); other.Y = origin.Y + (int)Math.Round(dy);
+                if (other.Visual != null) { SetLeft(other.Visual, _offX + (other.X - _minX) * _scale + 2); SetTop(other.Visual, _offY + (other.Y - _minY) * _scale + 2); }
+            }
+        }
         SetLeft(_dragItem.Visual, _offX + (_dragItem.X - _minX) * _scale + 2);
         SetTop(_dragItem.Visual, _offY + (_dragItem.Y - _minY) * _scale + 2);
     }
@@ -244,8 +368,11 @@ public sealed class DisplayCanvas : Canvas
         e.Pointer.Capture(null);
         var item = _dragItem;
         _dragItem = null;
+        var beforeX = item.X; var beforeY = item.Y;
         Snap(item);
         ResolveOverlap(item);
+        if (_dragGroup) foreach (var other in _groupOrigins.Keys.Where(i => i != item)) { other.X += item.X - beforeX; other.Y += item.Y - beforeY; }
+        _dragGroup = false;
         Redraw();
         DraftChanged?.Invoke();
     }
@@ -254,7 +381,7 @@ public sealed class DisplayCanvas : Canvas
     private void Snap(Item moved)
     {
         // local displays must form one desktop, so they only snap to each other; Deskflow screens snap to anything
-        var others = _items.Where(i => i != moved && (moved.Peer != null || i.Display != null)).ToList();
+        var others = _items.Where(i => i != moved && (!_dragGroup || i.Shared?.Owner != moved.Shared?.Owner) && (moved.Shared != null || moved.Peer != null || i.Display != null)).ToList();
         if (others.Count == 0) return;
         var threshold = moved.Peer != null ? 400 : 140;
         var w = moved.W;
@@ -297,7 +424,7 @@ public sealed class DisplayCanvas : Canvas
     {
         for (var guard = 0; guard < 8; guard++)
         {
-            var hit = _items.FirstOrDefault(o => o != moved && Overlaps(moved, o));
+            var hit = _items.FirstOrDefault(o => o != moved && (!_dragGroup || o.Shared?.Owner != moved.Shared?.Owner) && Overlaps(moved, o));
             if (hit == null) return;
             // push out to the nearest side
             var w = moved.W;

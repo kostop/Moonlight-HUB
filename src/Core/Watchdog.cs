@@ -621,11 +621,13 @@ public sealed class Watchdog : IDisposable
             }
             if (!d.Active) return false;
             // resolution: the profile value or the client-derived one
-            var okResolution = d.Width == spec.Width && d.Height == spec.Height;
+            var (expectedWidth, expectedHeight) = _engine.TargetResolution(profile, spec, d);
+            var okResolution = d.Width == expectedWidth && d.Height == expectedHeight;
             if (!okResolution && profile.AutoMatchClientResolution && spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var cm))
             {
                 var (hw, hh) = _engine.HostResolutionFor(spec.InstanceId, cm);
-                okResolution = d.Width == hw && d.Height == hh;
+                var expected = VirtualContentScale.RenderSize(hw, hh, spec.ContentScalePercent);
+                okResolution = d.Width == expected.Width && d.Height == expected.Height;
             }
             if (!okResolution) return false;
             // refresh rate: accept the profile value, the compose override, or the rate the client asked for

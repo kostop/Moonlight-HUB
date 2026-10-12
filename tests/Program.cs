@@ -33,6 +33,8 @@ internal static class Program
             ("空布局不调用系统接口", EmptyLayout)
         };
         ProfileSafetyTests.AddTo(tests);
+        ContentScaleTests.AddTo(tests);
+        SharedLayoutTests.AddTo(tests);
 
         var failed = 0;
         foreach (var (name, run) in tests)

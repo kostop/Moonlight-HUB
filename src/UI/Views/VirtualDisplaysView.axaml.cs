@@ -1,5 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -54,7 +55,9 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
             _lastEnumerate = DateTime.UtcNow;
             try { _displays = DisplayManager.Enumerate().Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).ToList(); } catch { }
         }
-        var sig = string.Join("|", _displays.Select(d => d.ToString()));
+        var profile = Hub.ActiveProfile;
+        var sig = string.Join("|", _displays.Select(d => d.ToString())) + "#" + profile?.Id + "#" +
+            string.Join(",", profile?.VirtualDisplays.Select(v => $"{v.Slot}:{v.ContentScalePercent}") ?? Enumerable.Empty<string>());
         if (sig != _signature)
         {
             _signature = sig;
@@ -80,6 +83,12 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
                 info.Children.Add(new TextBlock { Text = "Sunshine ID " + d.SunshineDeviceId, Classes = { "mono" }, Foreground = Ui.Res("MutedBrush"), Margin = new Thickness(0, 2, 0, 0) });
                 var mapped = Hub.State.InstanceOutputIds.FirstOrDefault(kv => kv.Value.Equals(d.SunshineDeviceId, StringComparison.OrdinalIgnoreCase));
                 if (mapped.Key > 0) info.Children.Add(Ui.T($"由 Sunshine 实例 {mapped.Key} 串流", "Muted"));
+                var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+                if (spec != null && profile?.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly)
+                {
+                    info.Children.Add(Ui.T($"方案输出 {spec.Width}×{spec.Height} · 画面大小 {spec.ContentScalePercent}%", "Muted"));
+                    info.Children.Add(ContentScaleRow(slot, spec.ContentScalePercent));
+                }
                 grid.Children.Add(info);
                 List.Children.Add(Ui.Card(grid, true));
             }
@@ -99,6 +108,43 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
                 ModesPanel.Children.Add(row);
             }
         }
+    }
+
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="percent">方案中保存的额外画面大小。</param>
+    private StackPanel ContentScaleRow(int slot, int percent)
+    {
+        var box = new NumericUpDown { Minimum = VirtualContentScale.Minimum, Maximum = VirtualContentScale.Maximum,
+            Increment = 1, Value = percent, Width = 85, FormatString = "0", ShowButtonSpinner = false,
+            HorizontalContentAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        var slider = new Slider { Minimum = VirtualContentScale.Minimum, Maximum = VirtualContentScale.Maximum,
+            Value = percent, Width = 170, TickFrequency = 5, IsSnapToTickEnabled = false };
+        slider.PropertyChanged += (_, e) => { if (e.Property == RangeBase.ValueProperty) box.Value = (decimal)Math.Round(slider.Value); };
+        box.ValueChanged += (_, e) => slider.Value = (double)(e.NewValue ?? 100);
+        var apply = Ui.B("应用", (_, _) =>
+        {
+            var requested = (int)(box.Value ?? 100);
+            Ui.RunAsync(_window, async () =>
+            {
+                var (ok, message) = await Hub.Engine.SetVirtualContentScaleAsync(slot, requested).ConfigureAwait(false);
+                if (!ok) throw new InvalidOperationException(message);
+                _window.Toast("画面大小", message);
+                Dispatcher.UIThread.Post(Invalidate);
+            });
+        }, "GhostButton");
+        var reset = Ui.B("原始大小", (_, _) => { box.Value = 100; }, "GhostButton");
+        var row = new WrapPanel { Orientation = Orientation.Horizontal };
+        foreach (var control in new Control[] { Ui.T("额外放大", "Muted"), slider, Ui.Row(box, Ui.T("%", "Muted")), apply, reset })
+        {
+            control.VerticalAlignment = VerticalAlignment.Center;
+            control.Margin = new Thickness(0, 0, 10, 6);
+            row.Children.Add(control);
+        }
+        var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        panel.Children.Add(row);
+        panel.Children.Add(new TextBlock { Text = "100% 保持原大小，可输入 50–300%。在 Windows 200% 上设为 150%，约等效 300%；每块副屏独立保存。",
+            Foreground = Ui.Res("MutedBrush"), TextWrapping = Avalonia.Media.TextWrapping.Wrap });
+        return panel;
     }
 
     /// <summary>Registered mode being edited in place (null = none).</summary>

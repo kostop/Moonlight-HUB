@@ -17,6 +17,7 @@ public partial class DisplaysView : UserControl, IRefreshable
     private string _signature = string.Empty;
     private DateTime _lastEnumerate = DateTime.MinValue;
     private string _peerStatusText = string.Empty;
+    private long _legendRevision;
 
     public DisplaysView() : this(App.Instance.MainWin) { }
 
@@ -29,6 +30,7 @@ public partial class DisplaysView : UserControl, IRefreshable
             ApplyLayoutBtn.IsEnabled = LayoutCanvas.HasChanges;
             ResetLayoutBtn.IsEnabled = LayoutCanvas.HasChanges;
         };
+        LayoutCanvas.ScaleRequested += ApplyMonitorScale;
         if (!OperatingSystem.IsWindows())
         {
             // Linux: the desktop's own display settings arrange the monitors; here only the other computers are placed
@@ -45,6 +47,17 @@ public partial class DisplaysView : UserControl, IRefreshable
 
     private void ApplyLayout_Click(object? sender, RoutedEventArgs e)
     {
+        if (LayoutCanvas.DraftSharedDisplays is { } shared)
+        {
+            DeskflowLayoutText.Text = "正在同步两台电脑的显示器布局…";
+            Ui.RunAsync(_window, async () =>
+            {
+                await PeerLink.ApplySharedDisplaysAsync(Hub.Deskflow.SharedDisplayServerHost, shared).ConfigureAwait(false);
+                await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
+                await Dispatcher.UIThread.InvokeAsync(() => { LayoutCanvas.ClearPeerDraft(); Invalidate(); Refresh(); DeskflowLayoutText.Text = "两台电脑的显示器布局已同步"; });
+            });
+            return;
+        }
         var draft = LayoutCanvas.DraftPositions;
         var gone = new List<string>();
         if (OperatingSystem.IsWindows())
@@ -130,6 +143,12 @@ public partial class DisplaysView : UserControl, IRefreshable
     private void RefreshPeers(bool force = false)
     {
         var df = Hub.Deskflow;
+        if (df.SharedDisplays is { } shared)
+        {
+            if (!(DeskflowLayoutText.Text ?? "").StartsWith("正在"))
+                DeskflowLayoutText.Text = $"两台电脑共享布局 · {shared.Monitors.Count} 块屏幕 · 服务端 {shared.Server}";
+            return;
+        }
         var active = _displays.Where(d => d.Active && d.Width > 0).Select(d => LocalRect.From(d)).ToList();
         var peers = df.Layout is { } layout ? DeskflowPeer.MapPeers(layout, active) : new List<PeerScreen>();
         LayoutCanvas.SetPeers(peers);
@@ -150,6 +169,12 @@ public partial class DisplaysView : UserControl, IRefreshable
 
     public void Refresh()
     {
+        if (OperatingSystem.IsWindows() && Hub.Deskflow.SharedDisplays is { } shared)
+        {
+            LayoutCanvas.SetSharedDisplays(shared);
+            RefreshMonitorLegend(LayoutCanvas.SharedDocument ?? shared);
+            HelpText.Text = "灰色为真实屏，青色为虚拟屏，大小按缩放后的桌面比例显示。拖动主屏或按 Shift 移动整台电脑；拖动虚拟屏右下角调节缩放，松开自动保存。两台 Hub 同步，鼠标自动跨过屏幕间隙。";
+        }
         if ((DateTime.UtcNow - _lastEnumerate) > TimeSpan.FromSeconds(3))
         {
             _lastEnumerate = DateTime.UtcNow;
@@ -174,6 +199,72 @@ public partial class DisplaysView : UserControl, IRefreshable
     }
 
     // ------------------------------------------------------------------ pointer speed per screen
+
+    /// <param name="document">与画布编号一致的两台电脑显示器列表。</param>
+    private void RefreshMonitorLegend(SharedDisplayDocument document)
+    {
+        if (_legendRevision == document.Revision) return;
+        _legendRevision = document.Revision;
+        MonitorLegend.Children.Clear();
+        for (var index = 0; index < document.Monitors.Count; index++)
+        {
+            var monitor = document.Monitors[index];
+            var info = new StackPanel { Spacing = 3, MaxWidth = 320 };
+            info.Children.Add(new TextBlock { Text = $"{index + 1} · {monitor.Owner} · {monitor.Name}",
+                FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Foreground = Ui.Res(monitor.Virtual ? "AccentBrush" : "TextBrush") });
+            info.Children.Add(new TextBlock { Text = $"{(monitor.ScalePending ? "预计桌面" : "可用桌面")} {monitor.CanvasWidth}×{monitor.CanvasHeight} · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : "")}",
+                TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
+            info.Children.Add(new TextBlock { Text = $"Windows {monitor.WindowsScalePercent}%" + (monitor.Virtual
+                ? $" · 额外 {monitor.ContentScalePercent}%{(monitor.ScalePending ? " · 待生效" : "")}" : ""),
+                TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
+            if (monitor.CanScale && monitor.VirtualSlot >= 0) info.Children.Add(MonitorScaleControls(monitor));
+            MonitorLegend.Children.Add(new Border { Child = info, Padding = new Thickness(10), Margin = new Thickness(0, 0, 10, 8),
+                Background = Ui.Res("Surface3Brush"), CornerRadius = new CornerRadius(6) });
+        }
+    }
+
+    /// <param name="monitor">本机或对端可调整的独立虚拟屏。</param>
+    private Control MonitorScaleControls(SharedMonitor monitor)
+    {
+        var input = new NumericUpDown { Minimum = VirtualContentScale.Minimum, Maximum = VirtualContentScale.Maximum,
+            Value = monitor.ContentScalePercent, Increment = 1, Width = 85, FormatString = "0", ShowButtonSpinner = false,
+            HorizontalContentAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        var apply = Ui.B("应用", (_, _) =>
+        {
+            ApplyMonitorScale(monitor, (int)(input.Value ?? 100));
+        }, "GhostButton");
+        apply.Padding = new Thickness(10, 4);
+        var row = Ui.Row(Ui.T("额外放大", "Muted"), input, Ui.T("%", "Muted"), apply);
+        row.Margin = new Thickness(0, 6, 0, 0);
+        ToolTip.SetTip(row, "50–300%，100% 保持原大小。调高后字和按钮更大，每块虚拟屏独立保存；Windows 缩放保持不变。");
+        return row;
+    }
+
+    /// <param name="monitor">本机或对端被调整的虚拟屏。</param>
+    /// <param name="percent">输入或拖动产生的额外缩放百分比。</param>
+    private void ApplyMonitorScale(SharedMonitor monitor, int percent)
+    {
+        var host = monitor.Owner == Hub.Deskflow.LocalScreenName ? "127.0.0.1" : Hub.Deskflow.Settings.RemoteHost;
+        DeskflowLayoutText.Text = $"正在保存 {monitor.Owner} 的虚拟屏缩放 {percent}%…";
+        Ui.RunAsync(_window, async () =>
+        {
+            try
+            {
+                var message = await PeerLink.SetContentScaleAsync(host, monitor.VirtualSlot, percent).ConfigureAwait(false);
+                await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
+                await Dispatcher.UIThread.InvokeAsync(() => {
+                    if (Hub.Deskflow.SharedDisplays is { } document) LayoutCanvas.RebaseSharedDisplays(document);
+                    _legendRevision = 0; Refresh(); DeskflowLayoutText.Text = message; _window.Toast("画面大小", message);
+                });
+            }
+            finally
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { LayoutCanvas.ResetSizePreview(); if ((DeskflowLayoutText.Text ?? "").StartsWith("正在保存")) DeskflowLayoutText.Text = "缩放未保存，请查看错误提示"; });
+            }
+        });
+    }
+
     private string _pointerSignature = string.Empty;
     private bool _buildingPointer;
 
