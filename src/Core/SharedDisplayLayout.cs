@@ -4,8 +4,11 @@ namespace MoonlightHub.Core;
 
 public sealed record SharedMonitor(string Owner, string Id, string Name, int X, int Y, int NativeX, int NativeY,
     int Width, int Height, bool Primary, bool Virtual, bool Active, int WindowsScalePercent = 100, int ContentScalePercent = 100,
-    bool ScalePending = false, int VirtualSlot = -1, bool CanScale = false, int RequestedWidth = 0, int RequestedHeight = 0)
+    bool ScalePending = false, int VirtualSlot = -1, bool CanScale = false, int RequestedWidth = 0, int RequestedHeight = 0,
+    int BaseDpiPercent = 0)
 {
+    public int ScalePercent => WindowsScalePercent;
+    public int MaximumScalePercent { get; init; } = 500;
     public int CanvasWidth => Math.Max(1, (int)Math.Round((ScalePending && RequestedWidth > 0 ? RequestedWidth : Width) * 100.0 / Math.Max(1, WindowsScalePercent)));
     public int CanvasHeight => Math.Max(1, (int)Math.Round((ScalePending && RequestedHeight > 0 ? RequestedHeight : Height) * 100.0 / Math.Max(1, WindowsScalePercent)));
 }
@@ -42,12 +45,17 @@ public static class SharedDisplayLayout
             var id = string.IsNullOrWhiteSpace(d.SunshineDeviceId) ? d.Key : d.SunshineDeviceId;
             var previous = hub.Deskflow.SharedDisplays?.Monitors.FirstOrDefault(m => m.Owner == owner && m.Id == id);
             var dpi = speeds.FirstOrDefault(s => s.Key == "monitor:" + d.SunshineDeviceId)?.Scale ?? (previous?.WindowsScalePercent / 100.0 ?? 1);
+            var actualDpi = d.IsReady ? PointerSpeedManager.GetWindowsScalePercent(d.GdiName) : spec?.ContentScaleCurrentDpiPercent ?? 0;
+            if (actualDpi > 0) dpi = actualDpi / 100.0;
             var x = d.IsReady ? d.PositionX : spec?.X ?? 0;
             var y = d.IsReady ? d.PositionY : spec?.Y ?? 0;
+            var maximum = 500;
+            if (d.IsParsec && d.IsReady) { try { maximum = DisplayDpiScale.Read(d).Maximum; } catch { maximum = (int)Math.Round(dpi * 100); } }
             return new SharedMonitor(owner, id, d.Label, x, y, x, y, size.Item1, size.Item2, d.Primary,
                 d.IsParsec, d.Active, (int)Math.Round(dpi * 100), spec?.ContentScalePercent ?? 100,
-                spec != null && hub.State.PendingReplugSlots.Contains(spec.Slot), d.IsParsec ? d.ParsecSlot : -1,
-                spec != null && profile?.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly, requested.Item1, requested.Item2);
+                false, d.IsParsec ? d.ParsecSlot : -1,
+                d.IsReady && spec != null && profile?.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly, requested.Item1, requested.Item2,
+                0) { MaximumScalePercent = maximum };
         }).Where(m => m.Width > 0 && m.Height > 0).ToList();
     }
 
@@ -142,6 +150,7 @@ public static class SharedDisplayLayout
     /// <param name="positions">稳定 ID、期望分辨率和新的 Windows 坐标。</param>
     public static async Task<List<SharedMonitor>> ApplyLocalAsync(Hub hub, IReadOnlyList<MonitorPlacement> positions)
     {
+        if (hub.Engine.IsBusy) throw new InvalidOperationException("副屏正在切换缩放，切换完成后自动恢复布局操作");
         var displays = DisplayManager.Enumerate();
         var items = new List<LayoutItem>();
         var changed = false;

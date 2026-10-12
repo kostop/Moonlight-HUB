@@ -173,6 +173,8 @@ public sealed class Watchdog : IDisposable
         }
 
         var health = _engine.CheckHealth();
+        foreach (var virtualDisplay in profile.VirtualDisplays.Where(v => v.WindowsScalePercent > 0))
+            _engine.RestoreVirtualDpiAsync(virtualDisplay.Slot).GetAwaiter().GetResult();
         var needRepair = false;
         // Windows re-enumerates everything during a monitor hot-plug (DisplayPort link retrain, KVM switch, remote
         // desktop tools): for a few seconds the virtual display may be missing although the driver still has it.
@@ -626,7 +628,7 @@ public sealed class Watchdog : IDisposable
             if (!okResolution && profile.AutoMatchClientResolution && spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var cm))
             {
                 var (hw, hh) = _engine.HostResolutionFor(spec.InstanceId, cm);
-                var expected = VirtualContentScale.RenderSize(hw, hh, spec.ContentScalePercent);
+                var expected = (Width: hw, Height: hh);
                 okResolution = d.Width == expected.Width && d.Height == expected.Height;
             }
             if (!okResolution) return false;

@@ -68,7 +68,8 @@ public sealed class DisplayCanvas : Canvas
     /// <param name="document">两台电脑共同使用的逻辑桌面布局。</param>
     public void SetSharedDisplays(SharedDisplayDocument document)
     {
-        if (_dragItem != null || _resize != null || HasChanges || SharedDocument?.Revision == document.Revision) return;
+        if (_dragItem != null || _resize != null || HasChanges || SharedDocument?.Revision == document.Revision
+            || SharedDocument is { } previous && previous.Server == document.Server && previous.Revision > document.Revision) return;
         SharedDocument = SharedDisplayLayout.Clone(document);
         _items.Clear();
         _items.AddRange(document.Monitors.Select(m => new Item { Shared = m, X = m.X, Y = m.Y,
@@ -87,12 +88,15 @@ public sealed class DisplayCanvas : Canvas
         }
     }
 
+    /// <summary>只包含用户拖动的位置，提交前与最新显示器信息合并。</summary>
+    public List<(string Owner, string Id, int X, int Y)> DraftSharedPositions => _items
+        .Where(i => i.Shared != null && i.Moved).Select(i => (i.Shared!.Owner, i.Shared.Id, i.X, i.Y)).ToList();
+
     /// <param name="document">缩放操作后服务端确认的新版本，保留尚未应用的位置草稿。</param>
     public void RebaseSharedDisplays(SharedDisplayDocument document)
     {
         if (_dragItem != null || _resize != null) return;
-        var positions = _items.Where(i => i.Shared != null && i.Moved)
-            .ToDictionary(i => (i.Shared!.Owner, i.Shared.Id), i => (i.X, i.Y));
+        var positions = DraftSharedPositions.ToDictionary(i => (i.Owner, i.Id), i => (i.X, i.Y));
         SharedDocument = null;
         _items.Clear();
         SetSharedDisplays(document);
@@ -247,7 +251,7 @@ public sealed class DisplayCanvas : Canvas
             CornerRadius = new CornerRadius(6), Background = Ui.Res(monitor.Virtual ? "AccentSoftBrush" : "Surface3Brush"),
             BorderBrush = Ui.Res(monitor.Virtual ? "AccentBrush" : "BorderBrush"), BorderThickness = new Thickness(monitor.Primary ? 2 : 1),
             Padding = new Thickness(4), ClipToBounds = true, Tag = item, Opacity = monitor.Active ? 1 : .6 };
-        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n渲染 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\nWindows {monitor.WindowsScalePercent}% · 额外 {monitor.ContentScalePercent}%{(monitor.ScalePending ? " · 待生效" : "")}\n拖动主屏或按 Shift 可移动整台电脑，其它屏幕单独移动。间隙自动跨越。" );
+        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}%\n拖动主屏或按 Shift 可移动整台电脑，其它屏幕单独移动。间隙自动跨越。" );
         // 屏幕框只显示编号，文字信息放到图例，避免小屏缩放后被裁切；边框尺寸仍严格保持比例。
         var content = new Grid();
         content.Children.Add(new Viewbox { Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly,
@@ -259,12 +263,12 @@ public sealed class DisplayCanvas : Canvas
             var handle = new Border { Width = 14, Height = 14, HorizontalAlignment = HorizontalAlignment.Right,
                 VerticalAlignment = VerticalAlignment.Bottom, Cursor = new Cursor(StandardCursorType.BottomRightCorner),
                 Background = Brushes.Transparent, BorderBrush = Ui.Res("AccentBrush"), BorderThickness = new Thickness(0, 0, 3, 3) };
-            ToolTip.SetTip(handle, "拖动调节缩放：缩小矩形会放大文字，放大矩形会显示更多内容；松开自动保存。");
+            ToolTip.SetTip(handle, $"拖动调节缩放：缩小矩形会放大文字，放大矩形会显示更多内容；松开立即应用。分辨率保持原值，当前最高 {monitor.MaximumScalePercent}%。");
             handle.PointerPressed += (_, e) =>
             {
-                if (!e.GetCurrentPoint(handle).Properties.IsLeftButtonPressed) return;
-                _resize = new ResizeDraft(item, e.GetPosition(this), item.W, item.H, monitor.ContentScalePercent);
-                _resizePercent = monitor.ContentScalePercent;
+                if (!Interactive || !IsEnabled || !e.GetCurrentPoint(handle).Properties.IsLeftButtonPressed) return;
+                _resize = new ResizeDraft(item, e.GetPosition(this), item.W, item.H, monitor.ScalePercent);
+                _resizePercent = monitor.ScalePercent;
                 e.Pointer.Capture(handle); e.Handled = true;
             };
             handle.PointerMoved += Resize_PointerMoved;
@@ -289,12 +293,15 @@ public sealed class DisplayCanvas : Canvas
         var delta = (e.GetPosition(this) - draft.Start) / _scale;
         var factor = Math.Abs(delta.X / draft.Width) >= Math.Abs(delta.Y / draft.Height)
             ? 1 + delta.X / draft.Width : 1 + delta.Y / draft.Height;
-        _resizePercent = Math.Clamp((int)Math.Round(draft.Percent / Math.Max(.01, factor)), VirtualContentScale.Minimum, VirtualContentScale.Maximum);
+        var requested = draft.Percent / Math.Max(.01, factor);
+        var maximum = Math.Max(100, draft.Item.Shared?.MaximumScalePercent ?? 500);
+        _resizePercent = DisplayDpiScale.Percentages.Where(p => p >= 100 && p <= maximum)
+            .OrderBy(p => Math.Abs(p - requested)).ThenByDescending(p => p).FirstOrDefault(100);
         draft.Item.W = Math.Max(1, (int)Math.Round(draft.Width * (double)draft.Percent / _resizePercent));
         draft.Item.H = Math.Max(1, (int)Math.Round(draft.Height * (double)draft.Percent / _resizePercent));
         visual.Width = Math.Max(24, draft.Item.W * _scale - 4);
         visual.Height = Math.Max(18, draft.Item.H * _scale - 4);
-        ToolTip.SetTip(visual, $"额外放大 {_resizePercent}% · 松开自动保存");
+        ToolTip.SetTip(visual, $"缩放比例 {_resizePercent}% · 松开立即应用 · 分辨率保持原值");
         e.Handled = true;
     }
 
@@ -331,7 +338,8 @@ public sealed class DisplayCanvas : Canvas
 
     private void Border_PointerPressed(object? sender, PointerPressedEventArgs e)
     {
-        if (sender is not Border { Tag: Item item } border || !e.GetCurrentPoint(border).Properties.IsLeftButtonPressed) return;
+        if (sender is not Border { Tag: Item item } border || !CanDrag(item) || !IsEnabled
+            || !e.GetCurrentPoint(border).Properties.IsLeftButtonPressed) return;
         _dragItem = item;
         _dragStart = e.GetPosition(this);
         _dragOriginX = item.X;

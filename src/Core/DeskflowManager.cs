@@ -598,7 +598,7 @@ public sealed class DeskflowManager : IDisposable
             var st = Refresh();
             if (OperatingSystem.IsWindows() && (DateTime.UtcNow - _lastSharedDisplayUtc).TotalSeconds > 3) _ = RefreshSharedDisplaysAsync();
             if ((DateTime.UtcNow - _lastLayoutFetchUtc) > TimeSpan.FromSeconds(15)) _ = RefreshLayoutAsync();
-            if ((DateTime.UtcNow - _lastPeerStatusUtc) > TimeSpan.FromSeconds(15)) _ = RefreshPeerHubAsync();
+            if ((DateTime.UtcNow - _lastPeerStatusUtc) > TimeSpan.FromSeconds(1)) _ = RefreshPeerHubAsync();
             if (!s.Managed || IsSwitching || !st.Installed) return;
 
             if (!s.LegacyTakenOver && !_takeOverAttempted)

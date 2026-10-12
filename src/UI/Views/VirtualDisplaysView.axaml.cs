@@ -86,8 +86,8 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
                 var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
                 if (spec != null && profile?.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly)
                 {
-                    info.Children.Add(Ui.T($"方案输出 {spec.Width}×{spec.Height} · 画面大小 {spec.ContentScalePercent}%", "Muted"));
-                    info.Children.Add(ContentScaleRow(slot, spec.ContentScalePercent));
+                    info.Children.Add(Ui.T($"方案输出 {spec.Width}×{spec.Height} · 真实 DPI 缩放", "Muted"));
+                    if (d.IsReady) info.Children.Add(ContentScaleRow(slot, d));
                 }
                 grid.Children.Add(info);
                 List.Children.Add(Ui.Card(grid, true));
@@ -111,30 +111,27 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
     }
 
     /// <param name="slot">虚拟屏槽位，从零开始。</param>
-    /// <param name="percent">方案中保存的额外画面大小。</param>
-    private StackPanel ContentScaleRow(int slot, int percent)
+    /// <param name="display">保持原生分辨率的活动虚拟屏。</param>
+    private StackPanel ContentScaleRow(int slot, DisplayInfo display)
     {
-        var box = new NumericUpDown { Minimum = VirtualContentScale.Minimum, Maximum = VirtualContentScale.Maximum,
-            Increment = 1, Value = percent, Width = 85, FormatString = "0", ShowButtonSpinner = false,
-            HorizontalContentAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-        var slider = new Slider { Minimum = VirtualContentScale.Minimum, Maximum = VirtualContentScale.Maximum,
-            Value = percent, Width = 170, TickFrequency = 5, IsSnapToTickEnabled = false };
-        slider.PropertyChanged += (_, e) => { if (e.Property == RangeBase.ValueProperty) box.Value = (decimal)Math.Round(slider.Value); };
-        box.ValueChanged += (_, e) => slider.Value = (double)(e.NewValue ?? 100);
+        var dpi = DisplayDpiScale.Read(display);
+        var box = new ComboBox { Width = 110 };
+        foreach (var percent in DisplayDpiScale.Percentages.Where(p => p >= dpi.Minimum && p <= dpi.Maximum)) box.Items.Add(percent);
+        box.SelectedItem = dpi.Current;
         var apply = Ui.B("应用", (_, _) =>
         {
-            var requested = (int)(box.Value ?? 100);
+            var requested = box.SelectedItem is int value ? value : dpi.Current;
             Ui.RunAsync(_window, async () =>
             {
                 var (ok, message) = await Hub.Engine.SetVirtualContentScaleAsync(slot, requested).ConfigureAwait(false);
                 if (!ok) throw new InvalidOperationException(message);
-                _window.Toast("画面大小", message);
+                _window.Toast("缩放比例", message);
                 Dispatcher.UIThread.Post(Invalidate);
             });
         }, "GhostButton");
-        var reset = Ui.B("原始大小", (_, _) => { box.Value = 100; }, "GhostButton");
+        var reset = Ui.B("100%", (_, _) => { box.SelectedItem = 100; }, "GhostButton");
         var row = new WrapPanel { Orientation = Orientation.Horizontal };
-        foreach (var control in new Control[] { Ui.T("额外放大", "Muted"), slider, Ui.Row(box, Ui.T("%", "Muted")), apply, reset })
+        foreach (var control in new Control[] { Ui.T("缩放比例", "Muted"), Ui.Row(box, Ui.T("%", "Muted")), apply, reset })
         {
             control.VerticalAlignment = VerticalAlignment.Center;
             control.Margin = new Thickness(0, 0, 10, 6);
@@ -142,7 +139,7 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
         }
         var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
         panel.Children.Add(row);
-        panel.Children.Add(new TextBlock { Text = "100% 保持原大小，可输入 50–300%。在 Windows 200% 上设为 150%，约等效 300%；每块副屏独立保存。",
+        panel.Children.Add(new TextBlock { Text = $"分辨率保持 {display.Width}×{display.Height}，此屏支持 {dpi.Minimum}–{dpi.Maximum}% 的真实 DPI。",
             Foreground = Ui.Res("MutedBrush"), TextWrapping = Avalonia.Media.TextWrapping.Wrap });
         return panel;
     }

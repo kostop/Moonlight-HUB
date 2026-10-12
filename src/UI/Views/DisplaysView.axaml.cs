@@ -18,6 +18,11 @@ public partial class DisplaysView : UserControl, IRefreshable
     private DateTime _lastEnumerate = DateTime.MinValue;
     private string _peerStatusText = string.Empty;
     private long _legendRevision;
+    private bool _scaleOperation;
+    private bool _layoutOperation;
+    private bool _refreshOperation;
+    private bool _displayError;
+    private const string DisplayBusyText = "正在调整显示器，完成后可继续摆放屏幕…";
 
     public DisplaysView() : this(App.Instance.MainWin) { }
 
@@ -25,11 +30,7 @@ public partial class DisplaysView : UserControl, IRefreshable
     {
         _window = window;
         InitializeComponent();
-        LayoutCanvas.DraftChanged += () =>
-        {
-            ApplyLayoutBtn.IsEnabled = LayoutCanvas.HasChanges;
-            ResetLayoutBtn.IsEnabled = LayoutCanvas.HasChanges;
-        };
+        LayoutCanvas.DraftChanged += UpdateDisplayControls;
         LayoutCanvas.ScaleRequested += ApplyMonitorScale;
         if (!OperatingSystem.IsWindows())
         {
@@ -43,18 +44,59 @@ public partial class DisplaysView : UserControl, IRefreshable
 
     private Hub Hub => _window.Hub;
 
+    private bool DisplayBusy => _scaleOperation || _layoutOperation || Hub.Engine.IsBusy || Hub.Deskflow.PeerHub?.DisplayBusy == true;
+
+    private void UpdateDisplayControls()
+    {
+        var busy = DisplayBusy;
+        ApplyLayoutBtn.IsEnabled = ResetLayoutBtn.IsEnabled = !busy && LayoutCanvas.HasChanges;
+        ExtendBtn.IsEnabled = ReapplyBtn.IsEnabled = !busy;
+        LayoutCanvas.IsEnabled = MonitorLegend.IsEnabled = !busy;
+        if (busy && !_scaleOperation && !_layoutOperation && !_displayError)
+            DeskflowLayoutText.Text = DisplayBusyText;
+        else if (!busy && DeskflowLayoutText.Text == DisplayBusyText)
+        {
+            DeskflowLayoutText.Text = string.Empty;
+            RefreshPeers(force: true);
+        }
+    }
+
     private List<DisplayInfo> EnumerateLocal() => OperatingSystem.IsWindows() ? DisplayManager.Enumerate() : LinuxDisplays.Enumerate();
 
     private void ApplyLayout_Click(object? sender, RoutedEventArgs e)
     {
-        if (LayoutCanvas.DraftSharedDisplays is { } shared)
+        if (DisplayBusy) { UpdateDisplayControls(); return; }
+        if (LayoutCanvas.SharedDocument != null)
         {
+            var positions = LayoutCanvas.DraftSharedPositions;
+            if (positions.Count == 0) return;
+            var leaderHost = Hub.Deskflow.SharedDisplayServerHost;
+            _layoutOperation = true;
+            _displayError = false;
             DeskflowLayoutText.Text = "正在同步两台电脑的显示器布局…";
+            UpdateDisplayControls();
             Ui.RunAsync(_window, async () =>
             {
-                await PeerLink.ApplySharedDisplaysAsync(Hub.Deskflow.SharedDisplayServerHost, shared).ConfigureAwait(false);
-                await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
-                await Dispatcher.UIThread.InvokeAsync(() => { LayoutCanvas.ClearPeerDraft(); Invalidate(); Refresh(); DeskflowLayoutText.Text = "两台电脑的显示器布局已同步"; });
+                try
+                {
+                    var applied = await ApplySharedPositionsAsync(leaderHost, positions).ConfigureAwait(false);
+                    await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                    {
+                        LayoutCanvas.ClearPeerDraft(); LayoutCanvas.SetSharedDisplays(applied);
+                        _legendRevision = 0; Invalidate(); Refresh();
+                        DeskflowLayoutText.Text = "两台电脑的显示器布局已同步";
+                    });
+                }
+                catch (Exception ex)
+                {
+                    await Dispatcher.UIThread.InvokeAsync(() => { _displayError = true; DeskflowLayoutText.Text = "应用失败：" + ex.Message; });
+                    throw;
+                }
+                finally
+                {
+                    await Dispatcher.UIThread.InvokeAsync(() => { _layoutOperation = false; UpdateDisplayControls(); });
+                }
             });
             return;
         }
@@ -77,7 +119,10 @@ public partial class DisplaysView : UserControl, IRefreshable
         var host = Hub.Deskflow.LayoutHost;
         var screen = Hub.Deskflow.LocalScreenName;
         var deskflowReady = Hub.Deskflow.Layout?.HasLocalScreen == true && DeskflowPeer.IsValidHost(host);
+        _layoutOperation = true;
+        _displayError = false;
         DeskflowLayoutText.Text = "正在应用…";
+        UpdateDisplayControls();
         Ui.RunAsync(_window, async () =>
         {
             var notes = new List<string>();
@@ -121,22 +166,48 @@ public partial class DisplaysView : UserControl, IRefreshable
                             notes.Add($"布局服务 {host}:{DeskflowPeer.LayoutPort} 不可用，新的显示器排列没有同步到共享布局（服务恢复后布局同步会自动上报）");
                     }
                 }
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    LayoutCanvas.ClearPeerDraft();
+                    DeskflowLayoutText.Text = string.Join("；", notes);
+                    Invalidate();
+                });
+                await Hub.Deskflow.RefreshLayoutAsync().ConfigureAwait(false);
+                await Dispatcher.UIThread.InvokeAsync(() => RefreshPeers(force: true));
             }
             catch (Exception ex)
             {
                 // the status line said "正在应用…" for good after a refused layout
-                await Dispatcher.UIThread.InvokeAsync(() => DeskflowLayoutText.Text = "应用失败：" + ex.Message);
+                await Dispatcher.UIThread.InvokeAsync(() => { _displayError = true; DeskflowLayoutText.Text = "应用失败：" + ex.Message; });
                 throw;
             }
-            await Dispatcher.UIThread.InvokeAsync(() =>
+            finally
             {
-                LayoutCanvas.ClearPeerDraft();
-                DeskflowLayoutText.Text = string.Join("；", notes);
-                Invalidate();
-            });
-            await Hub.Deskflow.RefreshLayoutAsync().ConfigureAwait(false);
-            await Dispatcher.UIThread.InvokeAsync(() => RefreshPeers(force: true));
+                await Dispatcher.UIThread.InvokeAsync(() => { _layoutOperation = false; UpdateDisplayControls(); });
+            }
         });
+    }
+
+    /// <param name="host">当前共同布局的服务端地址。</param>
+    /// <param name="positions">点击应用时保存的拖动位置，未拖动的显示器不覆盖。</param>
+    private static async Task<SharedDisplayDocument> ApplySharedPositionsAsync(string host, List<(string Owner, string Id, int X, int Y)> positions)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            var fresh = await PeerLink.GetSharedDisplaysAsync(host).ConfigureAwait(false);
+            var draft = SharedDisplayLayout.Clone(fresh);
+            foreach (var position in positions)
+            {
+                var index = draft.Monitors.FindIndex(m => m.Owner == position.Owner && m.Id == position.Id);
+                if (index < 0) throw new InvalidOperationException($"{position.Owner} 的显示器已断开或变化，请刷新布局");
+                draft.Monitors[index] = draft.Monitors[index] with { X = position.X, Y = position.Y };
+            }
+            try { return await PeerLink.ApplySharedDisplaysAsync(host, draft).ConfigureAwait(false); }
+            catch (InvalidOperationException ex) when (attempt == 0 && ex.Message == "布局已更新，请刷新后再应用")
+            {
+                // 缩放或另一台电脑刚更新了布局：重新读取一次，只重放用户拖动的位置。
+            }
+        }
     }
 
     /// <summary>Draws the other Deskflow computers next to the local displays (from the cached shared layout).</summary>
@@ -145,7 +216,7 @@ public partial class DisplaysView : UserControl, IRefreshable
         var df = Hub.Deskflow;
         if (df.SharedDisplays is { } shared)
         {
-            if (!(DeskflowLayoutText.Text ?? "").StartsWith("正在"))
+            if (!_displayError && !(DeskflowLayoutText.Text ?? "").StartsWith("正在"))
                 DeskflowLayoutText.Text = $"两台电脑共享布局 · {shared.Monitors.Count} 块屏幕 · 服务端 {shared.Server}";
             return;
         }
@@ -161,19 +232,23 @@ public partial class DisplaysView : UserControl, IRefreshable
         if (force || text != _peerStatusText)
         {
             _peerStatusText = text;
-            if (!(DeskflowLayoutText.Text ?? string.Empty).StartsWith("正在应用")) DeskflowLayoutText.Text = text;
+            if (!_displayError && !(DeskflowLayoutText.Text ?? string.Empty).StartsWith("正在")) DeskflowLayoutText.Text = text;
         }
     }
 
-    private void ResetLayout_Click(object? sender, RoutedEventArgs e) => LayoutCanvas.ResetDraft();
+    private void ResetLayout_Click(object? sender, RoutedEventArgs e)
+    {
+        if (!DisplayBusy) LayoutCanvas.ResetDraft();
+    }
 
     public void Refresh()
     {
+        UpdateDisplayControls();
         if (OperatingSystem.IsWindows() && Hub.Deskflow.SharedDisplays is { } shared)
         {
             LayoutCanvas.SetSharedDisplays(shared);
             RefreshMonitorLegend(LayoutCanvas.SharedDocument ?? shared);
-            HelpText.Text = "灰色为真实屏，青色为虚拟屏，大小按缩放后的桌面比例显示。拖动主屏或按 Shift 移动整台电脑；拖动虚拟屏右下角调节缩放，松开自动保存。两台 Hub 同步，鼠标自动跨过屏幕间隙。";
+            HelpText.Text = "灰色为真实屏，青色为虚拟屏，大小按缩放后的桌面比例显示。拖动主屏或按 Shift 移动整台电脑；拖动虚拟屏右下角调节文字大小，分辨率保持原值。两台 Hub 同步，鼠标自动跨过屏幕间隙。";
         }
         if ((DateTime.UtcNow - _lastEnumerate) > TimeSpan.FromSeconds(3))
         {
@@ -213,10 +288,9 @@ public partial class DisplaysView : UserControl, IRefreshable
             info.Children.Add(new TextBlock { Text = $"{index + 1} · {monitor.Owner} · {monitor.Name}",
                 FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap,
                 Foreground = Ui.Res(monitor.Virtual ? "AccentBrush" : "TextBrush") });
-            info.Children.Add(new TextBlock { Text = $"{(monitor.ScalePending ? "预计桌面" : "可用桌面")} {monitor.CanvasWidth}×{monitor.CanvasHeight} · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : "")}",
+            info.Children.Add(new TextBlock { Text = $"可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight} · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : "")}",
                 TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
-            info.Children.Add(new TextBlock { Text = $"Windows {monitor.WindowsScalePercent}%" + (monitor.Virtual
-                ? $" · 额外 {monitor.ContentScalePercent}%{(monitor.ScalePending ? " · 待生效" : "")}" : ""),
+            info.Children.Add(new TextBlock { Text = $"缩放比例 {monitor.ScalePercent}% · 分辨率 {monitor.Width}×{monitor.Height}",
                 TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
             if (monitor.CanScale && monitor.VirtualSlot >= 0) info.Children.Add(MonitorScaleControls(monitor));
             MonitorLegend.Children.Add(new Border { Child = info, Padding = new Thickness(10), Margin = new Thickness(0, 0, 10, 8),
@@ -227,26 +301,36 @@ public partial class DisplaysView : UserControl, IRefreshable
     /// <param name="monitor">本机或对端可调整的独立虚拟屏。</param>
     private Control MonitorScaleControls(SharedMonitor monitor)
     {
-        var input = new NumericUpDown { Minimum = VirtualContentScale.Minimum, Maximum = VirtualContentScale.Maximum,
-            Value = monitor.ContentScalePercent, Increment = 1, Width = 85, FormatString = "0", ShowButtonSpinner = false,
-            HorizontalContentAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        var maximum = Math.Max(100, monitor.MaximumScalePercent);
+        var input = new ComboBox { Width = 95, VerticalAlignment = VerticalAlignment.Center };
+        foreach (var percent in DisplayDpiScale.Percentages.Where(p => p >= 100 && p <= maximum))
+            input.Items.Add(new ComboBoxItem { Content = $"{percent}%", Tag = percent });
+        input.SelectedItem = input.Items.OfType<ComboBoxItem>().FirstOrDefault(i => (int)i.Tag! == monitor.ScalePercent);
         var apply = Ui.B("应用", (_, _) =>
         {
-            ApplyMonitorScale(monitor, (int)(input.Value ?? 100));
+            if (input.SelectedItem is ComboBoxItem { Tag: int percent }) ApplyMonitorScale(monitor, percent);
         }, "GhostButton");
         apply.Padding = new Thickness(10, 4);
-        var row = Ui.Row(Ui.T("额外放大", "Muted"), input, Ui.T("%", "Muted"), apply);
+        var row = Ui.Row(Ui.T("缩放比例", "Muted"), input, apply);
         row.Margin = new Thickness(0, 6, 0, 0);
-        ToolTip.SetTip(row, "50–300%，100% 保持原大小。调高后字和按钮更大，每块虚拟屏独立保存；Windows 缩放保持不变。");
+        ToolTip.SetTip(row, $"调高后文字和按钮更大，只调整这块虚拟屏的显示比例，分辨率保持原值，无需重启串流。当前 Windows 支持 100–{maximum}%。");
         return row;
     }
 
     /// <param name="monitor">本机或对端被调整的虚拟屏。</param>
-    /// <param name="percent">输入或拖动产生的额外缩放百分比。</param>
+    /// <param name="percent">选择或拖动产生的真实显示缩放百分比。</param>
     private void ApplyMonitorScale(SharedMonitor monitor, int percent)
     {
+        if (DisplayBusy)
+        {
+            LayoutCanvas.ResetSizePreview(); UpdateDisplayControls();
+            return;
+        }
         var host = monitor.Owner == Hub.Deskflow.LocalScreenName ? "127.0.0.1" : Hub.Deskflow.Settings.RemoteHost;
-        DeskflowLayoutText.Text = $"正在保存 {monitor.Owner} 的虚拟屏缩放 {percent}%…";
+        _scaleOperation = true;
+        _displayError = false;
+        DeskflowLayoutText.Text = $"正在应用 {monitor.Owner} 的虚拟屏缩放 {percent}%…";
+        UpdateDisplayControls();
         Ui.RunAsync(_window, async () =>
         {
             try
@@ -255,12 +339,20 @@ public partial class DisplaysView : UserControl, IRefreshable
                 await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
                 await Dispatcher.UIThread.InvokeAsync(() => {
                     if (Hub.Deskflow.SharedDisplays is { } document) LayoutCanvas.RebaseSharedDisplays(document);
-                    _legendRevision = 0; Refresh(); DeskflowLayoutText.Text = message; _window.Toast("画面大小", message);
+                    _legendRevision = 0; Refresh(); DeskflowLayoutText.Text = message; _window.Toast("缩放比例", message);
                 });
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { _displayError = true; DeskflowLayoutText.Text = "缩放失败：" + ex.Message; });
+                throw;
             }
             finally
             {
-                await Dispatcher.UIThread.InvokeAsync(() => { LayoutCanvas.ResetSizePreview(); if ((DeskflowLayoutText.Text ?? "").StartsWith("正在保存")) DeskflowLayoutText.Text = "缩放未保存，请查看错误提示"; });
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    _scaleOperation = false; LayoutCanvas.ResetSizePreview(); UpdateDisplayControls();
+                });
             }
         });
     }
@@ -496,18 +588,85 @@ public partial class DisplaysView : UserControl, IRefreshable
         Dispatcher.UIThread.Post(Refresh);
     }
 
-    private void Refresh_Click(object? sender, RoutedEventArgs e) => Invalidate();
+    private void Refresh_Click(object? sender, RoutedEventArgs e)
+    {
+        if (LayoutCanvas.SharedDocument == null) { Invalidate(); return; }
+        if (_refreshOperation) return;
+        _refreshOperation = true;
+        var host = Hub.Deskflow.SharedDisplayServerHost;
+        Ui.RunAsync(_window, async () =>
+        {
+            try
+            {
+                var fresh = await PeerLink.GetSharedDisplaysAsync(host).ConfigureAwait(false);
+                await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    _displayError = false; LayoutCanvas.RebaseSharedDisplays(fresh);
+                    _legendRevision = 0; Invalidate(); Refresh();
+                });
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { _displayError = true; DeskflowLayoutText.Text = "刷新失败：" + ex.Message; });
+                throw;
+            }
+            finally
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { _refreshOperation = false; UpdateDisplayControls(); });
+            }
+        });
+    }
 
     private void Extend_Click(object? sender, RoutedEventArgs e)
     {
-        var code = DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
-        Log.Info($"用户请求扩展全部显示器: SetDisplayConfig={code}");
-        Invalidate();
+        if (DisplayBusy) { UpdateDisplayControls(); return; }
+        _layoutOperation = true; _displayError = false; UpdateDisplayControls();
+        Ui.RunAsync(_window, async () =>
+        {
+            try
+            {
+                var code = await Task.Run(() => DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND)).ConfigureAwait(false);
+                Log.Info($"用户请求扩展全部显示器: SetDisplayConfig={code}");
+                if (code != 0) throw new InvalidOperationException($"扩展显示器失败（{code}）");
+                await Dispatcher.UIThread.InvokeAsync(Invalidate);
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { _displayError = true; DeskflowLayoutText.Text = "扩展失败：" + ex.Message; });
+                throw;
+            }
+            finally
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { _layoutOperation = false; UpdateDisplayControls(); });
+            }
+        });
     }
 
     private void Reapply_Click(object? sender, RoutedEventArgs e)
     {
+        if (DisplayBusy) { UpdateDisplayControls(); return; }
         var p = Hub.ActiveProfile;
-        if (p != null) _ = Hub.Engine.ApplyAsync(p);
+        if (p == null) return;
+        _layoutOperation = true; _displayError = false; UpdateDisplayControls();
+        Ui.RunAsync(_window, async () =>
+        {
+            try
+            {
+                var result = await Hub.Engine.ApplyAsync(p).ConfigureAwait(false);
+                if (!result.Success) throw new InvalidOperationException(result.Summary);
+                await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
+                await Dispatcher.UIThread.InvokeAsync(Invalidate);
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { _displayError = true; DeskflowLayoutText.Text = "应用方案失败：" + ex.Message; });
+                throw;
+            }
+            finally
+            {
+                await Dispatcher.UIThread.InvokeAsync(() => { _layoutOperation = false; UpdateDisplayControls(); });
+            }
+        });
     }
 }

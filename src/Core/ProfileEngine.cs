@@ -61,10 +61,7 @@ public sealed class ProfileEngine
 
     /// <summary>Resolution for a virtual display: the client's requested size (if that mode exists on the display) else the profile value.</summary>
     private (int Width, int Height) ResolveResolution(Profile profile, VirtualDisplaySpec spec, string? gdiName)
-    {
-        var (w, h) = ResolveOutputResolution(profile, spec, gdiName);
-        return profile.Mode == ProfileMode.Clone ? (w, h) : VirtualContentScale.RenderSize(w, h, spec.ContentScalePercent);
-    }
+        => ResolveOutputResolution(profile, spec, gdiName);
 
     /// <summary>串流输出尺寸与渲染尺寸分开，重连不会把自定义画面大小覆盖。</summary>
     private (int Width, int Height) ResolveOutputResolution(Profile profile, VirtualDisplaySpec spec, string? gdiName)
@@ -72,7 +69,7 @@ public sealed class ProfileEngine
         if (profile.AutoMatchClientResolution && spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var mode) && mode.Width > 0 && mode.Height > 0)
         {
             var (w, h) = HostResolutionFor(spec.InstanceId, mode);
-            if (spec.ContentScalePercent != 100 || string.IsNullOrWhiteSpace(gdiName) || DisplayManager.GetModes(gdiName, w, h).Any(m => m.Orientation == 0)) return (w, h);
+            if (string.IsNullOrWhiteSpace(gdiName) || DisplayManager.GetModes(gdiName, w, h).Any(m => m.Orientation == 0)) return (w, h);
         }
         return (spec.Width, spec.Height);
     }
@@ -545,6 +542,15 @@ public sealed class ProfileEngine
                 return result;
             }
 
+            foreach (var spec in specs.Where(v => v.WindowsScalePercent > 0))
+            {
+                var target = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == spec.Slot && d.IsReady);
+                if (target == null || PointerSpeedManager.GetWindowsScalePercent(target.GdiName) == spec.WindowsScalePercent) continue;
+                var dpi = DisplayDpiScale.TrySet(target, spec.WindowsScalePercent);
+                Step(result, (dpi.Ok ? "✓ " : "⚠ ") + dpi.Message);
+                if (dpi.Ok) spec.ContentScaleCurrentDpiPercent = spec.WindowsScalePercent;
+            }
+
             // ---------------------------------------------------------------- 5. Sunshine instances
             displays = DisplayManager.Enumerate();
             // present (active or stand-by) displays all have a stable device id; never drop an instance because its
@@ -945,7 +951,7 @@ public sealed class ProfileEngine
     }
 
     /// <param name="slot">虚拟屏槽位，从零开始。</param>
-    /// <param name="percent">额外画面缩放百分比。</param>
+    /// <param name="percent">只修改这块副屏的真实 DPI 百分比。</param>
     public async Task<(bool Ok, string Message)> SetVirtualContentScaleAsync(int slot, int percent)
     {
         if (!await _contentScaleChanges.WaitAsync(0).ConfigureAwait(false)) return (false, "正在调整画面大小，请稍候");
@@ -954,29 +960,48 @@ public sealed class ProfileEngine
     }
 
     /// <param name="slot">虚拟屏槽位，从零开始。</param>
-    /// <param name="percent">已经序列化处理的画面大小请求。</param>
+    /// <param name="percent">这块副屏的真实 Windows DPI 百分比，保持像素分辨率。</param>
     private async Task<(bool Ok, string Message)> SetVirtualContentScaleCoreAsync(int slot, int percent)
     {
-        if (IsBusy) return (false, "另一个显示操作正在进行，请稍候");
-        var profile = _settings.Profile(_state.ActiveProfileId);
-        var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
-        if (profile == null || spec == null) return (false, "当前方案没有这块虚拟屏");
-        if (profile.Mode is ProfileMode.Clone or ProfileMode.MainOnly) return (false, "画面大小调节需要独立的扩展副屏或仅副屏方案");
-        try { VirtualContentScale.RenderSize(spec.Width, spec.Height, percent); }
-        catch (ArgumentOutOfRangeException ex) { return (false, ex.Message); }
-        var previous = spec.ContentScalePercent;
-        spec.ContentScalePercent = percent;
-        _settings.Save();
-        var result = await ApplyAsync(profile).ConfigureAwait(false);
-        if (!result.Success)
+        if (!await _busy.WaitAsync(0).ConfigureAwait(false)) return (false, "另一个显示操作正在进行，请稍候");
+        try
         {
-            spec.ContentScalePercent = previous;
+            var profile = _settings.Profile(_state.ActiveProfileId);
+            var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+            if (profile == null || spec == null) return (false, "当前方案没有这块虚拟屏");
+            if (profile.Mode is ProfileMode.Clone or ProfileMode.MainOnly) return (false, "真实缩放需要独立的副屏");
+            var displays = DisplayManager.Enumerate();
+            var display = displays.FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot && d.IsReady);
+            if (display == null) return (false, "连接这块副屏后可调整真实缩放比例");
+            var error = DisplayManager.ValidateLayoutTargets([new LayoutItem(display)], displays);
+            if (error != null) return (false, error);
+            var changed = await Task.Run(() => DisplayDpiScale.TrySet(display, percent)).ConfigureAwait(false);
+            if (!changed.Ok) return changed;
+            spec.WindowsScalePercent = percent;
+            spec.ContentScaleCurrentDpiPercent = percent;
+            spec.ContentScalePercent = 100;
             _settings.Save();
-            await ApplyAsync(profile).ConfigureAwait(false);
-            return (false, result.Summary);
+            ClearPendingReplug(slot);
+            return changed;
         }
-        var pending = _state.PendingReplugSlots.Contains(slot);
-        return (true, pending ? $"已保存 {percent}%；本次串流断开后自动刷新，重连时生效" : $"画面大小已设为 {percent}% 并保存到当前方案");
+        catch (Exception ex) { Log.Error("设置虚拟屏真实 DPI 失败", ex); return (false, ex.Message); }
+        finally
+        {
+            CurrentStep = string.Empty;
+            _busy.Release();
+            try { Applied?.Invoke(); } catch { }
+        }
+    }
+
+    /// <param name="slot">需要恢复已保存 DPI 的虚拟屏槽位。</param>
+    public async Task RestoreVirtualDpiAsync(int slot)
+    {
+        var spec = _settings.Profile(_state.ActiveProfileId)?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+        if (spec?.WindowsScalePercent is not > 0) return;
+        var display = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot && d.IsReady);
+        if (display == null || PointerSpeedManager.GetWindowsScalePercent(display.GdiName) == spec.WindowsScalePercent) return;
+        var applied = await SetVirtualContentScaleAsync(slot, spec.WindowsScalePercent).ConfigureAwait(false);
+        if (!applied.Ok) Log.Warn("恢复副屏 DPI: " + applied.Message);
     }
 
     /// <summary>The user picked a refresh rate for a virtual display: store it in the active profile and apply it.</summary>
@@ -1153,7 +1178,9 @@ public sealed class ProfileEngine
             && !DisplayManager.HasMode(display.GdiName, width, height, hz))
         {
             Step(result, $"虚拟屏 #{spec.Slot + 1} 的新模式待生效，保持当前 {display.ModeText}");
-            return new DisplayMode(display.Width, display.Height, display.RefreshRate, display.Orientation);
+            var current = DisplayManager.GetModes(display.GdiName, display.Width, display.Height)
+                .OrderBy(m => Math.Abs(m.RefreshRate - display.RefreshRate)).FirstOrDefault();
+            return current ?? new DisplayMode(display.Width, display.Height, display.RefreshRate, display.Orientation);
         }
         return PickMode(display.GdiName, width, height, hz, result, spec.Slot);
     }

@@ -10,7 +10,7 @@ namespace MoonlightHub.Core;
 
 /// <summary>What the other computer's hub reports about itself.</summary>
 public sealed record PeerHubInfo(string Screen, string Os, string Version, DeskflowRole Role, DeskflowRole Running, List<string> Peers,
-    double DpiScale = 0, int DesktopWidth = 0, int DesktopHeight = 0, List<SharedMonitor>? Monitors = null)
+    double DpiScale = 0, int DesktopWidth = 0, int DesktopHeight = 0, List<SharedMonitor>? Monitors = null, bool DisplayBusy = false)
 {
     public string Text => $"{Screen} ({Os}, v{Version}) · {DeskflowManager.RoleName(Running)}" + (Peers.Count > 0 ? " · 已连接 " + string.Join(", ", Peers) : string.Empty);
 }
@@ -25,6 +25,7 @@ public sealed class PeerLink : IDisposable
 {
     public const int Port = 24990;
     private static readonly HttpClient Http = new(new HttpClientHandler { UseProxy = false }) { Timeout = TimeSpan.FromSeconds(45) };
+    private static readonly HttpClient ScaleHttp = new(new HttpClientHandler { UseProxy = false }) { Timeout = TimeSpan.FromMinutes(3) };
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 
     private readonly DeskflowManager _deskflow;
@@ -190,11 +191,12 @@ public sealed class PeerLink : IDisposable
             screen = _deskflow.LocalScreenName,
             os = OperatingSystem.IsWindows() ? "Windows" : "Linux",
             version = typeof(PeerLink).Assembly.GetName().Version?.ToString(3) ?? "?",
+            displayBusy = Hub.Current?.Engine.IsBusy == true,
             role = _deskflow.Settings.Role.ToString().ToLowerInvariant(),
             running = st.RunningRole.ToString().ToLowerInvariant(),
             peers = st.Peers,
-            // the other hub sets its pointer speed for this screen from it (Deskflow moves this cursor by its pixel deltas)
-            dpiScale = PointerSpeedManager.PrimaryScale(),
+            // 使用光标当前所在屏幕的真实 DPI，不能把整台对端都当作其主屏。
+            dpiScale = PointerSpeedManager.CurrentCursorScale() is > 0 and var cursorScale ? cursorScale : PointerSpeedManager.PrimaryScale(),
             // the Deskflow screen of this computer is its whole desktop; a dual-boot machine has a different one per
             // system, so the other hub draws this screen from what is reported here rather than from a stored layout
             desktopWidth = PointerSpeedManager.DesktopSize().Width,
@@ -292,11 +294,11 @@ public sealed class PeerLink : IDisposable
 
     /// <param name="host">这块虚拟屏所属电脑的 Hub 地址。</param>
     /// <param name="slot">虚拟屏槽位，从零开始。</param>
-    /// <param name="percent">保存到对应电脑方案中的额外缩放百分比。</param>
+    /// <param name="percent">该虚拟屏真实的 Windows DPI 百分比。</param>
     public static async Task<string> SetContentScaleAsync(string host, int slot, int percent)
     {
         using var request = Request(HttpMethod.Post, host, "/api/hub/scale", new { slot, percent });
-        using var response = await Http.SendAsync(request).ConfigureAwait(false);
+        using var response = await ScaleHttp.SendAsync(request).ConfigureAwait(false);
         var result = JsonNode.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
         var message = result?["message"]?.ToString() ?? result?["error"]?.ToString() ?? "调整失败";
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException(message);
@@ -325,7 +327,7 @@ public sealed class PeerLink : IDisposable
             o["dpiScale"] is JsonValue scale && scale.TryGetValue<double>(out var dpi) ? dpi : 0,
             o["desktopWidth"] is JsonValue dw && dw.TryGetValue<int>(out var w) ? w : 0,
             o["desktopHeight"] is JsonValue dh && dh.TryGetValue<int>(out var h) ? h : 0,
-            o["monitors"]?.Deserialize<List<SharedMonitor>>(Json));
+            o["monitors"]?.Deserialize<List<SharedMonitor>>(Json), o["displayBusy"]?.GetValue<bool>() == true);
     }
 
     public void Dispose()

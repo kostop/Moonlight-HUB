@@ -26,6 +26,12 @@ public sealed class VirtualDisplaySpec
     public int RefreshRate { get; set; } = 60;
     /// <summary>额外画面缩放，100 表示原始大小；独立于 Windows 的 DPI 档位。</summary>
     public int ContentScalePercent { get; set; } = 100;
+    /// <summary>单块副屏的真实 Windows DPI 百分比；0 保持系统现有值，分辨率不随该值变化。</summary>
+    public int WindowsScalePercent { get; set; }
+    /// <summary>原始输出模式的 Windows 缩放基准，首次应用额外缩放时校准。</summary>
+    public int ContentScaleBaseDpiPercent { get; set; }
+    /// <summary>最近一次激活该虚拟屏时测得的 Windows 缩放，供待机模式使用。</summary>
+    public int ContentScaleCurrentDpiPercent { get; set; }
     public Placement Placement { get; set; } = Placement.Right;
     public int? X { get; set; }
     public int? Y { get; set; }

@@ -387,6 +387,24 @@ public static unsafe class DisplayManager
         return null;
     }
 
+    /// <summary>只修正虚拟屏摆放操作继承的失效刷新率，不替换用户明确请求的模式。</summary>
+    /// <param name="item">待应用的布局项；物理屏、断开操作或明确模式请求保持原行为。</param>
+    /// <param name="current">Windows 当前模式，可能残留驱动不再支持的刷新率。</param>
+    /// <param name="published">驱动当前实际发布的模式，用于选择相同分辨率和方向的刷新率。</param>
+    /// <returns>需要显式写入的替代刷新率；无需修正时返回空。</returns>
+    internal static int? ResolveImplicitVirtualRefreshRate(LayoutItem item, DisplayMode current, IReadOnlyList<DisplayMode> published)
+    {
+        if (!item.Attached || !item.RequireParsec || item.RefreshRate.HasValue
+            || item.Width.HasValue && item.Width.Value != current.Width
+            || item.Height.HasValue && item.Height.Value != current.Height
+            || item.Orientation.HasValue && item.Orientation.Value != current.Orientation) return null;
+        var rates = published.Where(m => m.Width == current.Width && m.Height == current.Height
+            && m.Orientation == current.Orientation && m.RefreshRate > 0).Select(m => m.RefreshRate).Distinct().ToList();
+        if (rates.Contains(current.RefreshRate)) return null;
+        if (rates.Count == 0) throw new InvalidOperationException($"{item.GdiName}: 驱动未发布当前分辨率和方向的可用模式，已停止摆放");
+        return rates.OrderBy(hz => Math.Abs((long)hz - current.RefreshRate)).ThenByDescending(hz => hz).First();
+    }
+
     /// <summary>
     /// Stages every item with CDS_UPDATEREGISTRY|CDS_NORESET and then applies once. Positions are normalised so the
     /// primary display ends at (0,0). Detached items get a 0x0 mode which removes them from the desktop.
@@ -407,6 +425,7 @@ public static unsafe class DisplayManager
 
         // 所有目标的模式都必须可读；检查完成前不暂存任何改动，避免半套布局生效。
         var currentModes = new Dictionary<string, DEVMODEW>(StringComparer.OrdinalIgnoreCase);
+        var implicitRefreshRates = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var item in list)
         {
             var mode = GetCurrentMode(item.GdiName);
@@ -417,6 +436,26 @@ public static unsafe class DisplayManager
                 return result;
             }
             currentModes[item.GdiName] = mode.Value;
+            if (item.Attached && item.RequireParsec && !item.RefreshRate.HasValue)
+            {
+                var current = new DisplayMode((int)mode.Value.dmPelsWidth, (int)mode.Value.dmPelsHeight,
+                    (int)mode.Value.dmDisplayFrequency, (int)mode.Value.dmDisplayOrientation);
+                try
+                {
+                    var refresh = ResolveImplicitVirtualRefreshRate(item, current, GetModes(item.GdiName, current.Width, current.Height));
+                    if (refresh is { } hz)
+                    {
+                        implicitRefreshRates[item.GdiName] = hz;
+                        result.Messages.Add($"{item.GdiName}: 当前 {current.RefreshRate}Hz 未发布，摆放时使用 {hz}Hz");
+                    }
+                }
+                catch (InvalidOperationException ex)
+                {
+                    result.Success = false;
+                    result.Messages.Add("拒绝应用显示布局: " + ex.Message);
+                    return result;
+                }
+            }
         }
         // 模式读取期间也可能发生热插拔；在暂存前再次核对设备身份。
         error = ValidateLayoutTargets(list, Enumerate());
@@ -463,6 +502,11 @@ public static unsafe class DisplayManager
                 {
                     dm.dmDisplayFrequency = (uint)item.RefreshRate.Value;
                     dm.dmFields |= DM_DISPLAYFREQUENCY;
+                }
+                else if (implicitRefreshRates.TryGetValue(item.GdiName, out var hz))
+                {
+                    dm.dmDisplayFrequency = (uint)hz;
+                    dm.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_DISPLAYORIENTATION;
                 }
                 if (item.Orientation.HasValue)
                 {
