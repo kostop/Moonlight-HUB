@@ -40,6 +40,7 @@ public sealed class PointerSpeedManager : IDisposable
     private long _logPos = -1;
     private string _logPath = string.Empty;
     private string? _remoteScreen;
+    private int? _corePid;
     private int _applied;
 
     public PointerSpeedManager(HubSettings settings, DeskflowManager deskflow)
@@ -219,22 +220,33 @@ public sealed class PointerSpeedManager : IDisposable
         _displays.Any(d => d.IsParsec && d.GdiName.Equals(device, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
-    /// The Deskflow server logs every switch ("switch from "A" to "B""); while B is another computer the cursor there is
-    /// driven by this computer's pointer speed, so that screen's speed applies.
+    /// Tracks normal switches and the forced jump home when a Deskflow client disconnects.
+    /// A disconnected peer must never keep overriding the local monitor's pointer speed.
     /// </summary>
     private void FollowDeskflow()
     {
         if (_deskflow.Status.RunningRole != DeskflowRole.Server)
         {
             _remoteScreen = null;
+            _corePid = null;
             _logPos = -1;
             return;
         }
+        if (_corePid != _deskflow.Status.CorePid)
+        {
+            _corePid = _deskflow.Status.CorePid;
+            _remoteScreen = null;
+        }
         var path = _deskflow.Host.CoreLogPath;
-        if (path != _logPath) { _logPath = path; _logPos = -1; }
+        if (path != _logPath) { _logPath = path; _logPos = -1; _remoteScreen = null; }
         var info = new FileInfo(path);
-        if (!info.Exists) return;
-        if (_logPos < 0 || info.Length < _logPos) { _logPos = info.Length; return; } // start at the end; log was rotated
+        if (!info.Exists) { _remoteScreen = null; _logPos = -1; return; }
+        if (_logPos < 0 || info.Length < _logPos)
+        {
+            _remoteScreen = null;
+            _logPos = info.Length;
+            return; // start at the end; log was rotated
+        }
         if (info.Length == _logPos) return;
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         stream.Seek(_logPos, SeekOrigin.Begin);
@@ -244,15 +256,38 @@ public sealed class PointerSpeedManager : IDisposable
         var lastNewline = text.LastIndexOf('\n');
         if (lastNewline < 0) return; // wait for the whole line
         _logPos += Encoding.UTF8.GetByteCount(text[..(lastNewline + 1)]);
-        foreach (Match m in SwitchPattern.Matches(text[..(lastNewline + 1)]))
-        {
-            var to = m.Groups[1].Value;
-            _remoteScreen = to.Equals(_deskflow.LocalScreenName, StringComparison.OrdinalIgnoreCase) ? null : to;
-        }
-        if (text.Contains("started server", StringComparison.OrdinalIgnoreCase)) _remoteScreen = null;
+        _remoteScreen = FollowDeskflowLog(_remoteScreen, _deskflow.LocalScreenName, text[..(lastNewline + 1)]);
     }
 
-    private static readonly Regex SwitchPattern = new(@"switch from ""[^""]*"" to ""([^""]+)""", RegexOptions.Compiled);
+    /// <param name="remoteScreen">当前远端屏幕；null 表示鼠标在本机。</param>
+    /// <param name="localScreen">本机的 Deskflow 屏幕名称。</param>
+    /// <param name="text">已经完整读取的日志行，按事件发生顺序处理。</param>
+    private static string? FollowDeskflowLog(string? remoteScreen, string localScreen, string text)
+    {
+        foreach (var line in text.Split('\n'))
+        {
+            var move = SwitchPattern.Match(line);
+            if (move.Success)
+            {
+                var to = move.Groups[1].Value;
+                remoteScreen = to.Equals(localScreen, StringComparison.OrdinalIgnoreCase) ? null : to;
+                continue;
+            }
+            if (line.Contains("started server", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("stopped server", StringComparison.OrdinalIgnoreCase))
+            {
+                remoteScreen = null;
+                continue;
+            }
+            var disconnected = DisconnectPattern.Match(line);
+            if (disconnected.Success && disconnected.Groups["screen"].Value.Equals(remoteScreen, StringComparison.OrdinalIgnoreCase))
+                remoteScreen = null;
+        }
+        return remoteScreen;
+    }
+
+    private static readonly Regex SwitchPattern = new(@"(?:switch|jump) from ""[^""]*"" to ""([^""]+)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex DisconnectPattern = new(@"(?:client ""(?<screen>[^""]+)"" (?:has disconnected|is dead)|(?:disconnecting client|forced disconnection of client) ""(?<screen>[^""]+)"")", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static int ReadBaseline()
     {
