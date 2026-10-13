@@ -173,6 +173,8 @@ public sealed class Watchdog : IDisposable
         }
 
         var health = _engine.CheckHealth();
+        foreach (var virtualDisplay in profile.VirtualDisplays.Where(v => v.WindowsScalePercent > 0))
+            _engine.RestoreVirtualDpiAsync(virtualDisplay.Slot).GetAwaiter().GetResult();
         var needRepair = false;
         // Windows re-enumerates everything during a monitor hot-plug (DisplayPort link retrain, KVM switch, remote
         // desktop tools): for a few seconds the virtual display may be missing although the driver still has it.
@@ -621,11 +623,13 @@ public sealed class Watchdog : IDisposable
             }
             if (!d.Active) return false;
             // resolution: the profile value or the client-derived one
-            var okResolution = d.Width == spec.Width && d.Height == spec.Height;
+            var (expectedWidth, expectedHeight) = _engine.TargetResolution(profile, spec, d);
+            var okResolution = d.Width == expectedWidth && d.Height == expectedHeight;
             if (!okResolution && profile.AutoMatchClientResolution && spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var cm))
             {
                 var (hw, hh) = _engine.HostResolutionFor(spec.InstanceId, cm);
-                okResolution = d.Width == hw && d.Height == hh;
+                var expected = (Width: hw, Height: hh);
+                okResolution = d.Width == expected.Width && d.Height == expected.Height;
             }
             if (!okResolution) return false;
             // refresh rate: accept the profile value, the compose override, or the rate the client asked for

@@ -42,6 +42,7 @@ public sealed class PointerSpeedManager : IDisposable
     private string? _remoteScreen;
     private int? _corePid;
     private int _applied;
+    private double _referenceScale = 1.0;
 
     public PointerSpeedManager(HubSettings settings, DeskflowManager deskflow)
     {
@@ -117,7 +118,17 @@ public sealed class PointerSpeedManager : IDisposable
         {
             if (_remoteScreen != null)
             {
-                screen = _peers.FirstOrDefault(p => p.Label.Equals(_remoteScreen, StringComparison.OrdinalIgnoreCase));
+                var index = _peers.FindIndex(p => p.Label.Equals(_remoteScreen, StringComparison.OrdinalIgnoreCase));
+                screen = index >= 0 ? _peers[index] : null;
+                var peer = _deskflow.PeerHub;
+                if (screen != null && peer != null && peer.Screen.Equals(_remoteScreen, StringComparison.OrdinalIgnoreCase)
+                    && peer.DpiScale > 0 && Math.Abs(screen.Scale - peer.DpiScale) > 0.001)
+                {
+                    // 对端光标换屏后立即跟随真实 DPI；保留用户已经选择的手动速度。
+                    screen = screen with { Scale = peer.DpiScale,
+                        AutoSpeed = Closest(Multipliers[Math.Clamp(Baseline, 1, 20)] * peer.DpiScale / _referenceScale) };
+                    _peers[index] = screen;
+                }
                 key = screen?.Key ?? "peer:" + _remoteScreen;
             }
             else
@@ -193,6 +204,7 @@ public sealed class PointerSpeedManager : IDisposable
 
         lock (_gate)
         {
+            _referenceScale = reference;
             _monitors = list;
             _peers = peers;
         }
@@ -320,7 +332,43 @@ public sealed class PointerSpeedManager : IDisposable
     /// <summary>Sets the pointer speed for this session only (no SPIF_UPDATEINIFILE: the user's saved setting stays).</summary>
     private static bool SetSpeed(int speed) => SystemParametersInfo(SPI_SETMOUSESPEED, 0, new IntPtr(Math.Clamp(speed, 1, 20)), 0);
 
-    /// <summary>Display scale of the primary monitor (reported to the other hub, which drives this screen through Deskflow).</summary>
+    /// <summary>直接读取当前激活显示器的 Windows 缩放，不使用鼠标速度缓存。</summary>
+    /// <param name="gdiName">目标显示器的 GDI 名称，例如 \\.\DISPLAY1。</param>
+    /// <returns>Windows 缩放百分比；显示器未激活、未找到或读取失败时返回 0。</returns>
+    public static int GetWindowsScalePercent(string gdiName)
+    {
+        if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(gdiName)) return 0;
+        var percent = 0;
+        try
+        {
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (monitor, _, _, _) =>
+            {
+                var info = new MONITORINFOEX { cbSize = Marshal.SizeOf<MONITORINFOEX>() };
+                if (!GetMonitorInfo(monitor, ref info) || !info.szDevice.Equals(gdiName, StringComparison.OrdinalIgnoreCase)) return true;
+                if (GetDpiForMonitor(monitor, 0, out var dpi, out _) == 0 && dpi > 0)
+                    percent = (int)Math.Round(dpi * 100.0 / 96);
+                return false;
+            }, IntPtr.Zero);
+        }
+        catch { return 0; }
+        return percent;
+    }
+
+    /// <summary>读取光标所在活动显示器的真实 DPI；不依赖自动鼠标速度是否启用。</summary>
+    /// <returns>DPI 相对于 96 的倍率；非 Windows、光标不可读取或没有活动显示器时返回 0。</returns>
+    public static double CurrentCursorScale()
+    {
+        if (!OperatingSystem.IsWindows()) return 0;
+        try
+        {
+            if (!GetCursorPos(out var point)) return 0;
+            var monitor = MonitorFromPoint(point, 0 /* MONITOR_DEFAULTTONULL */);
+            return monitor != IntPtr.Zero && GetDpiForMonitor(monitor, 0, out var dpi, out _) == 0 && dpi > 0 ? dpi / 96.0 : 0;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>主显示器的 DPI 倍率，光标所在显示器无法读取时可作为回退。</summary>
     public static double PrimaryScale()
     {
         if (!OperatingSystem.IsWindows()) return 0;

@@ -24,6 +24,14 @@ public sealed class VirtualDisplaySpec
     public int Width { get; set; } = 2000;
     public int Height { get; set; } = 1200;
     public int RefreshRate { get; set; } = 60;
+    /// <summary>额外画面缩放，100 表示原始大小；独立于 Windows 的 DPI 档位。</summary>
+    public int ContentScalePercent { get; set; } = 100;
+    /// <summary>单块副屏的真实 Windows DPI 百分比；0 保持系统现有值，分辨率不随该值变化。</summary>
+    public int WindowsScalePercent { get; set; }
+    /// <summary>原始输出模式的 Windows 缩放基准，首次应用额外缩放时校准。</summary>
+    public int ContentScaleBaseDpiPercent { get; set; }
+    /// <summary>最近一次激活该虚拟屏时测得的 Windows 缩放，供待机模式使用。</summary>
+    public int ContentScaleCurrentDpiPercent { get; set; }
     public Placement Placement { get; set; } = Placement.Right;
     public int? X { get; set; }
     public int? Y { get; set; }
@@ -343,6 +351,8 @@ public sealed class HubState
     public Dictionary<int, int> LastClientFps { get; set; } = new();
     /// <summary>Last stream mode (client-side WxH@fps) requested per instance id.</summary>
     public Dictionary<int, ClientMode> LastClientMode { get; set; } = new();
+    /// <summary>Hub 为画面缩放创建的模式；只更新仍与该记录一致的注册表项。</summary>
+    public Dictionary<int, ParsecCustomMode> ContentScaleModes { get; set; } = new();
     /// <summary>Display-device options written to each instance's config by the last apply.</summary>
     public Dictionary<int, DdOptions> InstanceDd { get; set; } = new();
     /// <summary>Virtual display slots whose driver mode table changed while a client was streaming; re-plugged once idle.</summary>

@@ -9,6 +9,9 @@ internal static class Program
     private static readonly MethodInfo ValidateMethod = typeof(DisplayManager).GetMethod(
         "ValidateLayoutTargets", BindingFlags.Static | BindingFlags.NonPublic)
         ?? throw new InvalidOperationException("找不到显示目标校验方法");
+    private static readonly MethodInfo ImplicitRefreshMethod = typeof(DisplayManager).GetMethod(
+        "ResolveImplicitVirtualRefreshRate", BindingFlags.Static | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("找不到虚拟屏隐式刷新率校验方法");
     private static int _nativeCalls;
 
     private static int Main()
@@ -30,10 +33,18 @@ internal static class Program
             ("用户明确选择的物理屏允许调整", ExplicitPhysicalDisplay),
             ("设备名称大小写变化不影响匹配", CaseInsensitiveIdentity),
             ("空 GDI 查询不会落到默认主屏", EmptyNameQueries),
-            ("空布局不调用系统接口", EmptyLayout)
+            ("空布局不调用系统接口", EmptyLayout),
+            ("虚拟屏摆放把失效 60Hz 修正为已发布 120Hz", UnsupportedVirtualRefresh),
+            ("虚拟屏当前刷新率已发布时保持不变", SupportedVirtualRefresh),
+            ("物理屏摆放不自动调整刷新率", PhysicalRefreshUnchanged),
+            ("明确请求的虚拟屏刷新率不被替换", ExplicitRefreshUnchanged),
+            ("隐式修正不改变分辨率或旋转方向", ImplicitRefreshUsesSameMode),
+            ("无匹配模式时拒绝隐式刷新率修正", MissingImplicitRefresh)
         };
         ProfileSafetyTests.AddTo(tests);
         PointerSpeedTests.AddTo(tests);
+        DisplayDpiTests.AddTo(tests);
+        SharedLayoutTests.AddTo(tests);
 
         var failed = 0;
         foreach (var (name, run) in tests)
@@ -158,6 +169,62 @@ internal static class Program
     {
         Assert(DisplayManager.ApplyLayout([]).Success, "空布局应直接完成");
     }
+
+    private static void UnsupportedVirtualRefresh()
+    {
+        var current = new DisplayMode(1094, 504, 60, 0);
+        var item = new LayoutItem(VirtualDisplay()) { X = 2000, Y = 0 };
+        Assert(ImplicitRefresh(item, current, [current with { RefreshRate = 144 }, current with { RefreshRate = 120 }]) == 120,
+            "摆放操作仍继承驱动未发布的 60Hz");
+        Assert(item.RefreshRate == null && item.Width == null && item.Height == null, "刷新率修正不应改写用户的布局项");
+    }
+
+    private static void SupportedVirtualRefresh()
+    {
+        var current = new DisplayMode(1094, 504, 60, 0);
+        Assert(ImplicitRefresh(new LayoutItem(VirtualDisplay()), current, [current, current with { RefreshRate = 120 }]) == null,
+            "已发布的当前刷新率不应被改变");
+    }
+
+    private static void PhysicalRefreshUnchanged()
+    {
+        Assert(ImplicitRefresh(new LayoutItem(PhysicalDisplay()), new DisplayMode(2560, 1600, 60, 0), []) == null,
+            "物理屏不应执行虚拟屏刷新率修正");
+    }
+
+    private static void ExplicitRefreshUnchanged()
+    {
+        var item = new LayoutItem(VirtualDisplay()) { RefreshRate = 60 };
+        Assert(ImplicitRefresh(item, new DisplayMode(1094, 504, 60, 0), [new(1094, 504, 120, 0)]) == null,
+            "用户明确请求的 60Hz 不应被自动替换");
+        Assert(item.RefreshRate == 60, "明确设置被改写");
+    }
+
+    private static void ImplicitRefreshUsesSameMode()
+    {
+        var current = new DisplayMode(1094, 504, 60, 0);
+        var published = new List<DisplayMode> { new(1920, 1080, 60, 0), new(1094, 504, 60, 1), new(1094, 504, 120, 0) };
+        Assert(ImplicitRefresh(new LayoutItem(VirtualDisplay()), current, published) == 120,
+            "隐式刷新率必须来自相同分辨率和旋转方向");
+        Assert(ImplicitRefresh(new LayoutItem(VirtualDisplay()) { Width = 1920, Height = 1080 }, current, []) == null,
+            "明确改变分辨率的请求不应套用旧分辨率的刷新率");
+    }
+
+    private static void MissingImplicitRefresh()
+    {
+        try
+        {
+            ImplicitRefresh(new LayoutItem(VirtualDisplay()), new DisplayMode(1094, 504, 60, 0), [new(1920, 1080, 120, 0)]);
+        }
+        catch (TargetInvocationException ex) when (ex.InnerException is InvalidOperationException) { return; }
+        throw new InvalidOperationException("没有匹配当前分辨率的已发布模式时必须停止应用");
+    }
+
+    /// <param name="item">模拟的摆放请求，测试不会改写显示设置。</param>
+    /// <param name="current">模拟的 Windows 当前模式。</param>
+    /// <param name="published">模拟的驱动模式表。</param>
+    private static int? ImplicitRefresh(LayoutItem item, DisplayMode current, IReadOnlyList<DisplayMode> published)
+        => (int?)ImplicitRefreshMethod.Invoke(null, [item, current, published]);
 
     private static DisplayInfo VirtualDisplay() => new()
     {

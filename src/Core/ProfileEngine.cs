@@ -21,6 +21,7 @@ public sealed class ProfileEngine
     private readonly ParsecVdd _vdd;
     private readonly SunshineInstanceManager _instances;
     private readonly SemaphoreSlim _busy = new(1, 1);
+    private readonly SemaphoreSlim _contentScaleChanges = new(1, 1);
 
     public ProfileEngine(HubSettings settings, HubState state, ParsecVdd vdd, SunshineInstanceManager instances)
     {
@@ -60,6 +61,10 @@ public sealed class ProfileEngine
 
     /// <summary>Resolution for a virtual display: the client's requested size (if that mode exists on the display) else the profile value.</summary>
     private (int Width, int Height) ResolveResolution(Profile profile, VirtualDisplaySpec spec, string? gdiName)
+        => ResolveOutputResolution(profile, spec, gdiName);
+
+    /// <summary>串流输出尺寸与渲染尺寸分开，重连不会把自定义画面大小覆盖。</summary>
+    private (int Width, int Height) ResolveOutputResolution(Profile profile, VirtualDisplaySpec spec, string? gdiName)
     {
         if (profile.AutoMatchClientResolution && spec.InstanceId > 0 && _state.LastClientMode.TryGetValue(spec.InstanceId, out var mode) && mode.Width > 0 && mode.Height > 0)
         {
@@ -68,6 +73,12 @@ public sealed class ProfileEngine
         }
         return (spec.Width, spec.Height);
     }
+
+    /// <param name="profile">正在应用的方案。</param>
+    /// <param name="spec">独立虚拟屏设置。</param>
+    /// <param name="display">当前显示器快照，可为空。</param>
+    public (int Width, int Height) TargetResolution(Profile profile, VirtualDisplaySpec spec, DisplayInfo? display)
+        => ResolveResolution(profile, spec, display?.GdiName);
 
     /// <summary>
     /// Target refresh rate for a virtual display. The profile value is the floor, "follow client fps" raises it to the
@@ -246,6 +257,13 @@ public sealed class ProfileEngine
     {
         if (!profile.IdleOff || profile.Mode is ProfileMode.Clone or ProfileMode.MainOnly) return DdOptions.Disabled;
         var (w, h) = ResolveResolution(profile, spec, gdiName);
+        // 新模式尚未发布时继续使用已发布的输出尺寸，避免 Sunshine 回退到物理主屏。
+        if (spec.ContentScalePercent != 100 && !string.IsNullOrEmpty(gdiName) &&
+            !DisplayManager.GetModes(gdiName, w, h).Any(m => m.Orientation == 0))
+        {
+            var current = DisplayManager.Enumerate().FirstOrDefault(d => d.GdiName == gdiName && d.IsParsec && d.IsReady);
+            (w, h) = current != null ? (current.Width, current.Height) : ResolveOutputResolution(profile, spec, gdiName);
+        }
         var hz = ResolveHz(profile, spec, gdiName, w, h);
         // "automatic" makes Sunshine ask the driver for the client's fps itself; that is only safe when the rate we
         // resolved is exactly that fps (the mode exists and nothing raises it). Otherwise pin the resolved rate so the
@@ -412,20 +430,34 @@ public sealed class ProfileEngine
                     result.Success = false;
                     return result;
                 }
+                var (mw, mh) = ResolveResolution(profile, spec, d.GdiName);
+                var wanted = ExplicitHz(profile, spec);
+                // 待机副屏同样要先登记新渲染模式，再重新创建，让下次连接即可生效。
+                if (!DisplayManager.HasMode(d.GdiName, mw, mh, wanted) && !ParsecModes.RegisteredRates(mw, mh).Contains(wanted))
+                {
+                    var (ok, msg) = EnsureContentScaleMode(profile, spec, mw, mh, wanted);
+                    Step(result, (ok ? "✓ " : "✗ ") + msg);
+                    if (!ok) { result.Success = false; result.Summary = msg; return result; }
+                }
+                if (!d.IsReady && spec.ContentScalePercent != 100 && !DisplayManager.HasMode(d.GdiName, mw, mh, wanted))
+                {
+                    if (IsSpecStreaming(spec)) { RequestReplug(spec.Slot, "画面大小模式已更新"); continue; }
+                    displays = ReplugCore(spec.Slot, result);
+                    d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot) ?? d;
+                }
                 if (!d.IsReady)
                 {
                     displays = DisplayManager.WaitFor(l => l.Any(x => x.IsParsec && x.ParsecSlot == spec.Slot && x.IsReady), TimeSpan.FromSeconds(8));
                     d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot) ?? d;
                 }
                 if (!d.IsReady) continue;
-                var (mw, mh) = ResolveResolution(profile, spec, d.GdiName);
                 // the rate the user asked for must exist in the driver table (client-fps rates are only used when present)
-                var wanted = ExplicitHz(profile, spec);
                 if (!DisplayManager.HasMode(d.GdiName, mw, mh, wanted) && !ParsecModes.RegisteredRates(mw, mh).Contains(wanted))
                 {
                     Step(result, $"虚拟屏 #{spec.Slot + 1} 缺少模式 {mw}x{mh}@{wanted}，注册 Parsec 自定义模式…");
-                    var (ok, msg) = ParsecModes.EnsureRegistered(mw, mh, wanted);
+                    var (ok, msg) = EnsureContentScaleMode(profile, spec, mw, mh, wanted);
                     Step(result, (ok ? "✓ " : "✗ ") + msg);
+                    if (!ok) { result.Success = false; result.Summary = msg; return result; }
                 }
                 var hz = ResolveHz(profile, spec, d.GdiName, mw, mh);
                 if (!NeedsReplug(d, mw, mh)) continue; // the table Windows sees already matches the registry
@@ -508,6 +540,15 @@ public sealed class ProfileEngine
                 result.Summary = "显示布局未能安全应用，已停止更新串流配置，请待屏幕连接稳定后重试";
                 Step(result, "✗ " + result.Summary);
                 return result;
+            }
+
+            foreach (var spec in specs.Where(v => v.WindowsScalePercent > 0))
+            {
+                var target = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == spec.Slot && d.IsReady);
+                if (target == null || PointerSpeedManager.GetWindowsScalePercent(target.GdiName) == spec.WindowsScalePercent) continue;
+                var dpi = DisplayDpiScale.TrySet(target, spec.WindowsScalePercent);
+                Step(result, (dpi.Ok ? "✓ " : "⚠ ") + dpi.Message);
+                if (dpi.Ok) spec.ContentScaleCurrentDpiPercent = spec.WindowsScalePercent;
             }
 
             // ---------------------------------------------------------------- 5. Sunshine instances
@@ -879,6 +920,90 @@ public sealed class ProfileEngine
         return notes.Count == 0 ? "当前没有虚拟屏，新模式会在下次创建虚拟屏时生效" : string.Join("；", notes);
     }
 
+    /// <summary>只复用 Hub 自己创建且未被外部修改的模式，不覆盖用户登记的分辨率。</summary>
+    /// <param name="profile">当前方案，用来保护其它副屏仍在使用的模式。</param>
+    /// <param name="spec">需要缩放的虚拟屏。</param>
+    /// <param name="width">目标渲染宽度。</param>
+    /// <param name="height">目标渲染高度。</param>
+    /// <param name="hz">目标刷新率。</param>
+    private (bool Ok, string Message) EnsureContentScaleMode(Profile profile, VirtualDisplaySpec spec, int width, int height, int hz)
+    {
+        if (spec.ContentScalePercent == 100) return ParsecModes.EnsureRegistered(width, height, hz);
+        var existing = ParsecModes.Read();
+        if (existing.Any(m => m.Width == width && m.Height == height && m.Hz == hz)) return (true, "模式已存在");
+        _state.ContentScaleModes.TryGetValue(spec.Slot, out var owned);
+        var shared = owned != null && profile.VirtualDisplays.Any(v => v.Slot != spec.Slot &&
+            ResolveResolution(profile, v, null) == (owned.Width, owned.Height));
+        if (owned != null && existing.Contains(owned) && !shared)
+        {
+            var update = ParsecModes.Update(owned.Index, width, height, hz);
+            if (update.Ok) { _state.ContentScaleModes[spec.Slot] = new(owned.Index, width, height, hz); _state.Save(); }
+            return update;
+        }
+        var created = ParsecModes.EnsureRegistered(width, height, hz);
+        if (created.Ok)
+        {
+            var fresh = ParsecModes.Read().FirstOrDefault(m => m.Width == width && m.Height == height && m.Hz == hz &&
+                existing.All(old => old.Index != m.Index));
+            if (fresh != null) { _state.ContentScaleModes[spec.Slot] = fresh; _state.Save(); }
+        }
+        return created;
+    }
+
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="percent">只修改这块副屏的真实 DPI 百分比。</param>
+    public async Task<(bool Ok, string Message)> SetVirtualContentScaleAsync(int slot, int percent)
+    {
+        if (!await _contentScaleChanges.WaitAsync(0).ConfigureAwait(false)) return (false, "正在调整画面大小，请稍候");
+        try { return await SetVirtualContentScaleCoreAsync(slot, percent).ConfigureAwait(false); }
+        finally { _contentScaleChanges.Release(); }
+    }
+
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="percent">这块副屏的真实 Windows DPI 百分比，保持像素分辨率。</param>
+    private async Task<(bool Ok, string Message)> SetVirtualContentScaleCoreAsync(int slot, int percent)
+    {
+        if (!await _busy.WaitAsync(0).ConfigureAwait(false)) return (false, "另一个显示操作正在进行，请稍候");
+        try
+        {
+            var profile = _settings.Profile(_state.ActiveProfileId);
+            var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+            if (profile == null || spec == null) return (false, "当前方案没有这块虚拟屏");
+            if (profile.Mode is ProfileMode.Clone or ProfileMode.MainOnly) return (false, "真实缩放需要独立的副屏");
+            var displays = DisplayManager.Enumerate();
+            var display = displays.FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot && d.IsReady);
+            if (display == null) return (false, "连接这块副屏后可调整真实缩放比例");
+            var error = DisplayManager.ValidateLayoutTargets([new LayoutItem(display)], displays);
+            if (error != null) return (false, error);
+            var changed = await Task.Run(() => DisplayDpiScale.TrySet(display, percent)).ConfigureAwait(false);
+            if (!changed.Ok) return changed;
+            spec.WindowsScalePercent = percent;
+            spec.ContentScaleCurrentDpiPercent = percent;
+            spec.ContentScalePercent = 100;
+            _settings.Save();
+            ClearPendingReplug(slot);
+            return changed;
+        }
+        catch (Exception ex) { Log.Error("设置虚拟屏真实 DPI 失败", ex); return (false, ex.Message); }
+        finally
+        {
+            CurrentStep = string.Empty;
+            _busy.Release();
+            try { Applied?.Invoke(); } catch { }
+        }
+    }
+
+    /// <param name="slot">需要恢复已保存 DPI 的虚拟屏槽位。</param>
+    public async Task RestoreVirtualDpiAsync(int slot)
+    {
+        var spec = _settings.Profile(_state.ActiveProfileId)?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+        if (spec?.WindowsScalePercent is not > 0) return;
+        var display = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot && d.IsReady);
+        if (display == null || PointerSpeedManager.GetWindowsScalePercent(display.GdiName) == spec.WindowsScalePercent) return;
+        var applied = await SetVirtualContentScaleAsync(slot, spec.WindowsScalePercent).ConfigureAwait(false);
+        if (!applied.Ok) Log.Warn("恢复副屏 DPI: " + applied.Message);
+    }
+
     /// <summary>The user picked a refresh rate for a virtual display: store it in the active profile and apply it.</summary>
     public async Task<(bool Ok, string Message)> SetVirtualDisplayRateAsync(int slot, int hz)
     {
@@ -975,8 +1100,11 @@ public sealed class ProfileEngine
             if (d == null) continue;
             var (rw, rh) = ResolveResolution(profile, spec, d.GdiName);
             var hz = ResolveHz(profile, spec, d.GdiName, rw, rh);
-            var mode = PickMode(d.GdiName, rw, rh, hz, result, spec.Slot);
-            var (x, y) = anchor.HasValue ? PlaceRelative(spec, anchor.Value, cursorX, belowY) : (cursorX, 0);
+            var mode = PendingOrTargetMode(d, rw, rh, hz, result, spec);
+            var placement = spec.Clone();
+            placement.Width = mode.Width;
+            placement.Height = mode.Height;
+            var (x, y) = anchor.HasValue ? PlaceRelative(placement, anchor.Value, cursorX, belowY) : (cursorX, 0);
             if (spec.Placement == Placement.Custom && spec.X.HasValue && spec.Y.HasValue)
             {
                 // a remembered position that overlaps a physical display is a snapshot taken mid hot-plug: drop it
@@ -988,7 +1116,7 @@ public sealed class ProfileEngine
                     spec.X = null;
                     spec.Y = null;
                     _settings.Save();
-                    (x, y) = anchor.HasValue ? PlaceRelative(spec, anchor.Value, cursorX, belowY) : (cursorX, 0);
+                    (x, y) = anchor.HasValue ? PlaceRelative(placement, anchor.Value, cursorX, belowY) : (cursorX, 0);
                 }
                 else
                 {
@@ -1038,6 +1166,25 @@ public sealed class ProfileEngine
         }
     }
 
+    /// <param name="display">当前虚拟屏的真实模式。</param>
+    /// <param name="width">所需渲染宽度。</param>
+    /// <param name="height">所需渲染高度。</param>
+    /// <param name="hz">所需刷新率。</param>
+    /// <param name="result">方案执行日志。</param>
+    /// <param name="spec">用于检查待生效模式的虚拟屏设置。</param>
+    private DisplayMode PendingOrTargetMode(DisplayInfo display, int width, int height, int hz, ApplyResult result, VirtualDisplaySpec spec)
+    {
+        if (display.IsReady && IsReplugPending(spec.Slot) && IsSpecStreaming(spec)
+            && !DisplayManager.HasMode(display.GdiName, width, height, hz))
+        {
+            Step(result, $"虚拟屏 #{spec.Slot + 1} 的新模式待生效，保持当前 {display.ModeText}");
+            var current = DisplayManager.GetModes(display.GdiName, display.Width, display.Height)
+                .OrderBy(m => Math.Abs(m.RefreshRate - display.RefreshRate)).FirstOrDefault();
+            return current ?? new DisplayMode(display.Width, display.Height, display.RefreshRate, display.Orientation);
+        }
+        return PickMode(display.GdiName, width, height, hz, result, spec.Slot);
+    }
+
     private static DisplayMode PickMode(string gdi, int width, int height, int hz, ApplyResult result, int slot)
     {
         var modes = DisplayManager.GetModes(gdi, width, height).Where(m => m.Orientation == 0).ToList();
@@ -1055,7 +1202,7 @@ public sealed class ProfileEngine
     {
         var (rw, rh) = ResolveResolution(profile, spec, parsec.GdiName);
         var hz = ResolveHz(profile, spec, parsec.GdiName, rw, rh);
-        var mode = PickMode(parsec.GdiName, rw, rh, hz, result, spec.Slot);
+        var mode = PendingOrTargetMode(parsec, rw, rh, hz, result, spec);
 
         // 1) mode first, while the display is still part of the extended desktop
         var pre = DisplayManager.ApplyLayout(new[]

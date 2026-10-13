@@ -178,7 +178,9 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
     {
         try
         {
-            using var p = Process.Start(new ProcessStartInfo(exe, arguments) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(exe) ?? string.Empty });
+            var start = new ProcessStartInfo(exe, arguments) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(exe) ?? string.Empty };
+            start.Environment["DESKFLOW_MONITOR_TOPOLOGY"] = SharedDisplayLayout.TopologyPath;
+            using var p = Process.Start(start);
             return p?.Id ?? 0;
         }
         catch (Exception ex)

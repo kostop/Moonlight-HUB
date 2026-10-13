@@ -71,6 +71,19 @@ public static class Cli
                     P($"{name,-14} flags=0x{flags:X8} {desc}");
                 return 0;
 
+            case "dpi-probe":
+                if (rest.Count == 0 || !int.TryParse(rest[0], out var dpiSlot)) return 1;
+                var dpiDisplay = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == dpiSlot && d.IsReady);
+                if (dpiDisplay == null) { P("Target virtual display is inactive"); return 1; }
+                var dpiInfo = DisplayDpiScale.Read(dpiDisplay);
+                P($"slot={dpiSlot} native={dpiDisplay.Width}x{dpiDisplay.Height} min={dpiInfo.Minimum} current={dpiInfo.Current} max={dpiInfo.Maximum} recommendedIndex={dpiInfo.RecommendedIndex} offset={dpiInfo.CurrentOffset}");
+                if (rest.Count > 1 && int.TryParse(rest[1], out var dpiPercent))
+                {
+                    var changed = DisplayDpiScale.TrySet(dpiDisplay, dpiPercent);
+                    P(changed.Message); return changed.Ok ? 0 : 1;
+                }
+                return 0;
+
             case "modes":
                 if (rest.Count == 0)
                 {
@@ -303,6 +316,12 @@ public static class Cli
                     return 2;
                 }
 
+            case "scale":
+                if (rest.Count != 2 || !int.TryParse(rest[0], out var screen) || !int.TryParse(rest[1], out var percent) || screen < 1)
+                { P("用法: scale <副屏编号，从1开始> <真实 DPI 百分比，例如125、150、200>"); return 2; }
+                var scaleReply = PeerLink.RequestContentScaleAsync("127.0.0.1", screen - 1, percent).GetAwaiter().GetResult();
+                P(scaleReply.Message);
+                return scaleReply.Ok ? 0 : 2;
             case "deskflow":
                 return DeskflowCommand(hub, rest);
 
@@ -534,6 +553,7 @@ public static class Cli
         P("  vdd status | vdd add [--hold 秒] | vdd remove <槽位> | vdd removeall | vdd hold --hold 秒");
         P("  modes | modes add WxH@Hz | modes list \\\\.\\DISPLAYn");
         P("  apply <方案id> [--hold 秒]");
+        P("  scale <副屏编号，从1开始> <真实 DPI 百分比>");
         P("  instances | start <id> | stop <id> | restart <id> | config <id> [output_id] | serverinfo <id>");
         P("  creds <id> <用户> <密码> | auth-test <id> | pair <id> <PIN> [名称] | clients <id>");
         P("  takeover | restore | autostart [on|off] | topology extend|clone|internal|external");

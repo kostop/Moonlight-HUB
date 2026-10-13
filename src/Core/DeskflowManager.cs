@@ -174,6 +174,10 @@ public sealed class DeskflowManager : IDisposable
     public DeskflowStatus Status { get; private set; } = new();
     /// <summary>Last shared layout fetched from the layout service (null until the first successful fetch).</summary>
     public DeskflowLayoutSnapshot? Layout { get; private set; }
+    public SharedDisplayDocument? SharedDisplays { get; private set; }
+    public string SharedDisplayServerHost => Settings.Role == DeskflowRole.Server ? "127.0.0.1" : Settings.RemoteHost;
+    private DateTime _lastSharedDisplayUtc;
+    private int _sharedDisplayFetching;
     public string LayoutError { get; private set; } = string.Empty;
     /// <summary>Last answer of the other computer's hub (null when unknown or unreachable).</summary>
     public PeerHubInfo? PeerHub { get; private set; }
@@ -592,8 +596,9 @@ public sealed class DeskflowManager : IDisposable
             ReloadSettingsIfChanged();
             var s = Settings;
             var st = Refresh();
+            if (OperatingSystem.IsWindows() && (DateTime.UtcNow - _lastSharedDisplayUtc).TotalSeconds > 3) _ = RefreshSharedDisplaysAsync();
             if ((DateTime.UtcNow - _lastLayoutFetchUtc) > TimeSpan.FromSeconds(15)) _ = RefreshLayoutAsync();
-            if ((DateTime.UtcNow - _lastPeerStatusUtc) > TimeSpan.FromSeconds(15)) _ = RefreshPeerHubAsync();
+            if ((DateTime.UtcNow - _lastPeerStatusUtc) > TimeSpan.FromSeconds(1)) _ = RefreshPeerHubAsync();
             if (!s.Managed || IsSwitching || !st.Installed) return;
 
             if (!s.LegacyTakenOver && !_takeOverAttempted)
@@ -738,6 +743,19 @@ public sealed class DeskflowManager : IDisposable
     // ------------------------------------------------------------------ shared layout and peer hub
 
     /// <summary>Server address of the shared layout service as seen from this computer.</summary>
+    public async Task RefreshSharedDisplaysAsync()
+    {
+        if (Interlocked.Exchange(ref _sharedDisplayFetching, 1) == 1) return;
+        try
+        {
+            _lastSharedDisplayUtc = DateTime.UtcNow;
+            SharedDisplays = await PeerLink.GetSharedDisplaysAsync(SharedDisplayServerHost).ConfigureAwait(false);
+            SharedDisplayLayout.CacheDocument(SharedDisplays);
+        }
+        catch (Exception ex) { Log.Debug("共享显示器布局: " + ex.Message); }
+        finally { Interlocked.Exchange(ref _sharedDisplayFetching, 0); }
+    }
+
     public string LayoutHost => _host.LayoutHost(Settings.RemoteHost);
 
     /// <summary>Fetches the shared screen layout from the layout service so the display views can draw it.</summary>

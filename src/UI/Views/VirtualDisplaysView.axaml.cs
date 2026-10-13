@@ -1,5 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -54,7 +55,9 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
             _lastEnumerate = DateTime.UtcNow;
             try { _displays = DisplayManager.Enumerate().Where(d => d.IsParsec).OrderBy(d => d.ParsecSlot).ToList(); } catch { }
         }
-        var sig = string.Join("|", _displays.Select(d => d.ToString()));
+        var profile = Hub.ActiveProfile;
+        var sig = string.Join("|", _displays.Select(d => d.ToString())) + "#" + profile?.Id + "#" +
+            string.Join(",", profile?.VirtualDisplays.Select(v => $"{v.Slot}:{v.ContentScalePercent}") ?? Enumerable.Empty<string>());
         if (sig != _signature)
         {
             _signature = sig;
@@ -80,6 +83,12 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
                 info.Children.Add(new TextBlock { Text = "Sunshine ID " + d.SunshineDeviceId, Classes = { "mono" }, Foreground = Ui.Res("MutedBrush"), Margin = new Thickness(0, 2, 0, 0) });
                 var mapped = Hub.State.InstanceOutputIds.FirstOrDefault(kv => kv.Value.Equals(d.SunshineDeviceId, StringComparison.OrdinalIgnoreCase));
                 if (mapped.Key > 0) info.Children.Add(Ui.T($"由 Sunshine 实例 {mapped.Key} 串流", "Muted"));
+                var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+                if (spec != null && profile?.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly)
+                {
+                    info.Children.Add(Ui.T($"方案输出 {spec.Width}×{spec.Height} · 真实 DPI 缩放", "Muted"));
+                    if (d.IsReady) info.Children.Add(ContentScaleRow(slot, d));
+                }
                 grid.Children.Add(info);
                 List.Children.Add(Ui.Card(grid, true));
             }
@@ -99,6 +108,40 @@ public partial class VirtualDisplaysView : UserControl, IRefreshable
                 ModesPanel.Children.Add(row);
             }
         }
+    }
+
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="display">保持原生分辨率的活动虚拟屏。</param>
+    private StackPanel ContentScaleRow(int slot, DisplayInfo display)
+    {
+        var dpi = DisplayDpiScale.Read(display);
+        var box = new ComboBox { Width = 110 };
+        foreach (var percent in DisplayDpiScale.Percentages.Where(p => p >= dpi.Minimum && p <= dpi.Maximum)) box.Items.Add(percent);
+        box.SelectedItem = dpi.Current;
+        var apply = Ui.B("应用", (_, _) =>
+        {
+            var requested = box.SelectedItem is int value ? value : dpi.Current;
+            Ui.RunAsync(_window, async () =>
+            {
+                var (ok, message) = await Hub.Engine.SetVirtualContentScaleAsync(slot, requested).ConfigureAwait(false);
+                if (!ok) throw new InvalidOperationException(message);
+                _window.Toast("缩放比例", message);
+                Dispatcher.UIThread.Post(Invalidate);
+            });
+        }, "GhostButton");
+        var reset = Ui.B("100%", (_, _) => { box.SelectedItem = 100; }, "GhostButton");
+        var row = new WrapPanel { Orientation = Orientation.Horizontal };
+        foreach (var control in new Control[] { Ui.T("缩放比例", "Muted"), Ui.Row(box, Ui.T("%", "Muted")), apply, reset })
+        {
+            control.VerticalAlignment = VerticalAlignment.Center;
+            control.Margin = new Thickness(0, 0, 10, 6);
+            row.Children.Add(control);
+        }
+        var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        panel.Children.Add(row);
+        panel.Children.Add(new TextBlock { Text = $"分辨率保持 {display.Width}×{display.Height}，此屏支持 {dpi.Minimum}–{dpi.Maximum}% 的真实 DPI。",
+            Foreground = Ui.Res("MutedBrush"), TextWrapping = Avalonia.Media.TextWrapping.Wrap });
+        return panel;
     }
 
     /// <summary>Registered mode being edited in place (null = none).</summary>

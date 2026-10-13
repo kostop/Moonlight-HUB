@@ -97,6 +97,11 @@ public partial class ProfileEditorWindow : Window
             foreach (var child in row.Children) child.VerticalAlignment = VerticalAlignment.Center;
             row.Margin = new Thickness(0, 4, 0, 4);
             VdPanel.Children.Add(row);
+            var scale = new NumericUpDown { Minimum = 0, Maximum = 500,
+                Increment = 25, Value = vd.WindowsScalePercent, Width = 85, FormatString = "0", ShowButtonSpinner = false };
+            scale.ValueChanged += (_, e) => vd.WindowsScalePercent = (int)(e.NewValue ?? 0);
+            VdPanel.Children.Add(Ui.Row(Ui.T("DPI 缩放", "Muted"), scale, Ui.T("%", "Muted"),
+                Ui.T("0 保持系统当前值；活动副屏可在显示布局中选择其支持的真实比例。", "Muted")));
         }
         if (Result.VirtualDisplays.Count == 0) VdPanel.Children.Add(Ui.T("没有虚拟屏（相当于仅主屏）", "Muted"));
     }
