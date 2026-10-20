@@ -401,10 +401,31 @@ public sealed class ProfileEngine
             {
                 if (!_vdd.Open())
                 {
-                    result.Success = false;
-                    result.Summary = _vdd.LastError ?? "Parsec VDD 打开失败";
-                    Step(result, "✗ " + result.Summary);
-                    return result;
+                    var state = ParsecVdd.QueryDeviceState();
+                    Step(result, $"⚠ Parsec VDD 不可用: {state.Text}，尝试恢复适配器");
+                    if (state.Health == ParsecVdd.DeviceHealth.Missing)
+                    {
+                        result.Success = false;
+                        result.Summary = "Parsec VDD 驱动未安装，请在“虚拟屏”页点击「安装驱动」";
+                        Step(result, "✗ " + result.Summary);
+                        return result;
+                    }
+                    if (!ProcessUtil.IsElevated())
+                    {
+                        result.Success = false;
+                        result.Summary = _vdd.LastError ?? "Parsec VDD 打开失败（需要管理员权限恢复）";
+                        Step(result, "✗ " + result.Summary);
+                        return result;
+                    }
+                    var (driverOk, driverMessage) = ParsecVdd.RestartAdapterAndWait(TimeSpan.FromSeconds(25));
+                    Step(result, (driverOk ? "✓ " : "✗ ") + driverMessage);
+                    if (!driverOk || !_vdd.Open())
+                    {
+                        result.Success = false;
+                        result.Summary = _vdd.LastError ?? driverMessage;
+                        Step(result, "✗ " + result.Summary);
+                        return result;
+                    }
                 }
                 _vdd.PingIntervalMs = _settings.VddPingMs;
                 Step(result, $"Parsec VDD 已连接 (驱动版本 0.{_vdd.Version}), keep-alive 每 {_vdd.PingIntervalMs}ms");
@@ -664,6 +685,24 @@ public sealed class ProfileEngine
             return slots.Count == want && slots.SequenceEqual(Enumerable.Range(0, want));
         }
 
+        // 驱动重启后旧句柄会失效；先重开设备，仍失败再重启适配器。
+        int AddDisplayRecovered()
+        {
+            try { return _vdd.AddDisplay(); }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("Win32 错误 6") ||
+                ex.Message.Contains("Win32 错误 1167") || ex.Message.Contains("Win32 错误 1168") ||
+                ex.Message.Contains("重新打开失败"))
+            {
+                Step(result, "Parsec VDD 句柄失效，重启适配器后重试…");
+                _vdd.Close();
+                var (ok, msg) = ParsecVdd.RestartAdapterAndWait(TimeSpan.FromSeconds(25));
+                Step(result, (ok ? "✓ " : "✗ ") + msg);
+                if (!ok) throw new InvalidOperationException(msg, ex);
+                if (!_vdd.Open()) throw new InvalidOperationException(_vdd.LastError ?? "Parsec VDD 重新打开失败", ex);
+                return _vdd.AddDisplay();
+            }
+        }
+
         if (!SlotsOk(displays))
         {
             if (parsec.Count > want)
@@ -680,7 +719,7 @@ public sealed class ProfileEngine
             for (var i = 0; i < missing; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                var index = _vdd.AddDisplay();
+                var index = AddDisplayRecovered();
                 Step(result, $"已请求添加虚拟屏 (驱动返回槽位 {index})");
                 Thread.Sleep(300);
             }
@@ -693,7 +732,7 @@ public sealed class ProfileEngine
                 DisplayManager.WaitFor(l => !l.Any(d => d.IsParsec), TimeSpan.FromSeconds(12));
                 for (var i = 0; i < want; i++)
                 {
-                    _vdd.AddDisplay();
+                    AddDisplayRecovered();
                     Thread.Sleep(300);
                 }
                 displays = DisplayManager.WaitFor(SlotsOk, TimeSpan.FromSeconds(25));
@@ -749,7 +788,12 @@ public sealed class ProfileEngine
         {
             Step(result, $"插入虚拟屏后 Windows 关闭了 {string.Join("、", off.Select(d => d.Label))}，重新启用");
             var code = DisplayManager.ActivateDisplays(off, displays);
-            if (code != 0) Step(result, $"⚠ 重新启用物理显示器失败 ({code})");
+            if (code != 0)
+            {
+                Step(result, $"⚠ 重新启用物理显示器失败 ({code})，改用扩展拓扑");
+                var extend = DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
+                Step(result, $"扩展拓扑: {extend}");
+            }
             displays = DisplayManager.WaitFor(l => off.All(b => l.Any(d => !d.IsParsec && d.IsReady && Same(d, b))), TimeSpan.FromSeconds(10));
         }
 

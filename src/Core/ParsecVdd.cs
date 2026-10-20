@@ -451,7 +451,7 @@ public sealed unsafe class ParsecVdd : IDisposable
     public int AddDisplay()
     {
         EnsureOpen();
-        var index = IoControl(IoctlAdd, ReadOnlySpan<byte>.Empty);
+        var index = IoControlWithReopen(IoctlAdd, ReadOnlySpan<byte>.Empty);
         Update();
         if (index >= 0 && index < MaxDisplays && !AddedIndices.Contains(index)) AddedIndices.Add(index);
         StateChanged?.Invoke();
@@ -464,7 +464,7 @@ public sealed unsafe class ParsecVdd : IDisposable
         var be = (ushort)(((index & 0xFF) << 8) | ((index >> 8) & 0xFF));
         Span<byte> data = stackalloc byte[2];
         BinaryPrimitives.WriteUInt16LittleEndian(data, be);
-        IoControl(IoctlRemove, data);
+        IoControlWithReopen(IoctlRemove, data);
         Update();
         AddedIndices.Remove(index);
         StateChanged?.Invoke();
@@ -488,6 +488,31 @@ public sealed unsafe class ParsecVdd : IDisposable
     private void EnsureOpen()
     {
         if (!IsOpen) throw new InvalidOperationException("Parsec VDD 设备未打开");
+    }
+
+    /// <summary>关闭并重新打开设备；驱动重启或设备热插拔后旧句柄会失效。</summary>
+    /// <param name="reason">记录到日志的重开原因。</param>
+    public bool Reopen(string reason)
+    {
+        Log.Warn($"Parsec VDD 句柄失效，重新打开设备（{reason}）");
+        Close();
+        return Open();
+    }
+
+    /// <summary>执行会改变显示数量的 IOCTL；遇到失效句柄时重开一次并重试。</summary>
+    /// <param name="code">IOCTL 控制码。</param>
+    /// <param name="input">输入数据。</param>
+    private int IoControlWithReopen(uint code, ReadOnlySpan<byte> input)
+    {
+        try
+        {
+            return IoControl(code, input);
+        }
+        catch (InvalidOperationException ex) when (Faulted)
+        {
+            if (!Reopen(ex.Message)) throw new InvalidOperationException("Parsec VDD 重新打开失败: " + LastError, ex);
+            return IoControl(code, input);
+        }
     }
 
     /// <summary>
@@ -525,6 +550,12 @@ public sealed unsafe class ParsecVdd : IDisposable
                 if (err != NativeMethods.ERROR_IO_PENDING)
                 {
                     completed = true;
+                    // 6/1167/1168：驱动重启或设备接口变化后，旧句柄已经不再属于当前设备。
+                    if (err is 6 or 1167 or 1168)
+                    {
+                        _faulted = true;
+                        LastFaultUtc = DateTime.UtcNow;
+                    }
                     throw new InvalidOperationException($"DeviceIoControl(0x{code:X8}) 失败: Win32 错误 {err}");
                 }
             }
