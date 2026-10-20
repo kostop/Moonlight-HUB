@@ -241,8 +241,7 @@ public sealed class Watchdog : IDisposable
         {
             var spec = _settings.Instance(id);
             if (spec == null || !spec.Enabled) continue;
-            var rt = _instances.Get(spec);
-            if (rt.State != InstanceState.Streaming) continue;
+            if (!_engine.IsInstanceStreaming(id)) continue;
             if (!_state.InstanceOutputIds.TryGetValue(id, out var outputId) || string.IsNullOrEmpty(outputId)) continue;
             var target = health.Displays.FirstOrDefault(d => d.Active && d.SunshineDeviceId.Equals(outputId, StringComparison.OrdinalIgnoreCase));
             var captured = _instances.LastCaptureResolution(spec);
@@ -276,8 +275,7 @@ public sealed class Watchdog : IDisposable
         {
             var spec = _settings.Instance(id);
             if (spec == null || !spec.Enabled) continue;
-            var rt = _instances.Get(spec);
-            if (rt.State != InstanceState.Streaming) continue;
+            if (!_engine.IsInstanceStreaming(id)) continue;
 
             var mode = _instances.LastRequestedMode(spec);
             var fps = mode?.Fps ?? _instances.LastRequestedFps(spec);
@@ -313,8 +311,7 @@ public sealed class Watchdog : IDisposable
             {
                 var spec = _settings.Instance(id);
                 if (spec == null || !spec.Enabled || _settings.GetPassword(id) != null) continue;
-                var rt = _instances.Get(spec);
-                if (rt.State == InstanceState.Streaming || _engine.IsBusy) continue;
+                if (_engine.IsInstanceStreaming(id) || _engine.IsBusy) continue;
                 notes.Add($"为实例 {id} 生成 Web 凭据");
                 _ = Task.Run(() => _instances.EnsureCredentialsAsync(spec, allowRestart: true));
                 break; // one at a time
@@ -327,7 +324,8 @@ public sealed class Watchdog : IDisposable
             var spec = _settings.Instance(id);
             if (spec == null || !spec.Enabled) continue;
             var rt = _instances.Get(spec);
-            if (rt.State == InstanceState.Streaming) { _lastStreamingUtc[id] = DateTime.UtcNow; continue; }
+            if (_engine.IsInstanceStreaming(id)) { _lastStreamingUtc[id] = DateTime.UtcNow; continue; }
+            NoteStaleBusy(id, rt);
             if (!rt.ConfigDirty || !rt.IsAlive || _engine.IsBusy) continue;
             if (_instances.StreamingClientAddresses(spec).Count > 0) continue;
             if ((DateTime.UtcNow - _lastStreamingUtc.GetValueOrDefault(id, DateTime.MinValue)) < TimeSpan.FromSeconds(10)) continue; // let Sunshine finish its own revert first
@@ -350,12 +348,13 @@ public sealed class Watchdog : IDisposable
                 var rt = _instances.Get(inst);
                 var d = health.Displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == spec.Slot);
                 if (d == null) continue;
-                if (rt.State == InstanceState.Streaming)
+                if (_engine.IsInstanceStreaming(spec.InstanceId))
                 {
                     _lastStreamingUtc[spec.InstanceId] = DateTime.UtcNow;
                     _activeSinceUtc.Remove(d.GdiName);
                     continue;
                 }
+                NoteStaleBusy(spec.InstanceId, rt);
                 if (!d.Active)
                 {
                     _activeSinceUtc.Remove(d.GdiName);
@@ -616,9 +615,6 @@ public sealed class Watchdog : IDisposable
             if (idleOff)
             {
                 // stand-by: an inactive display is fine; while a session runs Sunshine owns mode/refresh rate
-                var inst = spec.InstanceId > 0 ? _settings.Instance(spec.InstanceId) : null;
-                var streaming = inst != null && _instances.Get(inst).State == InstanceState.Streaming;
-                if (!d.Active || !streaming) continue;
                 continue;
             }
             if (!d.Active) return false;
@@ -644,6 +640,22 @@ public sealed class Watchdog : IDisposable
     }
 
     private readonly Dictionary<int, DateTime> _lastStreamingUtc = new();
+    private readonly Dictionary<int, DateTime> _staleBusyLoggedUtc = new();
+
+    /// <summary>记录一次“Sunshine 仍报忙碌但没有 RTSP 客户端”的异常，供现场排查。</summary>
+    /// <param name="instanceId">Sunshine 实例编号。</param>
+    /// <param name="rt">该实例的运行时状态。</param>
+    private void NoteStaleBusy(int instanceId, InstanceRuntime rt)
+    {
+        if (rt.State != InstanceState.Streaming || _engine.IsInstanceStreaming(instanceId))
+        {
+            _staleBusyLoggedUtc.Remove(instanceId);
+            return;
+        }
+        if ((DateTime.UtcNow - _staleBusyLoggedUtc.GetValueOrDefault(instanceId, DateTime.MinValue)) < TimeSpan.FromMinutes(1)) return;
+        _staleBusyLoggedUtc[instanceId] = DateTime.UtcNow;
+        Log.Warn($"实例 {instanceId}: Sunshine 仍报告忙碌，但没有 RTSP 客户端连接，按空闲处理");
+    }
     private readonly Dictionary<string, DateTime> _activeSinceUtc = new();
     private readonly Dictionary<string, DateTime> _detachFailedUtc = new();
 

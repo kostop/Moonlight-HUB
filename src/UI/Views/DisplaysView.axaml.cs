@@ -477,30 +477,44 @@ public partial class DisplaysView : UserControl, IRefreshable
         var actions = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Top };
         if (d.Active)
         {
-            var modes = DisplayManager.GetModes(d.GdiName, d.Width, d.Height).Where(m => m.Orientation == 0).ToList();
-            var choices = modes.Select(m => new ModeChoice(m.RefreshRate, m.ToString(), true)).ToList();
-            if (d.IsParsec)
+            var profile = Hub.ActiveProfile;
+            var spec = d.IsParsec ? profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == d.ParsecSlot) : null;
+            var targetWidth = d.Width;
+            var targetHeight = d.Height;
+            var targetHz = d.RefreshRate;
+            List<VirtualModeChoice> choices;
+            if (d.IsParsec && profile != null && spec != null)
             {
-                // the registry is what the driver publishes after the next re-plug; show the difference to the current table
-                var registered = ParsecModes.RegisteredRates(d.Width, d.Height);
-                foreach (var hz in registered.Where(r => modes.All(m => m.RefreshRate != r)))
-                    choices.Add(new ModeChoice(hz, $"{d.Width}×{d.Height} @ {hz}Hz（重新插拔后可用）", false));
-                if (registered.Count > 0 && !ParsecModes.IsBuiltInResolution(d.Width, d.Height))
-                    foreach (var c in choices.Where(c => c.Exposed && !registered.Contains(c.Hz))) c.Label += "（已从注册表删除）";
+                targetWidth = spec.Width;
+                targetHeight = spec.Height;
+                targetHz = Hub.Engine.TargetHz(profile, spec, d);
+                // 同时列出驱动已发布的模式、注册表里等待重新插拔的自定义模式，以及方案当前模式。
+                choices = ParsecModeCatalog.Build(d.GdiName, targetWidth, targetHeight, targetHz);
             }
-            choices = choices.OrderByDescending(c => c.Hz).ToList();
-            var combo = new ComboBox { Width = d.IsParsec ? 250 : 170, Margin = new Thickness(0, 0, 8, 0) };
-            if (d.IsParsec) ToolTip.SetTip(combo, "选择的刷新率会记入当前方案（作为下限；跟随客户端帧率/合成刷新率可能再提高）。驱动尚未发布的模式会在客户端断开后自动重新插拔虚拟屏生效。");
+            else
+            {
+                choices = DisplayManager.GetModes(d.GdiName, d.Width, d.Height)
+                    .Where(m => m.Orientation == 0)
+                    .Select(m => new VirtualModeChoice(d.Width, d.Height, m.RefreshRate, true))
+                    .OrderByDescending(c => c.Hz)
+                    .ToList();
+            }
+            var combo = new ComboBox { Width = d.IsParsec ? 290 : 170, Margin = new Thickness(0, 0, 8, 0) };
+            if (d.IsParsec)
+                ToolTip.SetTip(combo, "选择完整的分辨率和刷新率会记入当前方案并立即应用；注册表中尚未发布的模式会在客户端断开后自动重新插拔虚拟屏生效。手动选择分辨率会关闭当前方案的“跟随客户端分辨率”。");
             foreach (var c in choices) combo.Items.Add(c);
-            combo.SelectedItem = choices.FirstOrDefault(c => c.Hz == d.RefreshRate);
+            combo.SelectedItem = choices.FirstOrDefault(c => c.Width == targetWidth && c.Height == targetHeight && c.Hz == targetHz)
+                ?? choices.FirstOrDefault(c => c.Width == d.Width && c.Height == d.Height && c.Hz == d.RefreshRate);
             combo.SelectionChanged += (_, _) =>
             {
-                if (combo.SelectedItem is not ModeChoice choice || choice.Hz == d.RefreshRate) return;
+                if (combo.SelectedItem is not VirtualModeChoice choice) return;
                 if (d.IsParsec)
                 {
-                    PickVirtualRate(d.ParsecSlot, choice.Hz);
+                    if (choice.Width == targetWidth && choice.Height == targetHeight && choice.Hz == targetHz) return;
+                    PickVirtualMode(d.ParsecSlot, choice.Width, choice.Height, choice.Hz);
                     return;
                 }
+                if (choice.Hz == d.RefreshRate) return;
                 var r = DisplayManager.ApplyLayout(new[] { new LayoutItem(d) { Width = d.Width, Height = d.Height, RefreshRate = choice.Hz } });
                 Log.Info($"手动修改 {d.GdiName} 为 {d.Width}x{d.Height}@{choice.Hz}: {r}");
                 _signature = string.Empty;
@@ -531,22 +545,20 @@ public partial class DisplaysView : UserControl, IRefreshable
             var spec = d.IsParsec ? profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == d.ParsecSlot) : null;
             if (profile != null && spec != null)
             {
-                // stand-by display: offer the registered rates; the choice is stored in the profile and used when a client connects
-                var rates = ParsecModes.RegisteredRates(spec.Width, spec.Height);
-                if (rates.Count > 0)
+                // 待机虚拟屏无法枚举 Windows 模式，但仍可从注册表自定义模式中选择完整分辨率。
+                var targetHz = Hub.Engine.TargetHz(profile, spec, d);
+                var choices = ParsecModeCatalog.Build(null, spec.Width, spec.Height, targetHz);
+                var combo = new ComboBox { Width = 290, Margin = new Thickness(0, 0, 8, 0) };
+                ToolTip.SetTip(combo, "待机中的虚拟屏：选择的分辨率和刷新率记入方案，客户端连接时由 Sunshine 启用该模式");
+                foreach (var c in choices) combo.Items.Add(c);
+                combo.SelectedItem = choices.FirstOrDefault(c => c.Width == spec.Width && c.Height == spec.Height && c.Hz == targetHz);
+                combo.SelectionChanged += (_, _) =>
                 {
-                    var combo = new ComboBox { Width = 200, Margin = new Thickness(0, 0, 8, 0) };
-                    ToolTip.SetTip(combo, "待机中的虚拟屏：选择的刷新率记入方案，客户端连接时由 Sunshine 启用该模式");
-                    var choices = rates.OrderByDescending(r => r).Select(r => new ModeChoice(r, $"{spec.Width}×{spec.Height} @ {r}Hz", false)).ToList();
-                    foreach (var c in choices) combo.Items.Add(c);
-                    var target = Hub.Engine.TargetHz(profile, spec, d);
-                    combo.SelectedItem = choices.FirstOrDefault(c => c.Hz == target);
-                    combo.SelectionChanged += (_, _) =>
-                    {
-                        if (combo.SelectedItem is ModeChoice c && c.Hz != target) PickVirtualRate(d.ParsecSlot, c.Hz);
-                    };
-                    actions.Children.Add(combo);
-                }
+                    if (combo.SelectedItem is not VirtualModeChoice c) return;
+                    if (c.Width == spec.Width && c.Height == spec.Height && c.Hz == targetHz) return;
+                    PickVirtualMode(d.ParsecSlot, c.Width, c.Height, c.Hz);
+                };
+                actions.Children.Add(combo);
             }
             actions.Children.Add(Ui.B("激活 (扩展)", (_, _) =>
             {
@@ -560,23 +572,18 @@ public partial class DisplaysView : UserControl, IRefreshable
         return Ui.Card(grid, true);
     }
 
-    private sealed class ModeChoice
-    {
-        public ModeChoice(int hz, string label, bool exposed) { Hz = hz; Label = label; Exposed = exposed; }
-        public int Hz { get; }
-        public string Label { get; set; }
-        /// <summary>Windows exposes this mode right now (false = registered in the driver table only).</summary>
-        public bool Exposed { get; }
-        public override string ToString() => Label;
-    }
-
-    private void PickVirtualRate(int slot, int hz)
+    /// <summary>用户从显示布局选择虚拟屏的完整模式。</summary>
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="width">目标宽度（像素）。</param>
+    /// <param name="height">目标高度（像素）。</param>
+    /// <param name="hz">目标刷新率（Hz）。</param>
+    private void PickVirtualMode(int slot, int width, int height, int hz)
     {
         Ui.RunAsync(_window, async () =>
         {
-            var (ok, msg) = await Hub.Engine.SetVirtualDisplayRateAsync(slot, hz).ConfigureAwait(false);
+            var (ok, msg) = await Hub.Engine.SetVirtualDisplayModeAsync(slot, width, height, hz).ConfigureAwait(false);
             if (!ok) throw new InvalidOperationException(msg);
-            _window.Toast("虚拟屏刷新率", msg);
+            _window.Toast("虚拟屏模式", msg);
             Dispatcher.UIThread.Post(Invalidate);
         });
     }

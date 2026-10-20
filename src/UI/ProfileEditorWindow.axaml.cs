@@ -65,21 +65,47 @@ public partial class ProfileEditorWindow : Window
             var vd = Result.VirtualDisplays[i];
             vd.Slot = i;
             var index = i;
+            var registeredModes = ParsecModes.Read();
+            var resolutionOptions = new List<(int Width, int Height)>();
+            void AddResolution(int width, int height)
+            {
+                if (width > 0 && height > 0 && !resolutionOptions.Contains((width, height)))
+                    resolutionOptions.Add((width, height));
+            }
+            AddResolution(vd.Width, vd.Height);
+            foreach (var (w, h) in Resolutions) AddResolution(w, h);
+            foreach (var mode in registeredModes) AddResolution(mode.Width, mode.Height);
+
             var res = new ComboBox { Width = 140, Margin = new Thickness(0, 0, 8, 0) };
-            foreach (var (w, h) in Resolutions) res.Items.Add($"{w}×{h}");
+            ToolTip.SetTip(res, "包含 Parsec 注册表里已登记的自定义分辨率；选择后保存方案即可使用");
+            foreach (var (w, h) in resolutionOptions) res.Items.Add($"{w}×{h}");
             var custom = $"{vd.Width}×{vd.Height}";
-            if (!res.Items.Contains(custom)) res.Items.Insert(0, custom);
             res.SelectedItem = custom;
+            var rate = new ComboBox { Width = 90, Margin = new Thickness(0, 0, 8, 0) };
+            ToolTip.SetTip(rate, "刷新率下限；开启“跟随客户端帧率”时客户端要求更高帧率会自动提高");
+            void FillRates(int width, int height, int selectedHz)
+            {
+                var available = Rates
+                    .Union(registeredModes.Where(m => m.Width == width && m.Height == height).Select(m => m.Hz))
+                    .Append(selectedHz)
+                    .Where(hz => hz > 0)
+                    .Distinct()
+                    .OrderBy(hz => hz)
+                    .ToList();
+                rate.Items.Clear();
+                foreach (var hz in available) rate.Items.Add($"{hz} Hz");
+                rate.SelectedItem = $"{selectedHz} Hz";
+            }
+            FillRates(vd.Width, vd.Height, vd.RefreshRate);
             res.SelectionChanged += (_, _) =>
             {
                 var parts = (res.SelectedItem as string ?? string.Empty).Split('×');
-                if (parts.Length == 2 && int.TryParse(parts[0], out var w) && int.TryParse(parts[1], out var h)) { vd.Width = w; vd.Height = h; }
+                if (parts.Length != 2 || !int.TryParse(parts[0], out var w) || !int.TryParse(parts[1], out var h)) return;
+                if (w == vd.Width && h == vd.Height) return;
+                vd.Width = w;
+                vd.Height = h;
+                FillRates(w, h, vd.RefreshRate);
             };
-            var rate = new ComboBox { Width = 90, Margin = new Thickness(0, 0, 8, 0) };
-            ToolTip.SetTip(rate, "刷新率下限；开启“跟随客户端帧率”时客户端要求更高帧率会自动提高");
-            foreach (var r in Rates.Union(ParsecModes.Read().Select(m => m.Hz)).Distinct().OrderBy(x => x)) rate.Items.Add($"{r} Hz");
-            if (!rate.Items.Contains($"{vd.RefreshRate} Hz")) rate.Items.Insert(0, $"{vd.RefreshRate} Hz");
-            rate.SelectedItem = $"{vd.RefreshRate} Hz";
             rate.SelectionChanged += (_, _) => { if (int.TryParse((rate.SelectedItem as string ?? "").Replace(" Hz", ""), out var r)) vd.RefreshRate = r; };
             var place = new ComboBox { Width = 110, Margin = new Thickness(0, 0, 8, 0) };
             foreach (var p in new[] { "主屏右侧", "主屏左侧", "主屏上方", "主屏下方" }) place.Items.Add(p);

@@ -797,6 +797,7 @@ public sealed class ProfileEngine
 
     // ------------------------------------------------------------------ driver mode table (re-plug)
     private readonly Dictionary<int, string> _replugDone = new();
+    private readonly Dictionary<int, DateTime> _lastLiveStreamUtc = new();
 
     /// <summary>True when the display should be re-plugged for the current registry table (and that was not already tried).</summary>
     private bool NeedsReplug(DisplayInfo d, int width, int height)
@@ -808,12 +809,32 @@ public sealed class ProfileEngine
         return NeedsReplug(d, w, h);
     }
 
-    /// <summary>True when the Sunshine instance assigned to this spec currently has a streaming session.</summary>
-    public bool IsSpecStreaming(VirtualDisplaySpec spec)
+    /// <summary>
+    /// True when the Sunshine instance assigned to this spec currently has a real streaming session.
+    /// Sunshine can keep reporting "busy" after a client vanished (HTTP 400 on stop, no RTSP connection);
+    /// that stale state used to block the re-plug that publishes newly registered display modes.
+    /// </summary>
+    /// <param name="spec">需要检查的虚拟屏设置。</param>
+    public bool IsSpecStreaming(VirtualDisplaySpec spec) => spec.InstanceId > 0 && IsInstanceStreaming(spec.InstanceId);
+
+    /// <summary>检查 Sunshine 实例是否仍有真实客户端连接；只有 /serverinfo 忙碌但没有 RTSP 连接时按空闲处理。</summary>
+    /// <param name="instanceId">Sunshine 实例编号。</param>
+    public bool IsInstanceStreaming(int instanceId)
     {
-        if (spec.InstanceId <= 0) return false;
-        var inst = _settings.Instance(spec.InstanceId);
-        return inst != null && _instances.Get(inst).State == InstanceState.Streaming;
+        var inst = _settings.Instance(instanceId);
+        if (inst == null || _instances.Get(inst).State != InstanceState.Streaming) return false;
+
+        var live = _instances.StreamingClientAddresses(inst).Count > 0;
+        lock (_lastLiveStreamUtc)
+        {
+            if (live)
+            {
+                _lastLiveStreamUtc[inst.Id] = DateTime.UtcNow;
+                return true;
+            }
+            // 短暂保留几秒，避免客户端刚连接、RTSP 尚未建立时被当成空闲。
+            return (DateTime.UtcNow - _lastLiveStreamUtc.GetValueOrDefault(inst.Id, DateTime.MinValue)) < TimeSpan.FromSeconds(12);
+        }
     }
 
     public bool IsSlotStreaming(int slot)
@@ -1029,6 +1050,50 @@ public sealed class ProfileEngine
         }
         if (target != hz) return (true, $"已记入方案；因跟随客户端帧率/合成刷新率，实际使用 {target}Hz");
         return (true, $"虚拟屏 #{slot + 1} → {target}Hz");
+    }
+
+    /// <summary>用户从显示布局选择虚拟屏的完整模式：写入方案、应用分辨率并处理驱动重新插拔。</summary>
+    /// <param name="slot">虚拟屏槽位，从零开始。</param>
+    /// <param name="width">目标宽度（像素）。</param>
+    /// <param name="height">目标高度（像素）。</param>
+    /// <param name="hz">目标刷新率（Hz）。</param>
+    public async Task<(bool Ok, string Message)> SetVirtualDisplayModeAsync(int slot, int width, int height, int hz)
+    {
+        if (width < 320 || height < 240 || hz is < 24 or > 500) return (false, "分辨率或刷新率无效");
+        var profile = _settings.Profile(_state.ActiveProfileId);
+        var spec = profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == slot);
+        if (profile == null || spec == null) return (false, "当前方案没有这块虚拟屏");
+        if (profile.Mode == ProfileMode.Clone) return (false, "复制模式的虚拟屏分辨率由主屏决定");
+
+        var resolutionChanged = spec.Width != width || spec.Height != height;
+        var streaming = IsSpecStreaming(spec);
+        var autoMatchDisabled = resolutionChanged && profile.AutoMatchClientResolution;
+        spec.Width = width;
+        spec.Height = height;
+        spec.RefreshRate = hz;
+        // 手动选择分辨率后固定使用它，否则“跟随客户端分辨率”会在下一次应用时覆盖用户的选择。
+        if (autoMatchDisabled) profile.AutoMatchClientResolution = false;
+        _settings.Save();
+        Log.Info($"用户把虚拟屏 #{slot + 1} 设为 {width}x{height}@{hz}Hz（记入方案「{profile.Name}」）");
+
+        var result = await ApplyAsync(profile).ConfigureAwait(false);
+        if (!result.Success) return (false, result.Summary);
+
+        var after = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot);
+        var targetHz = TargetHz(profile, spec, after);
+        var note = autoMatchDisabled ? "；已关闭“跟随客户端分辨率”以固定该分辨率" : string.Empty;
+        if (after is { IsReady: true } && after.Width == width && after.Height == height &&
+            Math.Abs(after.RefreshRate - hz) <= 1)
+        {
+            ClearPendingReplug(slot);
+            return (true, $"虚拟屏 #{slot + 1} → {width}×{height}@{targetHz}Hz{note}");
+        }
+        if (streaming && ParsecModes.RegisteredRates(width, height).Contains(hz))
+        {
+            RequestReplug(slot, $"模式 {width}x{height}@{hz} 已注册但驱动尚未发布");
+            return (true, $"{width}×{height}@{hz}Hz 已记入方案；客户端断开后自动重新插拔生效{note}");
+        }
+        return (true, $"已记入方案，当前 {(after?.IsReady == true ? after.ModeText : "待机")}{note}");
     }
 
     // ------------------------------------------------------------------ layouts
