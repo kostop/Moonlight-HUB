@@ -16,6 +16,12 @@ namespace MoonlightHub.UI;
 /// </summary>
 public sealed class DisplayCanvas : Canvas
 {
+    private static readonly Color[] OwnerPalette =
+    [
+        Color.Parse("#4EA1FF"), Color.Parse("#F2A93B"), Color.Parse("#58C98A"),
+        Color.Parse("#B98AFF"), Color.Parse("#F2778A"), Color.Parse("#31C6C9")
+    ];
+
     private sealed class Item
     {
         public DisplayInfo? Display;
@@ -65,6 +71,22 @@ public sealed class DisplayCanvas : Canvas
         SizeChanged += (_, _) => Redraw();
     }
 
+    /// <param name="owner">Deskflow 电脑名。</param>
+    /// <param name="alpha">颜色透明度，255 为完全不透明。</param>
+    public IBrush BrushForOwner(string owner, byte alpha = 255)
+    {
+        var owners = SharedDocument?.Monitors.Select(m => m.Owner).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? new();
+        var index = owners.FindIndex(name => name.Equals(owner, StringComparison.OrdinalIgnoreCase));
+        if (index < 0)
+        {
+            uint hash = 2166136261;
+            foreach (var c in owner.ToUpperInvariant()) hash = (hash ^ c) * 16777619;
+            index = (int)(hash % OwnerPalette.Length);
+        }
+        var color = OwnerPalette[index % OwnerPalette.Length];
+        return new SolidColorBrush(Color.FromArgb(alpha, color.R, color.G, color.B));
+    }
+
     /// <param name="document">两台电脑共同使用的逻辑桌面布局。</param>
     public void SetSharedDisplays(SharedDisplayDocument document)
     {
@@ -74,6 +96,7 @@ public sealed class DisplayCanvas : Canvas
         _items.Clear();
         _items.AddRange(document.Monitors.Select(m => new Item { Shared = m, X = m.X, Y = m.Y,
             OrigX = m.X, OrigY = m.Y, W = m.CanvasWidth, H = m.CanvasHeight }));
+        ResolveLoadedOverlaps();
         Redraw(); DraftChanged?.Invoke();
     }
 
@@ -247,17 +270,19 @@ public sealed class DisplayCanvas : Canvas
     /// <param name="number">与下方图例对应的屏幕编号。</param>
     private Border SharedVisual(Item item, SharedMonitor monitor, int number)
     {
+        var ownerColor = ((SolidColorBrush)BrushForOwner(monitor.Owner)).Color;
         var border = new Border { Width = Math.Max(24, item.W * _scale - 4), Height = Math.Max(18, item.H * _scale - 4),
-            CornerRadius = new CornerRadius(6), Background = Ui.Res(monitor.Virtual ? "AccentSoftBrush" : "Surface3Brush"),
-            BorderBrush = Ui.Res(monitor.Virtual ? "AccentBrush" : "BorderBrush"), BorderThickness = new Thickness(monitor.Primary ? 2 : 1),
+            CornerRadius = new CornerRadius(6),
+            Background = new SolidColorBrush(Color.FromArgb(monitor.Active ? (byte)34 : (byte)18, ownerColor.R, ownerColor.G, ownerColor.B)),
+            BorderBrush = BrushForOwner(monitor.Owner), BorderThickness = new Thickness(monitor.Primary ? 2.5 : monitor.Virtual ? 2 : 1.5),
             Padding = new Thickness(4), ClipToBounds = true, Tag = item, Opacity = monitor.Active ? 1 : .6 };
-        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}%\n拖动主屏或按 Shift 可移动整台电脑，其它屏幕单独移动。间隙自动跨越。" );
+        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}%\n同色屏幕属于同一台电脑，只会在同色范围内吸附。拖动主屏或按 Shift 可移动整台电脑。" );
         // 屏幕框只显示编号，文字信息放到图例，避免小屏缩放后被裁切；边框尺寸仍严格保持比例。
         var content = new Grid();
         content.Children.Add(new Viewbox { Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly,
             HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
             Child = new TextBlock { Text = number.ToString(), FontSize = 24, FontWeight = FontWeight.SemiBold,
-                Foreground = Ui.Res(monitor.Virtual ? "AccentBrush" : "TextBrush") } });
+                Foreground = BrushForOwner(monitor.Owner) } });
         if (monitor.CanScale && Interactive)
         {
             var handle = new Border { Width = 14, Height = 14, HorizontalAlignment = HorizontalAlignment.Right,
@@ -378,18 +403,19 @@ public sealed class DisplayCanvas : Canvas
         _dragItem = null;
         var beforeX = item.X; var beforeY = item.Y;
         Snap(item);
-        ResolveOverlap(item);
         if (_dragGroup) foreach (var other in _groupOrigins.Keys.Where(i => i != item)) { other.X += item.X - beforeX; other.Y += item.Y - beforeY; }
+        ResolveOverlap(item);
         _dragGroup = false;
         Redraw();
         DraftChanged?.Invoke();
     }
 
-    /// <summary>Aligns the moved item to the closest edges of the others (Windows-settings style snapping).</summary>
+    /// <summary>Aligns the moved item to the closest edges of the same computer (Windows-settings style snapping).</summary>
     private void Snap(Item moved)
     {
-        // local displays must form one desktop, so they only snap to each other; Deskflow screens snap to anything
-        var others = _items.Where(i => i != moved && (!_dragGroup || i.Shared?.Owner != moved.Shared?.Owner) && (moved.Shared != null || moved.Peer != null || i.Display != null)).ToList();
+        // 不同电脑用不同颜色区分，吸附只发生在同一种颜色的屏幕之间。
+        var owner = OwnerOf(moved);
+        var others = _items.Where(i => i != moved && OwnerOf(i) == owner && (!_dragGroup || !_groupOrigins.ContainsKey(i))).ToList();
         if (others.Count == 0) return;
         var threshold = moved.Peer != null ? 400 : 140;
         var w = moved.W;
@@ -430,22 +456,48 @@ public sealed class DisplayCanvas : Canvas
 
     private void ResolveOverlap(Item moved)
     {
+        var moving = _dragGroup && moved.Shared != null
+            ? _items.Where(i => i.Shared?.Owner == moved.Shared.Owner).ToList()
+            : new List<Item> { moved };
         for (var guard = 0; guard < 8; guard++)
         {
-            var hit = _items.FirstOrDefault(o => o != moved && (!_dragGroup || o.Shared?.Owner != moved.Shared?.Owner) && Overlaps(moved, o));
-            if (hit == null) return;
+            var pair = moving.SelectMany(item => _items.Where(o => !moving.Contains(o) && Overlaps(item, o)).Select(o => (item, o))).FirstOrDefault();
+            if (pair.item == null) return;
+            var (source, hit) = pair;
             // push out to the nearest side
-            var w = moved.W;
-            var h = moved.H;
-            var dxRight = hit.X + hit.W - moved.X;
-            var dxLeft = moved.X + w - hit.X;
-            var dyDown = hit.Y + hit.H - moved.Y;
-            var dyUp = moved.Y + h - hit.Y;
+            var w = source.W;
+            var h = source.H;
+            var dxRight = hit.X + hit.W - source.X;
+            var dxLeft = source.X + w - hit.X;
+            var dyDown = hit.Y + hit.H - source.Y;
+            var dyUp = source.Y + h - hit.Y;
             var min = Math.Min(Math.Min(dxRight, dxLeft), Math.Min(dyDown, dyUp));
-            if (min == dxRight) moved.X += dxRight;
-            else if (min == dxLeft) moved.X -= dxLeft;
-            else if (min == dyDown) moved.Y += dyDown;
-            else moved.Y -= dyUp;
+            var (dx, dy) = min == dxRight ? (dxRight, 0) : min == dxLeft ? (-dxLeft, 0)
+                : min == dyDown ? (0, dyDown) : (0, -dyUp);
+            foreach (var item in moving) { item.X += dx; item.Y += dy; }
+        }
+    }
+
+    /// <param name="item">布局中的一块屏幕。</param>
+    private static string OwnerOf(Item item) => item.Shared?.Owner ?? item.Peer?.Name ?? "local";
+
+    /// <param name="item">布局中的一块屏幕。</param>
+    private static SharedLayoutRect Box(Item item) => new(item.X, item.Y, item.W, item.H);
+
+    /// <summary>修复旧版本保存下来的重叠布局；只移动后出现且冲突的屏幕，并保持其它屏不动。</summary>
+    private void ResolveLoadedOverlaps()
+    {
+        for (var index = 1; index < _items.Count; index++)
+        {
+            var item = _items[index];
+            if (!_items.Take(index).Any(previous => Overlaps(previous, item))) continue;
+            var others = _items.Where((_, i) => i != index).ToList();
+            var owner = OwnerOf(item);
+            var ownerBoxes = others.Where(i => OwnerOf(i) == owner).Select(Box).ToList();
+            var occupied = others.Select(Box).ToList();
+            var (x, y) = SharedDisplayLayout.FindFreePosition(ownerBoxes, occupied, item.W, item.H, item.X, item.Y);
+            item.X = x;
+            item.Y = y;
         }
     }
 

@@ -12,6 +12,22 @@ public sealed record SharedMonitor(string Owner, string Id, string Name, int X, 
     public int CanvasWidth => Math.Max(1, (int)Math.Round((ScalePending && RequestedWidth > 0 ? RequestedWidth : Width) * 100.0 / Math.Max(1, WindowsScalePercent)));
     public int CanvasHeight => Math.Max(1, (int)Math.Round((ScalePending && RequestedHeight > 0 ? RequestedHeight : Height) * 100.0 / Math.Max(1, WindowsScalePercent)));
 }
+
+/// <summary>布局画布中的矩形，坐标和尺寸均使用缩放后的逻辑桌面单位。</summary>
+public readonly record struct SharedLayoutRect(int X, int Y, int Width, int Height)
+{
+    public int Right => X + Width;
+    public int Bottom => Y + Height;
+
+    /// <param name="other">另一块待比较屏幕。</param>
+    public bool Overlaps(SharedLayoutRect other)
+        => X < other.Right && Right > other.X && Y < other.Bottom && Bottom > other.Y;
+
+    /// <param name="other">另一块待比较屏幕。</param>
+    public bool Touches(SharedLayoutRect other)
+        => (Right == other.X || other.Right == X) && Math.Min(Bottom, other.Bottom) > Math.Max(Y, other.Y) ||
+           (Bottom == other.Y || other.Bottom == Y) && Math.Min(Right, other.Right) > Math.Max(X, other.X);
+}
 public sealed class SharedDisplayDocument
 {
     public long Revision { get; set; }
@@ -72,6 +88,7 @@ public static class SharedDisplayLayout
         var oldPrimary = prior.FirstOrDefault(m => m.Primary) ?? prior.FirstOrDefault(m => m.Id == primary.Id);
         var anchorX = oldPrimary?.X ?? fallbackX;
         var anchorY = oldPrimary?.Y ?? fallbackY;
+        var otherOwners = document.Monitors.Where(m => m.Owner != owner).ToList();
         var updated = monitors.Select(m =>
         {
             var old = prior.FirstOrDefault(p => p.Id == m.Id);
@@ -81,10 +98,129 @@ public static class SharedDisplayLayout
             return m with { X = anchorX + ProjectAxis(m.NativeX - primary.NativeX, primary.Width, m.Width, primary.CanvasWidth, m.CanvasWidth),
                 Y = anchorY + ProjectAxis(m.NativeY - primary.NativeY, primary.Height, m.Height, primary.CanvasHeight, m.CanvasHeight) };
         }).ToList();
+        // 首次发现这台电脑时沿用 Windows 的物理排列；之后再新增屏幕才放到现有区域的右下空位。
+        if (prior.Count > 0)
+        {
+            for (var index = 0; index < updated.Count; index++)
+            {
+                if (prior.Any(p => p.Id == updated[index].Id)) continue;
+                var occupied = updated.Where((_, i) => i != index).Concat(otherOwners).ToList();
+                var (x, y) = FindFreePosition(updated.Where((_, i) => i != index).ToList(), occupied,
+                    updated[index].CanvasWidth, updated[index].CanvasHeight, anchorX, anchorY);
+                updated[index] = updated[index] with { X = x, Y = y };
+            }
+            // 旧布局若已经重叠，只移动后出现的那一块，不用重排整台电脑。
+            for (var index = 1; index < updated.Count; index++)
+            {
+                var box = Rect(updated[index]);
+                if (!updated.Take(index).Concat(otherOwners).Any(m => Rect(m).Overlaps(box))) continue;
+                var occupied = updated.Where((_, i) => i != index).Concat(otherOwners).ToList();
+                var (x, y) = FindFreePosition(updated.Where((_, i) => i != index).ToList(), occupied,
+                    updated[index].CanvasWidth, updated[index].CanvasHeight, anchorX, anchorY);
+                updated[index] = updated[index] with { X = x, Y = y };
+            }
+        }
+        if (prior.Any(old => monitors.All(m => m.Id != old.Id)))
+            CompactOwner(updated, owner, primary.Id, otherOwners);
         if (prior.SequenceEqual(updated)) return false;
         document.Monitors.RemoveAll(m => m.Owner == owner);
         document.Monitors.AddRange(updated);
         return true;
+    }
+
+    /// <param name="monitors">同一台电脑的待摆放屏幕。</param>
+    /// <param name="occupied">所有电脑中已经占用的屏幕位置。</param>
+    /// <param name="width">新屏幕逻辑宽度。</param>
+    /// <param name="height">新屏幕逻辑高度。</param>
+    /// <param name="fallbackX">该电脑尚无屏幕时的横坐标。</param>
+    /// <param name="fallbackY">该电脑尚无屏幕时的纵坐标。</param>
+    public static (int X, int Y) FindFreePosition(IReadOnlyList<SharedMonitor> monitors, IReadOnlyList<SharedMonitor> occupied,
+        int width, int height, int fallbackX = 0, int fallbackY = 0)
+        => FindFreePosition(monitors.Select(Rect).ToList(), occupied.Select(Rect).ToList(), width, height, fallbackX, fallbackY);
+
+    /// <param name="monitors">同一台电脑的待摆放矩形。</param>
+    /// <param name="occupied">所有电脑中已经占用的矩形。</param>
+    /// <param name="width">新屏幕逻辑宽度。</param>
+    /// <param name="height">新屏幕逻辑高度。</param>
+    /// <param name="fallbackX">该电脑尚无屏幕时的横坐标。</param>
+    /// <param name="fallbackY">该电脑尚无屏幕时的纵坐标。</param>
+    public static (int X, int Y) FindFreePosition(IReadOnlyList<SharedLayoutRect> monitors, IReadOnlyList<SharedLayoutRect> occupied,
+        int width, int height, int fallbackX = 0, int fallbackY = 0)
+    {
+        if (monitors.Count == 0)
+        {
+            if (!OverlapsAny(fallbackX, fallbackY, width, height, occupied)) return (fallbackX, fallbackY);
+            var edge = occupied.Count == 0 ? fallbackX : occupied.Max(m => m.Right);
+            for (var scanY = fallbackY; scanY < fallbackY + 20000; scanY += 20)
+                if (!OverlapsAny(edge, scanY, width, height, occupied)) return (edge, scanY);
+            return (edge, fallbackY);
+        }
+        var right = monitors.Max(m => m.Right);
+        var bottom = monitors.Max(m => m.Bottom);
+        var target = (X: right, Y: bottom - height);
+        var candidates = new List<(int X, int Y)> { target, (right - width, bottom) };
+        foreach (var monitor in monitors)
+        {
+            candidates.Add((monitor.Right, ClampStart(target.Y, monitor.Y, monitor.Bottom - height)));
+            candidates.Add((ClampStart(target.X - width, monitor.X, monitor.Right - width), monitor.Bottom));
+        }
+        foreach (var candidate in candidates.Distinct()
+                     .OrderBy(c => Math.Abs(c.X - target.X) + Math.Abs(c.Y - target.Y)).ThenByDescending(c => c.X).ThenByDescending(c => c.Y))
+        {
+            if (!OverlapsAny(candidate.X, candidate.Y, width, height, occupied)) return candidate;
+        }
+        // 右下区域被另一台电脑占满时，沿下方继续寻找最近的整块空位。
+        var x = right;
+        var y = target.Y;
+        for (var guard = 0; guard < 512; guard++)
+        {
+            if (!OverlapsAny(x, y, width, height, occupied)) return (x, y);
+            y += 20;
+        }
+        return (right, bottom);
+    }
+
+    /// <param name="monitors">全部屏幕，方法只移动指定电脑的屏幕。</param>
+    /// <param name="owner">需要收拢间隔的电脑名。</param>
+    /// <param name="primaryId">保持不动的本机主屏稳定 ID。</param>
+    /// <param name="occupied">其它电脑的屏幕，收拢时不能压到它们。</param>
+    public static void CompactOwner(List<SharedMonitor> monitors, string owner, string primaryId,
+        IReadOnlyList<SharedMonitor>? occupied = null)
+    {
+        var ownerIndexes = monitors.Select((m, i) => (m, i)).Where(t => t.m.Owner == owner).ToList();
+        if (ownerIndexes.Count < 2) return;
+        var primary = ownerIndexes.FirstOrDefault(t => t.m.Id == primaryId).m ?? ownerIndexes[0].m;
+        for (var guard = 0; guard < ownerIndexes.Count; guard++)
+        {
+            var ownerItems = ownerIndexes.Select(t => monitors[t.i]).ToList();
+            var baseIds = ConnectedIds(ownerItems, primary.Id);
+            var rest = ownerItems.Where(m => !baseIds.Contains(m.Id)).ToList();
+            if (rest.Count == 0) return;
+            var movingIds = ConnectedIds(rest, rest[0].Id);
+            var moving = ownerItems.Where(m => movingIds.Contains(m.Id)).ToList();
+            var fixedItems = monitors.Where(m => !movingIds.Contains(m.Id)).Concat(occupied ?? []).ToList();
+            var shift = FindCompactShift(moving, ownerItems.Where(m => baseIds.Contains(m.Id)).ToList(), fixedItems);
+            if (shift is not { } delta || delta.Dx == 0 && delta.Dy == 0) return;
+            for (var i = 0; i < monitors.Count; i++)
+                if (movingIds.Contains(monitors[i].Id))
+                    monitors[i] = monitors[i] with { X = monitors[i].X + delta.Dx, Y = monitors[i].Y + delta.Dy };
+        }
+    }
+
+    /// <param name="monitors">需要检查的屏幕集合。</param>
+    /// <param name="first">第一块重叠屏幕。</param>
+    /// <param name="second">第二块重叠屏幕。</param>
+    public static bool TryFindOverlap(IReadOnlyList<SharedMonitor> monitors, out SharedMonitor? first, out SharedMonitor? second)
+    {
+        for (var i = 0; i < monitors.Count; i++)
+            for (var j = i + 1; j < monitors.Count; j++)
+                if (Rect(monitors[i]).Overlaps(Rect(monitors[j])))
+                {
+                    first = monitors[i]; second = monitors[j];
+                    return true;
+                }
+        first = second = null;
+        return false;
     }
 
     /// <param name="hub">当前作为 Deskflow 服务端的 Hub。</param>
@@ -130,6 +266,96 @@ public static class SharedDisplayLayout
         if (range != 0 && (double)offset / range is >= 0 and <= 1)
             return (int)Math.Round(offset * (double)(targetParentSize - targetChildSize) / range);
         return (int)Math.Round(offset * (double)targetParentSize / parentSize);
+    }
+
+    /// <param name="monitor">逻辑画布中的显示器。</param>
+    private static SharedLayoutRect Rect(SharedMonitor monitor)
+        => new(monitor.X, monitor.Y, monitor.CanvasWidth, monitor.CanvasHeight);
+
+    /// <param name="value">希望放置的起点。</param>
+    /// <param name="minimum">允许的最小值。</param>
+    /// <param name="maximum">允许的最大值。</param>
+    private static int ClampStart(int value, int minimum, int maximum)
+        => maximum < minimum ? minimum : Math.Clamp(value, minimum, maximum);
+
+    /// <param name="x">待检查横坐标。</param>
+    /// <param name="y">待检查纵坐标。</param>
+    /// <param name="width">待检查宽度。</param>
+    /// <param name="height">待检查高度。</param>
+    /// <param name="occupied">已经占用的屏幕。</param>
+    private static bool OverlapsAny(int x, int y, int width, int height, IReadOnlyList<SharedMonitor> occupied)
+        => OverlapsAny(x, y, width, height, occupied.Select(Rect).ToList());
+
+    /// <param name="x">待检查横坐标。</param>
+    /// <param name="y">待检查纵坐标。</param>
+    /// <param name="width">待检查宽度。</param>
+    /// <param name="height">待检查高度。</param>
+    /// <param name="occupied">已经占用的矩形。</param>
+    private static bool OverlapsAny(int x, int y, int width, int height, IReadOnlyList<SharedLayoutRect> occupied)
+    {
+        var candidate = new SharedLayoutRect(x, y, width, height);
+        return occupied.Any(candidate.Overlaps);
+    }
+
+    /// <param name="monitors">同一台电脑的全部屏幕。</param>
+    /// <param name="seedId">从哪块屏幕开始寻找相邻屏幕。</param>
+    private static HashSet<string> ConnectedIds(IReadOnlyList<SharedMonitor> monitors, string seedId)
+    {
+        var connected = new HashSet<string>();
+        var queue = new Queue<SharedMonitor>();
+        var seed = monitors.FirstOrDefault(m => m.Id == seedId);
+        if (seed == null) return connected;
+        connected.Add(seed.Id);
+        queue.Enqueue(seed);
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            foreach (var monitor in monitors)
+                if (!connected.Contains(monitor.Id) && Rect(current).Touches(Rect(monitor)))
+                {
+                    connected.Add(monitor.Id);
+                    queue.Enqueue(monitor);
+                }
+        }
+        return connected;
+    }
+
+    /// <param name="moving">需要整体移动的一组屏幕。</param>
+    /// <param name="baseItems">保持不动、用于吸附的一组屏幕。</param>
+    /// <param name="occupied">不允许重叠的全部屏幕。</param>
+    private static (int Dx, int Dy)? FindCompactShift(IReadOnlyList<SharedMonitor> moving,
+        IReadOnlyList<SharedMonitor> baseItems, IReadOnlyList<SharedMonitor> occupied)
+    {
+        (int Dx, int Dy)? best = null;
+        var bestDistance = int.MaxValue;
+        foreach (var screen in moving)
+        {
+            foreach (var anchor in baseItems)
+            {
+                if (Math.Min(screen.Y + screen.CanvasHeight, anchor.Y + anchor.CanvasHeight) > Math.Max(screen.Y, anchor.Y))
+                {
+                    Consider(anchor.X + anchor.CanvasWidth - screen.X, 0);
+                    Consider(anchor.X - screen.X - screen.CanvasWidth, 0);
+                }
+                if (Math.Min(screen.X + screen.CanvasWidth, anchor.X + anchor.CanvasWidth) > Math.Max(screen.X, anchor.X))
+                {
+                    Consider(0, anchor.Y + anchor.CanvasHeight - screen.Y);
+                    Consider(0, anchor.Y - screen.Y - screen.CanvasHeight);
+                }
+            }
+        }
+        return best;
+
+        void Consider(int dx, int dy)
+        {
+            var distance = Math.Abs(dx) + Math.Abs(dy);
+            if (distance == 0 || distance >= bestDistance) return;
+            var moved = moving.Select(m => new SharedLayoutRect(m.X + dx, m.Y + dy, m.CanvasWidth, m.CanvasHeight)).ToList();
+            if (moved.Any(m => occupied.Any(o => m.Overlaps(Rect(o))))) return;
+            if (!moved.Any(m => baseItems.Any(b => m.Touches(Rect(b))))) return;
+            best = (dx, dy);
+            bestDistance = distance;
+        }
     }
 
     private static void Save(SharedDisplayDocument document)
@@ -198,6 +424,8 @@ public static class SharedDisplayLayout
             if (desired.Monitors.Select(m => (m.Owner, m.Id)).Distinct().Count() != desired.Monitors.Count ||
                 desired.Monitors.Any(m => Math.Abs((long)m.X) > 1000000 || Math.Abs((long)m.Y) > 1000000))
                 throw new InvalidOperationException("显示器位置无效");
+            if (TryFindOverlap(desired.Monitors, out var overlapA, out var overlapB))
+                throw new InvalidOperationException($"显示器不能重叠：{overlapA!.Owner} · {overlapA.Name} / {overlapB!.Owner} · {overlapB.Name}");
             foreach (var group in desired.Monitors.GroupBy(m => m.Owner))
             {
                 var primary = group.FirstOrDefault(m => m.Primary) ?? group.First();

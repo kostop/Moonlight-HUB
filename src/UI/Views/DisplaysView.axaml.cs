@@ -248,7 +248,7 @@ public partial class DisplaysView : UserControl, IRefreshable
         {
             LayoutCanvas.SetSharedDisplays(shared);
             RefreshMonitorLegend(LayoutCanvas.SharedDocument ?? shared);
-            HelpText.Text = "灰色为真实屏，青色为虚拟屏，大小按缩放后的桌面比例显示。拖动主屏或按 Shift 移动整台电脑；拖动虚拟屏右下角调节文字大小，分辨率保持原值。两台 Hub 同步，鼠标自动跨过屏幕间隙。";
+            HelpText.Text = "同一种颜色代表同一台电脑，拖拽只会在同色屏幕之间吸附；所有屏幕都不能重叠。新增屏幕会自动放到本机右下空位，删除后剩余屏幕自动收拢。拖动主屏或按 Shift 移动整台电脑；拖动虚拟屏右下角调节文字大小，分辨率保持原值。";
         }
         if ((DateTime.UtcNow - _lastEnumerate) > TimeSpan.FromSeconds(3))
         {
@@ -287,14 +287,15 @@ public partial class DisplaysView : UserControl, IRefreshable
             var info = new StackPanel { Spacing = 3, MaxWidth = 320 };
             info.Children.Add(new TextBlock { Text = $"{index + 1} · {monitor.Owner} · {monitor.Name}",
                 FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap,
-                Foreground = Ui.Res(monitor.Virtual ? "AccentBrush" : "TextBrush") });
+                Foreground = LayoutCanvas.BrushForOwner(monitor.Owner) });
             info.Children.Add(new TextBlock { Text = $"可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight} · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : "")}",
                 TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
             info.Children.Add(new TextBlock { Text = $"缩放比例 {monitor.ScalePercent}% · 分辨率 {monitor.Width}×{monitor.Height}",
                 TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
             if (monitor.CanScale && monitor.VirtualSlot >= 0) info.Children.Add(MonitorScaleControls(monitor));
             MonitorLegend.Children.Add(new Border { Child = info, Padding = new Thickness(10), Margin = new Thickness(0, 0, 10, 8),
-                Background = Ui.Res("Surface3Brush"), CornerRadius = new CornerRadius(6) });
+                Background = Ui.Res("Surface3Brush"), BorderBrush = LayoutCanvas.BrushForOwner(monitor.Owner),
+                BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(6) });
         }
     }
 
@@ -562,8 +563,23 @@ public partial class DisplaysView : UserControl, IRefreshable
             }
             actions.Children.Add(Ui.B("激活 (扩展)", (_, _) =>
             {
-                var code = DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
-                Log.Info($"扩展拓扑: {code}");
+                var all = DisplayManager.Enumerate();
+                var target = all.FirstOrDefault(x => !string.IsNullOrEmpty(d.SunshineDeviceId) &&
+                        x.SunshineDeviceId.Equals(d.SunshineDeviceId, StringComparison.OrdinalIgnoreCase))
+                    ?? all.FirstOrDefault(x => x.DevicePath.Equals(d.DevicePath, StringComparison.OrdinalIgnoreCase))
+                    ?? d;
+                var code = DisplayManager.ActivateDisplays(new[] { target }, all.Where(x => x.Active).ToList());
+                Log.Info($"显式激活显示器 {d.Label} ({d.GdiName}): {code}");
+                if (code != 0)
+                {
+                    var extend = DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
+                    Log.Info($"显式激活失败，扩展拓扑: {extend}");
+                    _window.Toast("激活显示器", $"{d.Label} 激活失败 ({code})；如果笔记本合盖，请先打开盖子", true);
+                }
+                else
+                {
+                    _window.Toast("激活显示器", $"已请求启用 {d.Label}");
+                }
                 Invalidate();
             }, "GhostButton"));
         }

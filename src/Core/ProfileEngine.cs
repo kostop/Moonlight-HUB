@@ -784,6 +784,14 @@ public sealed class ProfileEngine
             : a.AdapterId.Same(b.AdapterId) && a.TargetId == b.TargetId;
 
         var off = before.Where(b => !displays.Any(d => !d.IsParsec && d.Active && Same(d, b))).ToList();
+        // 合盖/省电时 Windows 会关闭笔记本内屏；它不是主屏时不要为了“恢复”它反复改拓扑，
+        // 否则 Parsec 虚拟屏会在拓扑切换中再次被驱动移除。
+        var keepOff = off.Where(b => b.IsInternalPanel && !b.Primary).ToList();
+        if (keepOff.Count > 0)
+        {
+            Step(result, $"插入虚拟屏后 Windows 关闭了 {string.Join("、", keepOff.Select(d => d.Label))}，保持关闭（笔记本内屏）");
+            off = off.Where(b => !keepOff.Contains(b)).ToList();
+        }
         if (off.Count > 0)
         {
             Step(result, $"插入虚拟屏后 Windows 关闭了 {string.Join("、", off.Select(d => d.Label))}，重新启用");

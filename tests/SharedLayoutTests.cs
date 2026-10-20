@@ -45,6 +45,36 @@ internal static class SharedLayoutTests
             Check(!SharedDisplayLayout.Merge(doc, [p with { X = 0, Y = 0 }, v with { X = 1920, Y = 0 }], 0, 0));
             Check(doc.Monitors[1].X == 2800);
         }));
+        tests.Add(("新增屏幕放到本机右下角且不移动已有屏", () =>
+        {
+            var p = new SharedMonitor("pc", "main", "主屏", 0, 0, 0, 0, 1920, 1080, true, false, true);
+            var s = new SharedMonitor("pc", "second", "副屏", 1920, 0, 1920, 0, 1280, 720, false, false, true);
+            var n = new SharedMonitor("pc", "new", "新屏", 3000, 500, 3000, 500, 1600, 900, false, false, true);
+            var doc = new SharedDisplayDocument { Monitors = [p, s] };
+            Check(SharedDisplayLayout.Merge(doc, [p, s, n], 0, 0));
+            Check(doc.Monitors[0].X == 0 && doc.Monitors[1].X == 1920);
+            Check(doc.Monitors[2].X == 3200 && doc.Monitors[2].Y == 180);
+            Check(!SharedDisplayLayout.TryFindOverlap(doc.Monitors, out _, out _));
+        }));
+        tests.Add(("删除中间屏幕后自动收拢间隔", () =>
+        {
+            var p = new SharedMonitor("pc", "main", "主屏", 0, 0, 0, 0, 1000, 800, true, false, true);
+            var middle = new SharedMonitor("pc", "middle", "中间屏", 1000, 0, 1000, 0, 1000, 800, false, false, true);
+            var right = new SharedMonitor("pc", "right", "右屏", 2000, 0, 2000, 0, 1000, 800, false, false, true);
+            var doc = new SharedDisplayDocument { Monitors = [p, middle, right] };
+            Check(SharedDisplayLayout.Merge(doc, [p, right], 0, 0));
+            Check(doc.Monitors.Single(m => m.Id == "right").X == 1000);
+        }));
+        tests.Add(("历史重叠布局只移动冲突屏幕", () =>
+        {
+            var p = new SharedMonitor("pc", "main", "主屏", 0, 0, 0, 0, 1000, 800, true, false, true);
+            var s = new SharedMonitor("pc", "second", "副屏", 0, 0, 0, 0, 1000, 600, false, false, true);
+            var doc = new SharedDisplayDocument { Monitors = [p, s] };
+            Check(SharedDisplayLayout.Merge(doc, [p, s], 0, 0));
+            Check(doc.Monitors[0].X == 0 && doc.Monitors[0].Y == 0);
+            Check(doc.Monitors[1].X == 1000);
+            Check(!SharedDisplayLayout.TryFindOverlap(doc.Monitors, out _, out _));
+        }));
     }
     private static void Check(bool ok) { if (!ok) throw new Exception("共享布局不符合预期"); }
 }
