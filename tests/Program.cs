@@ -46,6 +46,7 @@ internal static class Program
         DisplayDpiTests.AddTo(tests);
         SharedLayoutTests.AddTo(tests);
         ParsecModeTests.AddTo(tests);
+        DisplayTopologyTests.AddTo(tests);
 
         var failed = 0;
         foreach (var (name, run) in tests)

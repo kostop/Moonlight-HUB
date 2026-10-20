@@ -616,9 +616,10 @@ public sealed class Watchdog : IDisposable
             var spec = specs[i];
             var d = displays.FirstOrDefault(x => x.IsParsec && x.ParsecSlot == i);
             if (d == null) return false;
+            if (profile.Mode != ProfileMode.Clone && d.Active && DisplayManager.SharesPhysicalSource(displays)) return false;
             if (idleOff)
             {
-                // stand-by: an inactive display is fine; while a session runs Sunshine owns mode/refresh rate
+                // 待机中的虚拟屏可以未激活；但激活后不能和物理屏共用 source（复制模式）。
                 continue;
             }
             if (!d.Active) return false;

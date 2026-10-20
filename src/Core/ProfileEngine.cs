@@ -775,10 +775,7 @@ public sealed class ProfileEngine
     private List<DisplayInfo> EnsureParsecEnabled(ApplyResult result, List<DisplayInfo> displays)
     {
         var inactive = displays.Where(d => d.IsParsec && !d.Active).ToList();
-        bool SharesPhysicalSource(List<DisplayInfo> current) => current.Any(v => v.IsParsec && v.Active &&
-            current.Any(p => !p.IsParsec && p.Active && !string.IsNullOrEmpty(v.GdiName) &&
-                p.GdiName.Equals(v.GdiName, StringComparison.OrdinalIgnoreCase)));
-        var sharedSource = SharesPhysicalSource(displays);
+        var sharedSource = DisplayManager.SharesPhysicalSource(displays);
         if (inactive.Count == 0 && !sharedSource) return displays;
         Step(result, sharedSource ? "虚拟屏与物理屏共用显示源，先切换为独立扩展显示再配置" : $"有 {inactive.Count} 块虚拟屏处于待机（停用），临时启用以便配置");
         var code = DisplayManager.ActivateDisplays(inactive, displays);
@@ -788,7 +785,7 @@ public sealed class ProfileEngine
             DisplayManager.SetTopology(NativeMethods.SDC_TOPOLOGY_EXTEND);
         }
         var slots = displays.Where(d => d.IsParsec).Select(d => d.ParsecSlot).ToList();
-        bool AllReady(List<DisplayInfo> current) => !SharesPhysicalSource(current) &&
+        bool AllReady(List<DisplayInfo> current) => !DisplayManager.SharesPhysicalSource(current) &&
             slots.All(slot => current.Any(d => d.IsParsec && d.ParsecSlot == slot && d.IsReady));
         var ready = DisplayManager.WaitFor(AllReady, TimeSpan.FromSeconds(15));
         if (AllReady(ready)) Step(result, "✓ 虚拟屏已启用");
@@ -1426,7 +1423,9 @@ public sealed class ProfileEngine
                 if (d == null || (!d.Active && !idleOff)) drifted.Add(id);
             }
         }
-        var ok = idleOff ? parsecPresent >= expected : parsecActive >= expected;
+        var cloned = profile != null && profile.Mode != ProfileMode.Clone &&
+            DisplayManager.SharesPhysicalSource(displays);
+        var ok = (idleOff ? parsecPresent >= expected : parsecActive >= expected) && !cloned;
         return new HealthReport(ok, parsecActive, parsecPresent, expected, missing, drifted, displays, idleOff);
     }
 }

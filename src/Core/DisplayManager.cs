@@ -199,6 +199,13 @@ public static unsafe class DisplayManager
 
     public static List<DisplayInfo> EnumerateActive() => Enumerate().Where(d => d.Active).ToList();
 
+    /// <summary>判断活动虚拟屏是否和活动物理屏共用同一个 Windows 显示源（即处于复制/镜像模式）。</summary>
+    /// <param name="displays">当前枚举到的显示器快照。</param>
+    public static bool SharesPhysicalSource(IReadOnlyList<DisplayInfo> displays)
+        => displays.Any(v => v.IsParsec && v.Active && !string.IsNullOrEmpty(v.GdiName) &&
+            displays.Any(p => !p.IsParsec && p.Active &&
+                p.GdiName.Equals(v.GdiName, StringComparison.OrdinalIgnoreCase)));
+
     private static HashSet<string> GetPrimaryGdiNames()
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
