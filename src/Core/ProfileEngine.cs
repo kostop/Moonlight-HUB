@@ -821,16 +821,23 @@ public sealed class ProfileEngine
         var inst = _settings.Instance(instanceId);
         if (inst == null || _instances.Get(inst).State != InstanceState.Streaming) return false;
 
-        var live = _instances.StreamingClientAddresses(inst).Count > 0;
+        // RTSP 端口并不始终保有 TCP 连接；以 Sunshine 日志里的客户端连接事件为准。
+        var connected = _instances.LoggedClientConnected(inst);
         lock (_lastLiveStreamUtc)
         {
-            if (live)
+            if (connected == true)
             {
                 _lastLiveStreamUtc[inst.Id] = DateTime.UtcNow;
                 return true;
             }
-            // 短暂保留几秒，避免客户端刚连接、RTSP 尚未建立时被当成空闲。
-            return (DateTime.UtcNow - _lastLiveStreamUtc.GetValueOrDefault(inst.Id, DateTime.MinValue)) < TimeSpan.FromSeconds(12);
+            if (connected == false)
+            {
+                // 日志已记录断开时再等一小段时间，避免客户端重连瞬间被切走。
+                if (!_lastLiveStreamUtc.TryGetValue(inst.Id, out var since)) _lastLiveStreamUtc[inst.Id] = since = DateTime.UtcNow;
+                return (DateTime.UtcNow - since) < TimeSpan.FromSeconds(20);
+            }
+            // 日志还没写出连接事件时按仍在串流处理，宁可多等也不要停用正在用的虚拟屏。
+            return true;
         }
     }
 

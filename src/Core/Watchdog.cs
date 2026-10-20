@@ -331,7 +331,6 @@ public sealed class Watchdog : IDisposable
             }
             NoteStaleBusy(id, rt);
             if (!rt.ConfigDirty || !rt.IsAlive || _engine.IsBusy) continue;
-            if (_instances.StreamingClientAddresses(spec).Count > 0) continue;
             if ((DateTime.UtcNow - _lastStreamingUtc.GetValueOrDefault(id, DateTime.MinValue)) < TimeSpan.FromSeconds(10)) continue; // let Sunshine finish its own revert first
             if ((DateTime.UtcNow - _instanceLastRestart.GetValueOrDefault(id, DateTime.MinValue)) < TimeSpan.FromSeconds(45)) continue;
             _instanceLastRestart[id] = DateTime.UtcNow;

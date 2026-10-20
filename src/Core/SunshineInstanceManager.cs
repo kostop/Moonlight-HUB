@@ -644,6 +644,31 @@ public sealed class SunshineInstanceManager
         }
     }
 
+    /// <summary>读取 Sunshine 日志中最后一次客户端连接/断开事件；null 表示日志里还没有相关记录。</summary>
+    /// <param name="spec">需要检查的 Sunshine 实例。</param>
+    public bool? LoggedClientConnected(InstanceSpec spec)
+    {
+        try
+        {
+            var rt = Get(spec);
+            return File.Exists(rt.LogPath) ? ParseLastClientConnection(ReadTail(rt.LogPath, 128 * 1024)) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>解析日志中最后一条 CLIENT CONNECTED / CLIENT DISCONNECTED。</summary>
+    /// <param name="text">Sunshine 日志文本。</param>
+    public static bool? ParseLastClientConnection(string text)
+    {
+        var connected = text.LastIndexOf("CLIENT CONNECTED", StringComparison.Ordinal);
+        var disconnected = text.LastIndexOf("CLIENT DISCONNECTED", StringComparison.Ordinal);
+        if (connected < 0 && disconnected < 0) return null;
+        return connected > disconnected;
+    }
+
     public string TailLog(InstanceSpec spec, int lines = 200)
     {
         var rt = Get(spec);

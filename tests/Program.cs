@@ -47,6 +47,7 @@ internal static class Program
         SharedLayoutTests.AddTo(tests);
         ParsecModeTests.AddTo(tests);
         DisplayTopologyTests.AddTo(tests);
+        SunshineLogTests.AddTo(tests);
 
         var failed = 0;
         foreach (var (name, run) in tests)
