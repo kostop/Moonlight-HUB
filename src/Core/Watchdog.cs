@@ -327,28 +327,9 @@ public sealed class Watchdog : IDisposable
             if (_engine.IsInstanceStreaming(id))
             {
                 _lastStreamingUtc[id] = DateTime.UtcNow;
-                _staleBusySinceUtc.Remove(id);
                 continue;
             }
             NoteStaleBusy(id, rt);
-            if (rt.State == InstanceState.Streaming)
-            {
-                // 客户端异常断开后 Sunshine 可能一直保持 busy 但没有 RTSP 连接；重启实例清理残留会话。
-                if (!_staleBusySinceUtc.TryGetValue(id, out var staleSince)) _staleBusySinceUtc[id] = staleSince = DateTime.UtcNow;
-                if (rt.IsAlive && !_engine.IsBusy &&
-                    (DateTime.UtcNow - staleSince) >= TimeSpan.FromSeconds(20) &&
-                    (DateTime.UtcNow - _instanceLastRestart.GetValueOrDefault(id, DateTime.MinValue)) >= TimeSpan.FromSeconds(60))
-                {
-                    _instanceLastRestart[id] = DateTime.UtcNow;
-                    _staleBusySinceUtc.Remove(id);
-                    Log.Warn($"实例 {id}: 串流会话已无 RTSP 客户端，重启 Sunshine 清理残留状态");
-                    notes.Add($"重启实例 {id}（清理残留串流会话）");
-                    _ = Task.Run(() => _instances.RestartAsync(spec));
-                    break;
-                }
-                continue;
-            }
-            _staleBusySinceUtc.Remove(id);
             if (!rt.ConfigDirty || !rt.IsAlive || _engine.IsBusy) continue;
             if (_instances.StreamingClientAddresses(spec).Count > 0) continue;
             if ((DateTime.UtcNow - _lastStreamingUtc.GetValueOrDefault(id, DateTime.MinValue)) < TimeSpan.FromSeconds(10)) continue; // let Sunshine finish its own revert first
@@ -664,7 +645,6 @@ public sealed class Watchdog : IDisposable
 
     private readonly Dictionary<int, DateTime> _lastStreamingUtc = new();
     private readonly Dictionary<int, DateTime> _staleBusyLoggedUtc = new();
-    private readonly Dictionary<int, DateTime> _staleBusySinceUtc = new();
 
     /// <summary>记录一次“Sunshine 仍报忙碌但没有 RTSP 客户端”的异常，供现场排查。</summary>
     /// <param name="instanceId">Sunshine 实例编号。</param>
@@ -678,7 +658,7 @@ public sealed class Watchdog : IDisposable
         }
         if ((DateTime.UtcNow - _staleBusyLoggedUtc.GetValueOrDefault(instanceId, DateTime.MinValue)) < TimeSpan.FromMinutes(1)) return;
         _staleBusyLoggedUtc[instanceId] = DateTime.UtcNow;
-        Log.Warn($"实例 {instanceId}: Sunshine 仍报告忙碌，但没有 RTSP 客户端连接，按空闲处理");
+        Log.Warn($"实例 {instanceId}: Sunshine 仍报告忙碌，但没有 RTSP 客户端连接，按空闲处理（不自动重启）");
     }
     private readonly Dictionary<string, DateTime> _activeSinceUtc = new();
     private readonly Dictionary<string, DateTime> _detachFailedUtc = new();
