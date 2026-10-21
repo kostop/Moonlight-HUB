@@ -94,7 +94,7 @@ public sealed class DisplayCanvas : Canvas
         _items.Clear();
         _items.AddRange(document.Monitors.Select(m => new Item { Shared = m, X = m.X, Y = m.Y,
             OrigX = m.X, OrigY = m.Y, W = m.CanvasWidth, H = m.CanvasHeight }));
-        ResolveLoadedOverlaps();
+        if (Interactive) ResolveLoadedOverlaps();
         Redraw(); DraftChanged?.Invoke();
     }
 
@@ -275,7 +275,8 @@ public sealed class DisplayCanvas : Canvas
             BorderBrush = BrushForOwner(monitor.Owner), BorderThickness = new Thickness(monitor.Primary ? 2.5 : monitor.Virtual ? 2 : 1.5),
             Padding = new Thickness(4), ClipToBounds = true, Tag = item, Opacity = monitor.Active ? 1 : .75 };
         var canScale = monitor.CanScale && monitor.VirtualSlot >= 0 && Interactive;
-        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}% · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : string.Empty)}\n每块屏幕独立拖动，同色屏幕之间吸附。" +
+        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}% · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : string.Empty)}\n" +
+            (Interactive ? "每块屏幕独立拖动，同色屏幕之间吸附。" : "在“显示布局”中调整屏幕位置和缩放。") +
             (canScale ? "\n右键选择缩放比例，或拖动右下角调整。" : string.Empty));
         // 名称直接放在屏幕内，小屏按可用宽高等比缩小文字，矩形仍保持真实比例。
         var content = new Grid();
