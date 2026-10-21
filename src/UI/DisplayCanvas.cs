@@ -264,8 +264,8 @@ public sealed class DisplayCanvas : Canvas
     }
 
     /// <param name="item">按可用桌面尺寸绘制的屏幕。</param>
-    /// <param name="monitor">该屏幕的完整信息，显示在图例和提示中。</param>
-    /// <param name="number">与下方图例对应的屏幕编号。</param>
+    /// <param name="monitor">该屏幕的名称、电脑及提示信息。</param>
+    /// <param name="number">布局中的屏幕编号。</param>
     private Border SharedVisual(Item item, SharedMonitor monitor, int number)
     {
         var ownerColor = ((SolidColorBrush)BrushForOwner(monitor.Owner)).Color;
@@ -273,16 +273,34 @@ public sealed class DisplayCanvas : Canvas
             CornerRadius = new CornerRadius(6),
             Background = new SolidColorBrush(Color.FromArgb(monitor.Active ? (byte)34 : (byte)18, ownerColor.R, ownerColor.G, ownerColor.B)),
             BorderBrush = BrushForOwner(monitor.Owner), BorderThickness = new Thickness(monitor.Primary ? 2.5 : monitor.Virtual ? 2 : 1.5),
-            Padding = new Thickness(4), ClipToBounds = true, Tag = item, Opacity = monitor.Active ? 1 : .6 };
-        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}%\n每块屏幕独立拖动，同色屏幕属于同一台电脑，只会在同色范围内吸附。" );
-        // 屏幕框只显示编号，文字信息放到图例，避免小屏缩放后被裁切；边框尺寸仍严格保持比例。
+            Padding = new Thickness(4), ClipToBounds = true, Tag = item, Opacity = monitor.Active ? 1 : .75 };
+        var canScale = monitor.CanScale && monitor.VirtualSlot >= 0 && Interactive;
+        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}% · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : string.Empty)}\n每块屏幕独立拖动，同色屏幕之间吸附。" +
+            (canScale ? "\n右键选择缩放比例，或拖动右下角调整。" : string.Empty));
+        // 名称直接放在屏幕内，小屏按可用宽高等比缩小文字，矩形仍保持真实比例。
         var content = new Grid();
+        var label = new StackPanel { Spacing = 5, HorizontalAlignment = HorizontalAlignment.Center };
+        label.Children.Add(new TextBlock { Text = $"{number} · {monitor.Name}", FontSize = 18,
+            FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center,
+            MaxWidth = 220, Foreground = BrushForOwner(monitor.Owner) });
+        label.Children.Add(new TextBlock { Text = monitor.Owner + (monitor.Primary ? " · 主屏" : !monitor.Active ? " · 待机" : string.Empty),
+            FontSize = 13, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center,
+            MaxWidth = 220, Foreground = Ui.Res("MutedBrush") });
         content.Children.Add(new Viewbox { Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly,
             HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center,
-            Child = new TextBlock { Text = number.ToString(), FontSize = 24, FontWeight = FontWeight.SemiBold,
-                Foreground = BrushForOwner(monitor.Owner) } });
-        if (monitor.CanScale && Interactive)
+            Margin = new Thickness(8, 6, 8, canScale ? 16 : 6), IsHitTestVisible = false, Child = label });
+        if (canScale)
         {
+            var menu = new ContextMenu();
+            var scaling = new MenuItem { Header = $"缩放比例（当前 {monitor.ScalePercent}%）" };
+            foreach (var percent in DisplayDpiScale.Percentages.Where(p => p >= 100 && p <= monitor.MaximumScalePercent))
+            {
+                var option = new MenuItem { Header = $"{percent}%{(percent == monitor.ScalePercent ? " ✓" : string.Empty)}" };
+                option.Click += (_, _) => { if (IsEnabled) ScaleRequested?.Invoke(monitor, percent); };
+                scaling.Items.Add(option);
+            }
+            menu.Items.Add(scaling);
+            border.ContextMenu = menu;
             var handle = new Border { Width = 14, Height = 14, HorizontalAlignment = HorizontalAlignment.Right,
                 VerticalAlignment = VerticalAlignment.Bottom, Cursor = new Cursor(StandardCursorType.BottomRightCorner),
                 Background = Brushes.Transparent, BorderBrush = Ui.Res("AccentBrush"), BorderThickness = new Thickness(0, 0, 3, 3) };

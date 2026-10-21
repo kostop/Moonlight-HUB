@@ -19,7 +19,6 @@
                         </WrapPanel>
                     </StackPanel>
                     <StackPanel DockPanel.Dock="Bottom">
-                        <WrapPanel x:Name="MonitorLegend" Margin="0,10,0,0" />
                         <TextBlock x:Name="DeskflowLayoutText" Classes="muted" TextWrapping="Wrap" Margin="0,8,0,0" Text="" />
                     </StackPanel>
                     <ui:DisplayCanvas x:Name="LayoutCanvas" Height="360" Interactive="True" />

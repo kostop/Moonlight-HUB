@@ -17,7 +17,6 @@ public partial class DisplaysView : UserControl, IRefreshable
     private string _signature = string.Empty;
     private DateTime _lastEnumerate = DateTime.MinValue;
     private string _peerStatusText = string.Empty;
-    private long _legendRevision;
     private bool _scaleOperation;
     private bool _layoutOperation;
     private bool _refreshOperation;
@@ -51,7 +50,7 @@ public partial class DisplaysView : UserControl, IRefreshable
         var busy = DisplayBusy;
         ApplyLayoutBtn.IsEnabled = ResetLayoutBtn.IsEnabled = !busy && LayoutCanvas.HasChanges;
         ExtendBtn.IsEnabled = ReapplyBtn.IsEnabled = !busy;
-        LayoutCanvas.IsEnabled = MonitorLegend.IsEnabled = !busy;
+        LayoutCanvas.IsEnabled = !busy;
         if (busy && !_scaleOperation && !_layoutOperation && !_displayError)
             DeskflowLayoutText.Text = DisplayBusyText;
         else if (!busy && DeskflowLayoutText.Text == DisplayBusyText)
@@ -84,7 +83,7 @@ public partial class DisplaysView : UserControl, IRefreshable
                     await Dispatcher.UIThread.InvokeAsync(() =>
                     {
                         LayoutCanvas.ClearPeerDraft(); LayoutCanvas.SetSharedDisplays(applied);
-                        _legendRevision = 0; Invalidate(); Refresh();
+                        Invalidate(); Refresh();
                         DeskflowLayoutText.Text = "两台电脑的显示器布局已同步";
                     });
                 }
@@ -247,8 +246,7 @@ public partial class DisplaysView : UserControl, IRefreshable
         if (OperatingSystem.IsWindows() && Hub.Deskflow.SharedDisplays is { } shared)
         {
             LayoutCanvas.SetSharedDisplays(shared);
-            RefreshMonitorLegend(LayoutCanvas.SharedDocument ?? shared);
-            HelpText.Text = "每块屏幕都可以独立拖动。同一种颜色代表同一台电脑，拖拽只会在同色屏幕之间吸附；所有屏幕都不能重叠。屏幕暂时断开时保留原位，重新连接后自动恢复；新增屏幕会放到本机右下空位。拖动虚拟屏右下角调节文字大小，分辨率保持原值。";
+            HelpText.Text = "同色代表同一台电脑。每块屏幕独立拖动并在同色屏幕之间吸附，不能重叠；重新连接后保留位置。虚拟屏可拖动右下角调节缩放，也可右键选择比例，分辨率保持原值。";
         }
         if ((DateTime.UtcNow - _lastEnumerate) > TimeSpan.FromSeconds(3))
         {
@@ -275,49 +273,6 @@ public partial class DisplaysView : UserControl, IRefreshable
 
     // ------------------------------------------------------------------ pointer speed per screen
 
-    /// <param name="document">与画布编号一致的两台电脑显示器列表。</param>
-    private void RefreshMonitorLegend(SharedDisplayDocument document)
-    {
-        if (_legendRevision == document.Revision) return;
-        _legendRevision = document.Revision;
-        MonitorLegend.Children.Clear();
-        for (var index = 0; index < document.Monitors.Count; index++)
-        {
-            var monitor = document.Monitors[index];
-            var info = new StackPanel { Spacing = 3, MaxWidth = 320 };
-            info.Children.Add(new TextBlock { Text = $"{index + 1} · {monitor.Owner} · {monitor.Name}",
-                FontWeight = FontWeight.SemiBold, TextWrapping = TextWrapping.Wrap,
-                Foreground = LayoutCanvas.BrushForOwner(monitor.Owner) });
-            info.Children.Add(new TextBlock { Text = $"可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight} · {(monitor.Virtual ? "虚拟屏" : "真实屏")}{(monitor.Primary ? " · 主屏" : "")}",
-                TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
-            info.Children.Add(new TextBlock { Text = $"缩放比例 {monitor.ScalePercent}% · 分辨率 {monitor.Width}×{monitor.Height}",
-                TextWrapping = TextWrapping.Wrap, Foreground = Ui.Res("MutedBrush") });
-            if (monitor.CanScale && monitor.VirtualSlot >= 0) info.Children.Add(MonitorScaleControls(monitor));
-            MonitorLegend.Children.Add(new Border { Child = info, Padding = new Thickness(10), Margin = new Thickness(0, 0, 10, 8),
-                Background = Ui.Res("Surface3Brush"), BorderBrush = LayoutCanvas.BrushForOwner(monitor.Owner),
-                BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(6) });
-        }
-    }
-
-    /// <param name="monitor">本机或对端可调整的独立虚拟屏。</param>
-    private Control MonitorScaleControls(SharedMonitor monitor)
-    {
-        var maximum = Math.Max(100, monitor.MaximumScalePercent);
-        var input = new ComboBox { Width = 95, VerticalAlignment = VerticalAlignment.Center };
-        foreach (var percent in DisplayDpiScale.Percentages.Where(p => p >= 100 && p <= maximum))
-            input.Items.Add(new ComboBoxItem { Content = $"{percent}%", Tag = percent });
-        input.SelectedItem = input.Items.OfType<ComboBoxItem>().FirstOrDefault(i => (int)i.Tag! == monitor.ScalePercent);
-        var apply = Ui.B("应用", (_, _) =>
-        {
-            if (input.SelectedItem is ComboBoxItem { Tag: int percent }) ApplyMonitorScale(monitor, percent);
-        }, "GhostButton");
-        apply.Padding = new Thickness(10, 4);
-        var row = Ui.Row(Ui.T("缩放比例", "Muted"), input, apply);
-        row.Margin = new Thickness(0, 6, 0, 0);
-        ToolTip.SetTip(row, $"调高后文字和按钮更大，只调整这块虚拟屏的显示比例，分辨率保持原值，无需重启串流。当前 Windows 支持 100–{maximum}%。");
-        return row;
-    }
-
     /// <param name="monitor">本机或对端被调整的虚拟屏。</param>
     /// <param name="percent">选择或拖动产生的真实显示缩放百分比。</param>
     private void ApplyMonitorScale(SharedMonitor monitor, int percent)
@@ -340,7 +295,7 @@ public partial class DisplaysView : UserControl, IRefreshable
                 await Hub.Deskflow.RefreshSharedDisplaysAsync().ConfigureAwait(false);
                 await Dispatcher.UIThread.InvokeAsync(() => {
                     if (Hub.Deskflow.SharedDisplays is { } document) LayoutCanvas.RebaseSharedDisplays(document);
-                    _legendRevision = 0; Refresh(); DeskflowLayoutText.Text = message; _window.Toast("缩放比例", message);
+                    Refresh(); DeskflowLayoutText.Text = message; _window.Toast("缩放比例", message);
                 });
             }
             catch (Exception ex)
@@ -626,7 +581,7 @@ public partial class DisplaysView : UserControl, IRefreshable
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     _displayError = false; LayoutCanvas.RebaseSharedDisplays(fresh);
-                    _legendRevision = 0; Invalidate(); Refresh();
+                    Invalidate(); Refresh();
                 });
             }
             catch (Exception ex)
