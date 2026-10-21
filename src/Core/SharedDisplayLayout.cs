@@ -33,6 +33,8 @@ public sealed class SharedDisplayDocument
     public long Revision { get; set; }
     public string Server { get; set; } = string.Empty;
     public List<SharedMonitor> Monitors { get; set; } = new();
+    // 断开的屏幕不参与路由，但保留最后确认的位置，以便重连或重启后恢复。
+    public List<SharedMonitor> RememberedMonitors { get; set; } = new();
 }
 public sealed record MonitorPlacement(string Id, int X, int Y, int Width, int Height);
 
@@ -83,49 +85,77 @@ public static class SharedDisplayLayout
     {
         if (monitors.Count == 0) return false;
         var owner = monitors[0].Owner;
-        var prior = document.Monitors.Where(m => m.Owner == owner).ToList();
+        var prior = document.Monitors.Where(m => SameOwner(m.Owner, owner)).ToList();
+        RememberPositions(document, prior, overwrite: false);
+        var remembered = document.RememberedMonitors.Where(m => SameOwner(m.Owner, owner)).ToList();
         var primary = monitors.FirstOrDefault(m => m.Primary) ?? monitors[0];
-        var oldPrimary = prior.FirstOrDefault(m => m.Primary) ?? prior.FirstOrDefault(m => m.Id == primary.Id);
+        var oldPrimary = remembered.Concat(prior).FirstOrDefault(m => SameMonitor(m, primary));
         var anchorX = oldPrimary?.X ?? fallbackX;
         var anchorY = oldPrimary?.Y ?? fallbackY;
-        var otherOwners = document.Monitors.Where(m => m.Owner != owner).ToList();
+        var otherOwners = document.Monitors.Where(m => !SameOwner(m.Owner, owner)).ToList();
         var updated = monitors.Select(m =>
         {
-            var old = prior.FirstOrDefault(p => p.Id == m.Id);
-            // Hub 自己保存的逻辑摆放不被 Windows 的物理像素坐标覆盖。
-            if (old != null && old.NativeX == m.NativeX && old.NativeY == m.NativeY)
-                return m with { X = old.X + anchorX - (oldPrimary?.X ?? anchorX), Y = old.Y + anchorY - (oldPrimary?.Y ?? anchorY) };
+            var old = remembered.Concat(prior).FirstOrDefault(p => SameMonitor(p, m));
+            // 热插拔可能改变 Windows 坐标、主屏和枚举顺序，不能据此覆盖用户的逻辑摆放。
+            // 每次从确认位置解冲突，临时 DPI 尺寸恢复后即可回原位，不沿用临时避让位置。
+            if (old != null) return m with { X = old.X, Y = old.Y };
             return m with { X = anchorX + ProjectAxis(m.NativeX - primary.NativeX, primary.Width, m.Width, primary.CanvasWidth, m.CanvasWidth),
                 Y = anchorY + ProjectAxis(m.NativeY - primary.NativeY, primary.Height, m.Height, primary.CanvasHeight, m.CanvasHeight) };
         }).ToList();
-        // 首次发现这台电脑时沿用 Windows 的物理排列；之后再新增屏幕才放到现有区域的右下空位。
-        if (prior.Count > 0)
+
+        // 持续连接且仍在确认位置的屏幕优先；临时避让和重连屏其次，新屏最后。
+        var placed = new List<SharedMonitor>();
+        var order = Enumerable.Range(0, updated.Count)
+            .OrderBy(i =>
+            {
+                var live = prior.FirstOrDefault(m => SameMonitor(m, updated[i]));
+                var saved = remembered.FirstOrDefault(m => SameMonitor(m, updated[i]));
+                if (live != null && (saved == null || live.X == saved.X && live.Y == saved.Y)) return 0;
+                return saved != null ? 1 : 2;
+            })
+            .ThenBy(i => { var index = remembered.FindIndex(m => SameMonitor(m, updated[i])); return index < 0 ? i : index; });
+        foreach (var index in order)
         {
-            for (var index = 0; index < updated.Count; index++)
+            var item = updated[index];
+            var known = remembered.Any(m => SameMonitor(m, item));
+            var occupied = placed.Concat(otherOwners).ToList();
+            if ((remembered.Count > 0 && !known) || occupied.Any(m => Rect(m).Overlaps(Rect(item))))
             {
-                if (prior.Any(p => p.Id == updated[index].Id)) continue;
-                var occupied = updated.Where((_, i) => i != index).Concat(otherOwners).ToList();
-                var (x, y) = FindFreePosition(updated.Where((_, i) => i != index).ToList(), occupied,
-                    updated[index].CanvasWidth, updated[index].CanvasHeight, anchorX, anchorY);
-                updated[index] = updated[index] with { X = x, Y = y };
+                var (x, y) = FindFreePosition(placed, occupied, item.CanvasWidth, item.CanvasHeight, anchorX, anchorY);
+                item = item with { X = x, Y = y };
             }
-            // 旧布局若已经重叠，只移动后出现的那一块，不用重排整台电脑。
-            for (var index = 1; index < updated.Count; index++)
-            {
-                var box = Rect(updated[index]);
-                if (!updated.Take(index).Concat(otherOwners).Any(m => Rect(m).Overlaps(box))) continue;
-                var occupied = updated.Where((_, i) => i != index).Concat(otherOwners).ToList();
-                var (x, y) = FindFreePosition(updated.Where((_, i) => i != index).ToList(), occupied,
-                    updated[index].CanvasWidth, updated[index].CanvasHeight, anchorX, anchorY);
-                updated[index] = updated[index] with { X = x, Y = y };
-            }
+            updated[index] = item;
+            placed.Add(item);
         }
-        if (prior.Any(old => monitors.All(m => m.Id != old.Id)))
-            CompactOwner(updated, owner, primary.Id, otherOwners);
+        // 临时冲突只改变在线位置；原位保留到用户明确应用摆放时再更新。
+        RememberPositions(document, updated, overwrite: false);
         if (prior.SequenceEqual(updated)) return false;
-        document.Monitors.RemoveAll(m => m.Owner == owner);
+        document.Monitors.RemoveAll(m => SameOwner(m.Owner, owner));
         document.Monitors.AddRange(updated);
         return true;
+    }
+
+    /// <param name="first">第一个显示器所属电脑名。</param>
+    /// <param name="second">第二个显示器所属电脑名。</param>
+    private static bool SameOwner(string first, string second)
+        => string.Equals(first, second, StringComparison.OrdinalIgnoreCase);
+
+    /// <param name="first">第一块显示器的身份。</param>
+    /// <param name="second">第二块显示器的身份。</param>
+    private static bool SameMonitor(SharedMonitor first, SharedMonitor second)
+        => SameOwner(first.Owner, second.Owner) && string.Equals(first.Id, second.Id, StringComparison.OrdinalIgnoreCase);
+
+    /// <param name="document">包含断开屏幕位置记忆的共享布局。</param>
+    /// <param name="monitors">需要记住位置的显示器。</param>
+    /// <param name="overwrite">用户明确应用摆放时，覆盖已有位置记忆。</param>
+    public static void RememberPositions(SharedDisplayDocument document, IReadOnlyList<SharedMonitor> monitors, bool overwrite)
+    {
+        foreach (var monitor in monitors)
+        {
+            var index = document.RememberedMonitors.FindIndex(m => SameMonitor(m, monitor));
+            if (index < 0) document.RememberedMonitors.Add(monitor);
+            else if (overwrite) document.RememberedMonitors[index] = monitor;
+        }
     }
 
     /// <param name="monitors">同一台电脑的待摆放屏幕。</param>
@@ -249,7 +279,8 @@ public static class SharedDisplayLayout
     }
 
     public static SharedDisplayDocument Clone(SharedDisplayDocument document)
-        => new() { Revision = document.Revision, Server = document.Server, Monitors = document.Monitors.ToList() };
+        => new() { Revision = document.Revision, Server = document.Server, Monitors = document.Monitors.ToList(),
+            RememberedMonitors = document.RememberedMonitors.ToList() };
 
     /// <param name="offset">当前坐标系中相对主屏的偏移。</param>
     /// <param name="parentSize">当前坐标系中主屏的尺寸。</param>
@@ -369,8 +400,23 @@ public static class SharedDisplayLayout
     /// <param name="document">服务端确认的共享布局，在角色切换后继续使用。</param>
     public static void CacheDocument(SharedDisplayDocument document)
     {
-        lock (Gate) { _current = Clone(document); Save(_current); }
+        lock (Gate)
+        {
+            if (!CanCacheDocument(_current, document)) return;
+            var cached = Clone(document);
+            if (_current != null && SameOwner(_current.Server, cached.Server))
+                RememberPositions(cached, _current.RememberedMonitors, overwrite: false);
+            RememberPositions(cached, cached.Monitors, overwrite: false);
+            _current = cached;
+            Save(_current);
+        }
     }
+
+    /// <param name="current">已保存的共享布局；首次加载时可以为空。</param>
+    /// <param name="incoming">异步请求返回的布局快照。</param>
+    public static bool CanCacheDocument(SharedDisplayDocument? current, SharedDisplayDocument incoming)
+        => current == null || string.IsNullOrWhiteSpace(current.Server) || !SameOwner(current.Server, incoming.Server)
+           || incoming.Revision >= current.Revision;
 
     /// <param name="hub">拥有这些显示器的 Hub。</param>
     /// <param name="positions">稳定 ID、期望分辨率和新的 Windows 坐标。</param>
@@ -442,7 +488,15 @@ public static class SharedDisplayLayout
                     if (index >= 0) desired.Monitors[index] = monitor with { X = desired.Monitors[index].X, Y = desired.Monitors[index].Y };
                 }
             }
-            lock (Gate) { desired.Revision = DateTime.UtcNow.Ticks; _current = Clone(desired); Save(_current); }
+            lock (Gate)
+            {
+                // 草稿可能来自旧客户端：先保留服务端的离线屏记忆，再提交此次明确的在线摆放。
+                RememberPositions(desired, current.RememberedMonitors, overwrite: false);
+                RememberPositions(desired, desired.Monitors, overwrite: true);
+                desired.Revision = DateTime.UtcNow.Ticks;
+                _current = Clone(desired);
+                Save(_current);
+            }
             return desired;
         }
         finally { ApplyGate.Release(); }

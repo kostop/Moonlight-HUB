@@ -32,6 +32,7 @@ public sealed class ProfileEngine
     }
 
     public bool IsBusy => _busy.CurrentCount == 0;
+    public DateTime LastExplicitApplyUtc { get; private set; }
     public string CurrentStep { get; private set; } = string.Empty;
     public event Action<string>? Progress;
     public event Action? Applied;
@@ -358,6 +359,52 @@ public sealed class ProfileEngine
     private static bool Overlaps(DisplayInfo a, DisplayInfo b)
         => a.PositionX < b.PositionX + b.Width && b.PositionX < a.PositionX + a.Width && a.PositionY < b.PositionY + b.Height && b.PositionY < a.PositionY + a.Height;
 
+    /// <summary>热插拔稳定后只恢复记忆的坐标和主屏，不切换模式或重启串流实例。</summary>
+    /// <param name="profile">提供虚拟屏位置记忆的当前扩展方案。</param>
+    /// <param name="expectedIds">断开前的完整物理屏集合，子集期间不能覆盖它。</param>
+    public LayoutResult RestoreRememberedPositions(Profile profile, IReadOnlyCollection<string> expectedIds)
+    {
+        var result = new LayoutResult();
+        if (!_busy.Wait(0))
+        {
+            result.Messages.Add("等待正在进行的显示操作结束后恢复布局");
+            return result;
+        }
+        try
+        {
+            var displays = DisplayManager.Enumerate();
+            var specs = profile.VirtualDisplays.OrderBy(v => v.Slot).Take(profile.VirtualCount).ToList();
+            var plan = DisplayReconnectLayout.Build(displays, expectedIds, _state.PhysicalLayout, specs);
+            if (!plan.Ready) { result.Messages.Add(plan.Reason); return result; }
+            if (plan.Changed)
+            {
+                result = DisplayManager.ApplyLayout(plan.Items);
+                if (!result.Success) return result;
+                Thread.Sleep(300);
+                displays = DisplayManager.Enumerate();
+                var verified = DisplayReconnectLayout.Build(displays, expectedIds, _state.PhysicalLayout, specs);
+                if (!verified.Ready || verified.Changed)
+                {
+                    result.Success = false;
+                    result.Messages.Add("显示器重连布局尚未稳定，稍后重试恢复");
+                    return result;
+                }
+            }
+            _state.LastAppliedActiveIds = displays.Where(d => d.IsReady && !d.IsParsec).Select(d => d.SunshineDeviceId).ToList();
+            _state.Save();
+            result.Success = true;
+            result.Messages.Add("已恢复显示器重连前的位置和主屏");
+            return result;
+        }
+        catch (Exception ex)
+        {
+            result.Success = false;
+            result.Messages.Add("恢复显示器位置失败: " + ex.Message);
+            return result;
+        }
+        finally { _busy.Release(); }
+    }
+
     private void Step(ApplyResult result, string text)
     {
         CurrentStep = text;
@@ -366,7 +413,10 @@ public sealed class ProfileEngine
         try { Progress?.Invoke(text); } catch { }
     }
 
-    public async Task<ApplyResult> ApplyAsync(Profile profile, CancellationToken ct = default)
+    /// <param name="profile">要应用的显示方案。</param>
+    /// <param name="ct">用户取消操作的通知。</param>
+    /// <param name="automatic">启动或守护自动修复，不能以缺屏子集覆盖重连前的完整目标。</param>
+    public async Task<ApplyResult> ApplyAsync(Profile profile, CancellationToken ct = default, bool automatic = false)
     {
         if (!await _busy.WaitAsync(0, ct).ConfigureAwait(false))
         {
@@ -374,7 +424,9 @@ public sealed class ProfileEngine
         }
         try
         {
-            return await Task.Run(() => ApplyCore(profile, ct), ct).ConfigureAwait(false);
+            var result = await Task.Run(() => ApplyCore(profile, ct, automatic), ct).ConfigureAwait(false);
+            if (result.Success && !automatic) LastExplicitApplyUtc = _state.LastAppliedUtc;
+            return result;
         }
         finally
         {
@@ -384,7 +436,7 @@ public sealed class ProfileEngine
         }
     }
 
-    private ApplyResult ApplyCore(Profile profile, CancellationToken ct)
+    private ApplyResult ApplyCore(Profile profile, CancellationToken ct, bool automatic)
     {
         var result = new ApplyResult();
         Step(result, $"开始应用方案「{profile.Name}」({profile.ModeText})");
@@ -634,8 +686,10 @@ public sealed class ProfileEngine
             _state.ExpectedVirtualDisplays = want;
             _state.ExpectedInstances = mapping.Keys.OrderBy(k => k).ToList();
             _state.InstanceOutputIds = mapping;
-            // the physical displays this apply saw (the reference for "did the user rearrange something" later)
-            _state.LastAppliedActiveIds = DisplayManager.Enumerate().Where(d => d.Active && d.IsReady && !d.IsParsec).Select(d => d.SunshineDeviceId).ToList();
+            // 自动修复和失败的应用不能把临时缺屏子集写成新目标，进程重启后仍需等待原屏回归。
+            var activePhysicalIds = DisplayManager.Enumerate().Where(d => d.Active && d.IsReady && !d.IsParsec).Select(d => d.SunshineDeviceId);
+            _state.LastAppliedActiveIds = DisplayReconnectLayout.ExpectedIdsAfterApply(_state.LastAppliedActiveIds,
+                activePhysicalIds, automatic || !result.Success);
             _state.Save();
             _settings.ActiveProfileId = profile.Id;
             _settings.Save();
@@ -979,7 +1033,7 @@ public sealed class ProfileEngine
         var profile = _settings.Profile(_state.ActiveProfileId);
         if (profile != null && profile.VirtualCount > slot)
         {
-            var r = await ApplyAsync(profile).ConfigureAwait(false);
+            var r = await ApplyAsync(profile, automatic: true).ConfigureAwait(false);
             return (r.Success, r.Success ? $"虚拟屏 #{slot + 1} 已重新插拔，驱动模式表已更新" : r.Summary);
         }
         return (true, $"虚拟屏 #{slot + 1} 已重新插拔");
@@ -1095,7 +1149,7 @@ public sealed class ProfileEngine
         var (w, h) = ResolveResolution(profile, spec, display?.GdiName);
         var published = KnownRates(slot, display?.IsReady == true ? display.GdiName : null, w, h);
         var streaming = IsSpecStreaming(spec);
-        var r = await ApplyAsync(profile).ConfigureAwait(false);
+        var r = await ApplyAsync(profile, automatic: true).ConfigureAwait(false);
         if (!r.Success) return (false, r.Summary);
         var target = TargetHz(profile, spec, DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot));
         if (!published.Contains(hz) && ParsecModes.RegisteredRates(w, h).Contains(hz))
@@ -1132,7 +1186,7 @@ public sealed class ProfileEngine
         _settings.Save();
         Log.Info($"用户把虚拟屏 #{slot + 1} 设为 {width}x{height}@{hz}Hz（记入方案「{profile.Name}」）");
 
-        var result = await ApplyAsync(profile).ConfigureAwait(false);
+        var result = await ApplyAsync(profile, automatic: true).ConfigureAwait(false);
         if (!result.Success) return (false, result.Summary);
 
         var after = DisplayManager.Enumerate().FirstOrDefault(d => d.IsParsec && d.ParsecSlot == slot);

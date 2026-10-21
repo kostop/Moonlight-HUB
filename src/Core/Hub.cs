@@ -157,7 +157,7 @@ public sealed class Hub : IDisposable
             {
                 Log.Info($"启动时自动应用方案「{profile.Name}」(延迟 {Settings.StartupDelaySeconds}s)");
                 await Task.Delay(TimeSpan.FromSeconds(Math.Clamp(Settings.StartupDelaySeconds, 0, 120))).ConfigureAwait(false);
-                await Engine.ApplyAsync(profile).ConfigureAwait(false);
+                await Engine.ApplyAsync(profile, automatic: true).ConfigureAwait(false);
             }
         }
         if (Settings.WatchdogEnabled) Watchdog.Start();

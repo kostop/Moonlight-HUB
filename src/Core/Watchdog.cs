@@ -14,12 +14,14 @@ public sealed class Watchdog : IDisposable
     private readonly ParsecVdd _vdd;
     private readonly SunshineInstanceManager _instances;
     private readonly ProfileEngine _engine;
+    private readonly DisplayReconnectState _displayReconnect;
     private readonly System.Threading.Timer _timer;
     private readonly object _gate = new();
     private bool _ticking;
     private DateTime _lastRepairUtc = DateTime.MinValue;
     private DateTime _pendingVerifyUtc = DateTime.MaxValue;
     private int _displayMismatchTicks;
+    private DateTime _lastExplicitApplyUtc;
     private readonly Dictionary<int, int> _instanceMissingTicks = new();
     private readonly Dictionary<int, DateTime> _instanceLastRestart = new();
 
@@ -37,6 +39,7 @@ public sealed class Watchdog : IDisposable
         _vdd = vdd;
         _instances = instances;
         _engine = engine;
+        _displayReconnect = new DisplayReconnectState(state.LastAppliedActiveIds);
         _timer = new System.Threading.Timer(_ => Tick(), null, Timeout.Infinite, Timeout.Infinite);
         if (!subscribeSystemEvents) return;
         try
@@ -88,11 +91,13 @@ public sealed class Watchdog : IDisposable
         if (_engine.IsBusy) return; // our own change
         try
         {
-            var active = DisplayManager.Enumerate().Where(d => d.Active).Select(d => $"{d.GdiName}={d.Width}x{d.Height}@{d.RefreshRate}({d.PositionX},{d.PositionY}){(d.Primary ? "*" : "")}");
+            var displays = DisplayManager.Enumerate();
+            _displayReconnect.Observe(displays);
+            var active = displays.Where(d => d.Active).Select(d => $"{d.GdiName}={d.Width}x{d.Height}@{d.RefreshRate}({d.PositionX},{d.PositionY}){(d.Primary ? "*" : "")}");
             Log.Info("显示设置变化: " + string.Join(" | ", active));
         }
         catch { }
-        _manualChangeUtc = DateTime.UtcNow;
+        _manualChangeUtc = _displayReconnect.Pending ? DateTime.MinValue : DateTime.UtcNow;
         _lastDisplayChangeUtc = DateTime.UtcNow;
         RequestVerify(TimeSpan.FromSeconds(12), "显示设置发生变化");
     }
@@ -173,6 +178,17 @@ public sealed class Watchdog : IDisposable
         }
 
         var health = _engine.CheckHealth();
+        if (_lastExplicitApplyUtc != _engine.LastExplicitApplyUtc)
+        {
+            _lastExplicitApplyUtc = _engine.LastExplicitApplyUtc;
+            _displayReconnect.Reset(_state.LastAppliedActiveIds);
+        }
+        if (profile.Mode == ProfileMode.Extend && _displayReconnect.Observe(health.Displays))
+        {
+            _manualChangeUtc = DateTime.MinValue;
+            _lastDisplayChangeUtc = DateTime.UtcNow;
+            RequestVerify(TimeSpan.FromSeconds(12), "物理显示器连接变化，保留完整布局记忆");
+        }
         foreach (var virtualDisplay in profile.VirtualDisplays.Where(v => v.WindowsScalePercent > 0))
             _engine.RestoreVirtualDpiAsync(virtualDisplay.Slot).GetAwaiter().GetResult();
         var needRepair = false;
@@ -423,7 +439,23 @@ public sealed class Watchdog : IDisposable
                 return;
             }
             _pendingVerifyUtc = DateTime.MaxValue;
-            if (_manualChangeUtc != DateTime.MinValue && health.VirtualDisplaysOk)
+            if (_displayReconnect.Pending && profile.Mode == ProfileMode.Extend)
+            {
+                _manualChangeUtc = DateTime.MinValue;
+                var restored = _engine.RestoreRememberedPositions(profile, _displayReconnect.ExpectedIds);
+                if (restored.Success)
+                {
+                    health = _engine.CheckHealth();
+                    if (_displayReconnect.Complete(health.Displays)) notes.Add("已恢复显示器重连前的位置和主屏");
+                    else _pendingVerifyUtc = DateTime.UtcNow.AddSeconds(6);
+                }
+                else
+                {
+                    _pendingVerifyUtc = DateTime.UtcNow.AddSeconds(6);
+                    notes.Add(restored.ToString());
+                }
+            }
+            else if (_manualChangeUtc != DateTime.MinValue && health.VirtualDisplaysOk)
             {
                 _manualChangeUtc = DateTime.MinValue;
                 if (_engine.RememberLayout(health.Displays)) notes.Add("已记住手动摆放的位置");
@@ -444,7 +476,7 @@ public sealed class Watchdog : IDisposable
             _lastRepairUtc = DateTime.UtcNow;
             if (urgentRepair) _keepAliveStallUtc = DateTime.MinValue; // one urgent repair per stall
             Log.Warn("守护: 重新应用方案「" + profile.Name + "」 (" + string.Join("; ", notes) + ")" + (_failedRepairs > 0 ? $"，连续失败 {_failedRepairs} 次" : string.Empty));
-            _ = _engine.ApplyAsync(profile).ContinueWith(t =>
+            _ = _engine.ApplyAsync(profile, automatic: true).ContinueWith(t =>
             {
                 var ok = t.Status == TaskStatus.RanToCompletion && t.Result.Success;
                 _failedRepairs = ok ? 0 : Math.Min(_failedRepairs + 1, 8);
