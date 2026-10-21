@@ -14,6 +14,72 @@ internal static class SharedLayoutTests
             var enlarged = phone with { Width = 1824, Height = 840, ContentScalePercent = 150 };
             Check(enlarged.CanvasWidth == 912 && enlarged.CanvasHeight == 420);
         }));
+        tests.Add(("待机虚拟屏启动无缓存时使用保存的 175% 和 200% DPI", () =>
+        {
+            foreach (var percent in new[] { 175, 200 })
+            {
+                var spec = new VirtualDisplaySpec { WindowsScalePercent = percent };
+                Check(SharedDisplayLayout.ResolveLocalScalePercent(0, spec, null, 0) == percent);
+                spec.ContentScaleCurrentDpiPercent = 100;
+                Check(SharedDisplayLayout.ResolveLocalScalePercent(0, spec, 1, 100) == percent);
+            }
+        }));
+        tests.Add(("就绪显示器实际 125% DPI 优先于保存的 175%", () =>
+        {
+            var spec = new VirtualDisplaySpec { WindowsScalePercent = 175, ContentScaleCurrentDpiPercent = 200 };
+            Check(SharedDisplayLayout.ResolveLocalScalePercent(125, spec, 2, 200) == 125);
+        }));
+        tests.Add(("无保存目标时 DPI 缓存和旧数据仍可回退", () =>
+        {
+            var spec = new VirtualDisplaySpec { ContentScaleCurrentDpiPercent = 175 };
+            Check(SharedDisplayLayout.ResolveLocalScalePercent(0, spec, 1.5, 200) == 150);
+            Check(SharedDisplayLayout.ResolveLocalScalePercent(0, spec, null, 200) == 200);
+            Check(SharedDisplayLayout.ResolveLocalScalePercent(0, spec, null, 0) == 175);
+            Check(SharedDisplayLayout.ResolveLocalScalePercent(0, null, null, 0) == 100);
+        }));
+        tests.Add(("待机目标未设置且在线快照已变 100% 时优先持久化 175% 记忆", () =>
+        {
+            var remembered = Screen("standby", 9559, 0) with { Virtual = true, Active = false, WindowsScalePercent = 175 };
+            var doc = new SharedDisplayDocument { Monitors = [remembered with { WindowsScalePercent = 100 }], RememberedMonitors = [remembered] };
+            var json = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+            doc = JsonSerializer.Deserialize<SharedDisplayDocument>(JsonSerializer.Serialize(doc, json), json)!;
+            var dpi = SharedDisplayLayout.RememberedScalePercent(doc, "PC", "STANDBY");
+            var spec = new VirtualDisplaySpec { WindowsScalePercent = 0, ContentScaleCurrentDpiPercent = 0 };
+            Check(dpi == 175 && SharedDisplayLayout.ResolveLocalScalePercent(0, spec, null, 100, dpi) == 175);
+            Check(SharedDisplayLayout.ResolveLocalScalePercent(0, spec, 2, 100, dpi) == 200);
+            Check(SharedDisplayLayout.ResolveLocalScalePercent(125, spec, null, 100, dpi) == 125);
+            Check(SharedDisplayLayout.RememberedScalePercent(doc, "qingxian", "standby") == 0);
+        }));
+        tests.Add(("无配置目标的待机屏从记忆恢复 DPI 后回到合法原位", () =>
+        {
+            var p = Screen("main", 0, 0, primary: true);
+            var s = Screen("standby", 1000, 0) with { Width = 2000, Height = 1200, Virtual = true, Active = false, WindowsScalePercent = 175 };
+            var external = Screen("external", 2143, 0);
+            var doc = new SharedDisplayDocument { Monitors = [p, external, s], RememberedMonitors = [p, external, s] };
+            var polluted = s with { WindowsScalePercent = 100 };
+            SharedDisplayLayout.Merge(doc, [p, external, polluted], 0, 0);
+            Check(doc.Monitors.Single(m => m.Id == "standby").X != 1000);
+            var startup = polluted with { WindowsScalePercent = SharedDisplayLayout.ResolveLocalScalePercent(0,
+                new VirtualDisplaySpec(), null, 100, SharedDisplayLayout.RememberedScalePercent(doc, "pc", "standby")) };
+            Check(SharedDisplayLayout.Merge(doc, [p, external, startup], 0, 0));
+            Position(doc, "standby", 1000, 0);
+            Position(doc, "external", 2143, 0);
+            Check(!SharedDisplayLayout.Merge(doc, [p, external, startup], 0, 0));
+        }));
+        tests.Add(("待机屏启动刷新不会因缺少 DPI 缓存挪动合法摆放", () =>
+        {
+            var p = Screen("main", 0, 0, primary: true);
+            var s = Screen("standby", 1000, 0) with { Width = 2000, Height = 1200, Virtual = true, Active = false, WindowsScalePercent = 175 };
+            var external = Screen("external", 2143, 0);
+            var doc = new SharedDisplayDocument { Monitors = [p, external, s] };
+            var spec = new VirtualDisplaySpec { WindowsScalePercent = 175 };
+            var startup = s with { WindowsScalePercent = SharedDisplayLayout.ResolveLocalScalePercent(0, spec, null, 0) };
+            Check(startup.CanvasWidth == 1143 && startup.CanvasHeight == 686);
+            Check(!SharedDisplayLayout.Merge(doc, [p, external, startup], 0, 0));
+            Position(doc, "main", 0, 0);
+            Position(doc, "external", 2143, 0);
+            Position(doc, "standby", 1000, 0);
+        }));
         tests.Add(("缩放不同的屏幕边缘映射一致", () =>
         {
             Check(SharedDisplayLayout.ProjectAxis(1920, 1920, 912, 1920, 1824) == 1920);

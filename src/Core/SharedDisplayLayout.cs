@@ -55,6 +55,7 @@ public static class SharedDisplayLayout
         var owner = hub.Deskflow.LocalScreenName;
         var profile = hub.ActiveProfile;
         var speeds = hub.PointerSpeed.Screens;
+        var remembered = ReadCachedDocument();
         return DisplayManager.Enumerate().Where(d => d.IsReady || d.IsParsec).Select(d =>
         {
             var spec = d.IsParsec ? profile?.VirtualDisplays.FirstOrDefault(v => v.Slot == d.ParsecSlot) : null;
@@ -62,19 +63,53 @@ public static class SharedDisplayLayout
             var requested = spec != null ? hub.Engine.TargetResolution(profile!, spec, d) : size;
             var id = string.IsNullOrWhiteSpace(d.SunshineDeviceId) ? d.Key : d.SunshineDeviceId;
             var previous = hub.Deskflow.SharedDisplays?.Monitors.FirstOrDefault(m => m.Owner == owner && m.Id == id);
-            var dpi = speeds.FirstOrDefault(s => s.Key == "monitor:" + d.SunshineDeviceId)?.Scale ?? (previous?.WindowsScalePercent / 100.0 ?? 1);
-            var actualDpi = d.IsReady ? PointerSpeedManager.GetWindowsScalePercent(d.GdiName) : spec?.ContentScaleCurrentDpiPercent ?? 0;
-            if (actualDpi > 0) dpi = actualDpi / 100.0;
+            var dpi = ResolveLocalScalePercent(d.IsReady ? PointerSpeedManager.GetWindowsScalePercent(d.GdiName) : 0,
+                spec, speeds.FirstOrDefault(s => s.Key == "monitor:" + d.SunshineDeviceId)?.Scale,
+                previous?.WindowsScalePercent ?? 0, RememberedScalePercent(remembered, owner, id));
             var x = d.IsReady ? d.PositionX : spec?.X ?? 0;
             var y = d.IsReady ? d.PositionY : spec?.Y ?? 0;
             var maximum = 500;
-            if (d.IsParsec && d.IsReady) { try { maximum = DisplayDpiScale.Read(d).Maximum; } catch { maximum = (int)Math.Round(dpi * 100); } }
+            if (d.IsParsec && d.IsReady) { try { maximum = DisplayDpiScale.Read(d).Maximum; } catch { maximum = dpi; } }
             return new SharedMonitor(owner, id, d.Label, x, y, x, y, size.Item1, size.Item2, d.Primary,
-                d.IsParsec, d.Active, (int)Math.Round(dpi * 100), spec?.ContentScalePercent ?? 100,
+                d.IsParsec, d.Active, dpi, spec?.ContentScalePercent ?? 100,
                 false, d.IsParsec ? d.ParsecSlot : -1,
                 d.IsReady && spec != null && profile?.Mode is ProfileMode.Extend or ProfileMode.VirtualOnly, requested.Item1, requested.Item2,
                 0) { MaximumScalePercent = maximum };
         }).Where(m => m.Width > 0 && m.Height > 0).ToList();
+    }
+
+    /// <param name="actualDpi">就绪显示器读取到的实际 Windows DPI；待机或读取失败时为零。</param>
+    /// <param name="spec">虚拟屏保存的用户 DPI 目标及旧版实际 DPI 记忆。</param>
+    /// <param name="cachedScale">鼠标管理器缓存的显示器缩放倍数；未枚举待机屏时为空。</param>
+    /// <param name="previousDpi">上一份共享快照中的 DPI；启动尚无快照时为零。</param>
+    /// <param name="rememberedDpi">持久化布局中的 DPI；优先确认记忆，避免旧版启动快照的 100% 污染。</param>
+    public static int ResolveLocalScalePercent(int actualDpi, VirtualDisplaySpec? spec, double? cachedScale, int previousDpi, int rememberedDpi = 0)
+    {
+        if (actualDpi > 0) return actualDpi;
+        // 待机屏没有实时 DPI，启动时也没有缓存；必须使用已保存目标，避免被误画成 100% 后挤走其它屏。
+        if (spec?.WindowsScalePercent is > 0) return spec.WindowsScalePercent;
+        if (cachedScale is > 0) return (int)Math.Round(cachedScale.Value * 100);
+        if (rememberedDpi > 0) return rememberedDpi;
+        if (previousDpi > 0) return previousDpi;
+        return spec?.ContentScaleCurrentDpiPercent is > 0 ? spec.ContentScaleCurrentDpiPercent : 100;
+    }
+
+    /// <param name="document">最近保存的共享布局，可能包含被旧版启动快照覆盖的在线信息。</param>
+    /// <param name="owner">显示器所属的电脑名。</param>
+    /// <param name="id">显示器稳定身份，不使用临时的 Windows 显示编号。</param>
+    public static int RememberedScalePercent(SharedDisplayDocument document, string owner, string id)
+        => document.RememberedMonitors.Concat(document.Monitors).FirstOrDefault(m => m.WindowsScalePercent > 0 &&
+            SameOwner(m.Owner, owner) && string.Equals(m.Id, id, StringComparison.OrdinalIgnoreCase))?.WindowsScalePercent ?? 0;
+
+    /// <summary>首次枚举本机屏幕时便读取布局记忆；之后仅复制内存快照，不重复访问磁盘。</summary>
+    private static SharedDisplayDocument ReadCachedDocument()
+    {
+        lock (Gate)
+        {
+            _current ??= File.Exists(FilePath) ? JsonSerializer.Deserialize<SharedDisplayDocument>(File.ReadAllText(FilePath), Json) : new();
+            _current ??= new();
+            return Clone(_current);
+        }
     }
 
     /// <param name="document">已有共享布局。</param>

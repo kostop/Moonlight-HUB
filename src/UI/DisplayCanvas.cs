@@ -44,8 +44,6 @@ public sealed class DisplayCanvas : Canvas
     private string _signature = string.Empty;
     private string _peerSignature = string.Empty;
     private Item? _dragItem;
-    private bool _dragGroup;
-    private Dictionary<Item, (int X, int Y)> _groupOrigins = new();
     private Point _dragStart;
     private int _dragOriginX, _dragOriginY;
     private double _scale = 1;
@@ -276,7 +274,7 @@ public sealed class DisplayCanvas : Canvas
             Background = new SolidColorBrush(Color.FromArgb(monitor.Active ? (byte)34 : (byte)18, ownerColor.R, ownerColor.G, ownerColor.B)),
             BorderBrush = BrushForOwner(monitor.Owner), BorderThickness = new Thickness(monitor.Primary ? 2.5 : monitor.Virtual ? 2 : 1.5),
             Padding = new Thickness(4), ClipToBounds = true, Tag = item, Opacity = monitor.Active ? 1 : .6 };
-        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}%\n同色屏幕属于同一台电脑，只会在同色范围内吸附。拖动主屏或按 Shift 可移动整台电脑。" );
+        ToolTip.SetTip(border, $"{number} · {monitor.Owner} · {monitor.Name}\n分辨率 {monitor.Width}×{monitor.Height}，可用桌面 {monitor.CanvasWidth}×{monitor.CanvasHeight}\n缩放比例 {monitor.ScalePercent}%\n每块屏幕独立拖动，同色屏幕属于同一台电脑，只会在同色范围内吸附。" );
         // 屏幕框只显示编号，文字信息放到图例，避免小屏缩放后被裁切；边框尺寸仍严格保持比例。
         var content = new Grid();
         content.Children.Add(new Viewbox { Stretch = Stretch.Uniform, StretchDirection = StretchDirection.DownOnly,
@@ -369,8 +367,6 @@ public sealed class DisplayCanvas : Canvas
         _dragStart = e.GetPosition(this);
         _dragOriginX = item.X;
         _dragOriginY = item.Y;
-        _dragGroup = item.Shared != null && (item.Shared.Primary || e.KeyModifiers.HasFlag(KeyModifiers.Shift));
-        _groupOrigins = _dragGroup ? _items.Where(i => i.Shared?.Owner == item.Shared!.Owner).ToDictionary(i => i, i => (i.X, i.Y)) : new();
         e.Pointer.Capture(border);
         e.Handled = true;
     }
@@ -383,14 +379,6 @@ public sealed class DisplayCanvas : Canvas
         var dy = (p.Y - _dragStart.Y) / _scale;
         _dragItem.X = _dragOriginX + (int)Math.Round(dx);
         _dragItem.Y = _dragOriginY + (int)Math.Round(dy);
-        if (_dragGroup)
-        {
-            foreach (var (other, origin) in _groupOrigins)
-            {
-                other.X = origin.X + (int)Math.Round(dx); other.Y = origin.Y + (int)Math.Round(dy);
-                if (other.Visual != null) { SetLeft(other.Visual, _offX + (other.X - _minX) * _scale + 2); SetTop(other.Visual, _offY + (other.Y - _minY) * _scale + 2); }
-            }
-        }
         SetLeft(_dragItem.Visual, _offX + (_dragItem.X - _minX) * _scale + 2);
         SetTop(_dragItem.Visual, _offY + (_dragItem.Y - _minY) * _scale + 2);
     }
@@ -401,11 +389,8 @@ public sealed class DisplayCanvas : Canvas
         e.Pointer.Capture(null);
         var item = _dragItem;
         _dragItem = null;
-        var beforeX = item.X; var beforeY = item.Y;
         Snap(item);
-        if (_dragGroup) foreach (var other in _groupOrigins.Keys.Where(i => i != item)) { other.X += item.X - beforeX; other.Y += item.Y - beforeY; }
         ResolveOverlap(item);
-        _dragGroup = false;
         Redraw();
         DraftChanged?.Invoke();
     }
@@ -415,7 +400,7 @@ public sealed class DisplayCanvas : Canvas
     {
         // 不同电脑用不同颜色区分，吸附只发生在同一种颜色的屏幕之间。
         var owner = OwnerOf(moved);
-        var others = _items.Where(i => i != moved && OwnerOf(i) == owner && (!_dragGroup || !_groupOrigins.ContainsKey(i))).ToList();
+        var others = _items.Where(i => i != moved && OwnerOf(i) == owner).ToList();
         if (others.Count == 0) return;
         var threshold = moved.Peer != null ? 400 : 140;
         var w = moved.W;
@@ -456,25 +441,22 @@ public sealed class DisplayCanvas : Canvas
 
     private void ResolveOverlap(Item moved)
     {
-        var moving = _dragGroup && moved.Shared != null
-            ? _items.Where(i => i.Shared?.Owner == moved.Shared.Owner).ToList()
-            : new List<Item> { moved };
         for (var guard = 0; guard < 8; guard++)
         {
-            var pair = moving.SelectMany(item => _items.Where(o => !moving.Contains(o) && Overlaps(item, o)).Select(o => (item, o))).FirstOrDefault();
-            if (pair.item == null) return;
-            var (source, hit) = pair;
+            var hit = _items.FirstOrDefault(other => other != moved && Overlaps(moved, other));
+            if (hit == null) return;
             // push out to the nearest side
-            var w = source.W;
-            var h = source.H;
-            var dxRight = hit.X + hit.W - source.X;
-            var dxLeft = source.X + w - hit.X;
-            var dyDown = hit.Y + hit.H - source.Y;
-            var dyUp = source.Y + h - hit.Y;
+            var w = moved.W;
+            var h = moved.H;
+            var dxRight = hit.X + hit.W - moved.X;
+            var dxLeft = moved.X + w - hit.X;
+            var dyDown = hit.Y + hit.H - moved.Y;
+            var dyUp = moved.Y + h - hit.Y;
             var min = Math.Min(Math.Min(dxRight, dxLeft), Math.Min(dyDown, dyUp));
             var (dx, dy) = min == dxRight ? (dxRight, 0) : min == dxLeft ? (-dxLeft, 0)
                 : min == dyDown ? (0, dyDown) : (0, -dyUp);
-            foreach (var item in moving) { item.X += dx; item.Y += dy; }
+            moved.X += dx;
+            moved.Y += dy;
         }
     }
 

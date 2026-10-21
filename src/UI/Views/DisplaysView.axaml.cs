@@ -248,7 +248,7 @@ public partial class DisplaysView : UserControl, IRefreshable
         {
             LayoutCanvas.SetSharedDisplays(shared);
             RefreshMonitorLegend(LayoutCanvas.SharedDocument ?? shared);
-            HelpText.Text = "同一种颜色代表同一台电脑，拖拽只会在同色屏幕之间吸附；所有屏幕都不能重叠。屏幕暂时断开时保留原位，重新连接后自动恢复；新增屏幕会放到本机右下空位。拖动主屏或按 Shift 移动整台电脑；拖动虚拟屏右下角调节文字大小，分辨率保持原值。";
+            HelpText.Text = "每块屏幕都可以独立拖动。同一种颜色代表同一台电脑，拖拽只会在同色屏幕之间吸附；所有屏幕都不能重叠。屏幕暂时断开时保留原位，重新连接后自动恢复；新增屏幕会放到本机右下空位。拖动虚拟屏右下角调节文字大小，分辨率保持原值。";
         }
         if ((DateTime.UtcNow - _lastEnumerate) > TimeSpan.FromSeconds(3))
         {
