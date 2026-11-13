@@ -29,7 +29,6 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
         "Moonlight Deskflow Touch Guard",
     };
 
-    private readonly Func<DeskflowSettings> _settings;
     private readonly Action<Action<DeskflowSettings>> _update;
     private readonly Action<DeskflowRole?> _reloadRequested;
     private DateTime _lastFilterCheckUtc = DateTime.MinValue;
@@ -41,12 +40,10 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
     private volatile bool _pipeStop;
     private string _pendingCommand = string.Empty;
 
-    /// <param name="settings">current Deskflow settings.</param>
-    /// <param name="update">persists a settings change.</param>
-    /// <param name="reloadRequested">a client of the emulated service pipe asked to (re)start the core (role parsed from its command, null = stop).</param>
-    public DeskflowWindowsHost(Func<DeskflowSettings> settings, Action<Action<DeskflowSettings>> update, Action<DeskflowRole?> reloadRequested)
+    /// <param name="update">保存 Hub 管理设置的回调。</param>
+    /// <param name="reloadRequested">处理本机服务管道的核心重载请求；null 表示停止。</param>
+    public DeskflowWindowsHost(Action<Action<DeskflowSettings>> update, Action<DeskflowRole?> reloadRequested)
     {
-        _settings = settings;
         _update = update;
         _reloadRequested = reloadRequested;
         ProcessUtil.EnableDebugPrivilege(); // FindCores must read the command line of a SYSTEM client core too
@@ -60,45 +57,23 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
     public static string PrivateServerConfig => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeskflowTouchFilter", "server.conf");
     public static string SharedServerConfig => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Deskflow", "deskflow-server.conf");
 
-    public string InstallDir
-    {
-        get
-        {
-            var configured = _settings().InstallDir;
-            if (!string.IsNullOrWhiteSpace(configured) && File.Exists(Path.Combine(configured, "deskflow-core.exe"))) return configured;
-            foreach (var dir in new[]
-                     {
-                         @"D:\YingYong\Deskflow",
-                         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Deskflow"),
-                         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Deskflow"),
-                     })
-            {
-                if (File.Exists(Path.Combine(dir, "deskflow-core.exe"))) return dir;
-            }
-            return configured;
-        }
-    }
+    public string InstallDir => Path.Combine(BridgeRuntimeDir ?? Path.Combine(Paths.ExeDir, "deskflow"), "native");
 
     public string CoreExe => Path.Combine(InstallDir, "deskflow-core.exe");
     public string GuiExe => Path.Combine(InstallDir, "deskflow.exe");
-    public bool Installed => File.Exists(CoreExe);
+    public bool Installed => BridgeRuntimeDir != null;
     public string InstallLocation => InstallDir;
     public string LayoutHost(string peerHost) => peerHost;
 
-    /// <summary>Newest touch filter runtime (…\MoonlightDeskflowBridge\v&lt;n&gt;) that has the wrapper core.</summary>
+    /// <summary>优先随 Hub 分发的完整组件，兼容旧版 Hub 管理的版本目录。</summary>
     public static string? BridgeRuntimeDir
     {
         get
         {
             try
             {
-                if (!Directory.Exists(BridgeRoot)) return null;
-                return Directory.GetDirectories(BridgeRoot, "v*")
-                    .Select(d => (Dir: d, N: int.TryParse(Path.GetFileName(d)[1..], out var n) ? n : -1))
-                    .Where(t => t.N >= 0 && File.Exists(Path.Combine(t.Dir, "deskflow-core.exe")))
-                    .OrderByDescending(t => t.N)
-                    .Select(t => t.Dir)
-                    .FirstOrDefault();
+                return DeskflowRuntimeLocator.Resolve(Paths.ExeDir, BridgeRoot, File.Exists,
+                    root => Directory.Exists(root) ? Directory.EnumerateDirectories(root, "v*") : []);
             }
             catch { return null; }
         }
@@ -129,10 +104,11 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
 
     public int Start(DeskflowRole role, DeskflowSettings settings)
     {
-        if (!Installed) throw new InvalidOperationException("找不到 deskflow-core.exe（" + InstallDir + "）");
+        var runtime = BridgeRuntimeDir;
+        if (runtime == null) throw new InvalidOperationException("Moonlight Hub 缺少完整的随附 Deskflow 组件，请重新安装完整的 Hub 发布包。");
         EnsureLogConfig();
-        var filtered = role == DeskflowRole.Server && settings.UseTouchFilter && WrapperExe != null;
-        var exe = filtered ? WrapperExe! : CoreExe;
+        var filtered = role == DeskflowRole.Server && settings.UseTouchFilter;
+        var exe = Path.Combine(runtime, filtered ? "deskflow-core.exe" : Path.Combine("native", "deskflow-core.exe"));
         var mode = role == DeskflowRole.Server ? "server" : "client";
         var args = $"{mode} --settings \"{ConfigPath}\"";
         var asSystem = false;
@@ -277,7 +253,7 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
     public bool MonitorRunning() => AnyProcess("moonlight-touch-keyboard-release");
 
     /// <summary>Stand-alone touch isolator shipped with the hub (touch_mouse_isolator.cpp built as "moonlight-touch-bridge.exe").</summary>
-    public static string BridgeExe => Path.Combine(Paths.ExeDir, "tools", "moonlight-touch-bridge.exe");
+    public static string BridgeExe => DeskflowRuntimeLocator.ResolveBridge(BridgeRuntimeDir, Paths.ExeDir, File.Exists);
     public bool TouchBridgeRunning() => AnyProcess("moonlight-touch-bridge");
 
     private DateTime _lastBridgeStartUtc = DateTime.MinValue;

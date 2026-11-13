@@ -1,0 +1,2 @@
+# 源码补丁的上下文必须保持 LF，避免 Windows 自动换行破坏串联补丁。
+*.patch text eol=lf -whitespace

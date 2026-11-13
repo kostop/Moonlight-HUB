@@ -1,0 +1,3297 @@
+diff --git a/doc/dev/windows-cross-screen-modifiers.md b/doc/dev/windows-cross-screen-modifiers.md
+new file mode 100644
+index 0000000..202caad
+--- /dev/null
++++ b/doc/dev/windows-cross-screen-modifiers.md
+@@ -0,0 +1,19 @@
++# Windows 跨屏后修饰键残留
++
++分支 `fix/windows-cross-screen-modifiers` 基于稳定的 `c15f2b6`，保留鼠标位移和逻辑屏幕间隙路由。
++
++本机按下 Alt 等键后离开屏幕，物理松开时原实现切换全局 hook 模式再补发释放，释放可能被稍后恢复的 relay hook 再次捕获；该分支又提前返回，跳过修饰状态同步及客户端 key-up。补丁只标记这一次本机释放，零初始化 INPUT，保留右侧按键扩展扫描码，并继续正常转发物理释放。失败时保留记录，由已有维护 timer 重试；新真实按下暂停重试，下一次真实松开再处理。
++
++客户端另增加残留合成修饰状态的定向清理：收到明确的修饰键释放和已经移除该位的来源 mask 后，仅释放本核心拥有的合成修饰状态；不清理锁定键、其它修饰类别或已被本地实体事件接管的键。该分支的单元测试人工保留合成状态；真实 KeyMap 通常会在普通键合成后恢复原修饰状态，因此这些测试不能证明原客户端必然发生隐式 Alt 残留。
++
++验证入口：
++
++- `tools/test-local-key-release.ps1`：80 项 INPUT、左右键扫描码、标记及失败重试状态检查。
++- `tools/test-modifier-reconcile.ps1`：编译实际生产 KeyState，配合 FixtureMap 构造残留合成状态，验证 Alt、Ctrl、AltGr、双侧保持、实体接管和重复释放，共 15 项；不替代真实 KeyMap 的端到端回归。
++- `tools/build-pointer-core.ps1 -TestRouting`：完整编译 core 并验证原有逻辑屏幕路由。
++
++上述回归不向真实桌面注入按键。KeyState 类布局发生变化，首次构建必须 clean-first；后续测试仍需在用户实际跨屏操作中观察修饰键状态。
++
++部署使用独立 `MoonlightDeskflowBridge/v18`，沿用 v17 的触摸过滤组件和匹配 Qt 依赖，不覆盖原安装。v17 与配置备份保留用于回退。
++
++2026-10-19：Desktop-Lin 已启用 v18，qingxian 保持原客户端且已重新连接。qingxian 的 Smart App Control / Code Integrity（事件 3077、3033）拦截了新核心；部署在依赖检查阶段停止，未修改其 InstallDir，也未修改安全策略。当前生效的是源端松键修复；客户端定向清理尚未启用。未通过自动化向用户桌面注入按键，实际跨屏效果仍需使用中观察。
+diff --git a/doc/dev/windows-pointer-motion.md b/doc/dev/windows-pointer-motion.md
+new file mode 100644
+index 0000000..edeb060
+--- /dev/null
++++ b/doc/dev/windows-pointer-motion.md
+@@ -0,0 +1,103 @@
++# Windows 发送端鼠标位移修复
++
++分支：`fix/windows-pointer-motion`。此补丁保持 Deskflow 的网络协议和接收端不变。
++
++Windows 的低级鼠标钩子在远端控制模式下已经吞掉本机移动，隐藏光标不会随物理鼠标移动。
++旧实现仍在每次移动后执行回中，并在 PRE_WARP / POST_WARP 之间丢弃鼠标消息；突发输入会丢失真实位移。
++新实现直接在钩子中用事件位置减去移动前的实际光标位置，发送独立的位移消息。
++这条消息不进入回中清理的范围。切回本机或切换标记前的旧消息仍会被忽略。
++
++事件位置与查询位置统一为物理像素，查询完成后恢复线程 DPI 上下文。
++Windows 当前鼠标速度和加速仍生效，没有增加第二套速度倍率。
++此外，兼容已有配置的 `log/level=Info` 与当前数字日志等级，避免重新编译后丢失切屏日志、影响 Hub 的速度切换。
++
++2026-10-10 在 Desktop-Lin → qingxian 的真实连接上验证：
++
++- Release 编译、版本与命令行检查通过。
++- 原核心在突发往返输入中出现位移不足，返回点偏离起点。
++- 修复后一次 200 条突发输入，发送端分别记录 +874 / -874 像素，接收端完整到达 874 像素并返回起点。
++- 使用用户保存的速度 4 再测 200 条突发输入，发送端 +349 / -349 像素，接收端完整到达 349 像素并准确返回。
++- v13 触摸过滤 DLL 保持相同 SHA-256，接收端核心保持原版本。
++
++发送端运行时安装在 `%LOCALAPPDATA%\MoonlightDeskflowBridge\v14`，原 `v13` 保留。
++测试记录在 `%LOCALAPPDATA%\MoonlightHub\mouse-diagnostics-20261010`。
++
++2026-10-20：跨屏路由只允许在共享边确有重叠的显示器之间切换；边界位置增加 1.5px 容差，
++避免屏幕上下错开时跳到“最近但不重叠”的屏幕，也避免落到边界外时退回旧的整屏切屏逻辑。
++
++构建入口为 `tools/build-pointer-core.ps1`，使用 MSVC x64、匹配运行时的 Qt SDK 和 OpenSSL SDK，单独构建 `deskflow-core`。
++
++2026-10-21：离开源机时，隐藏光标的窗口仍保持 1×1 像素。先仅接管鼠标移动，再回中，
++最后在原来的时点切换完整 relay；键盘与鼠标按钮的处理时机保持原样。不能提前切换完整
++relay，因为回中会清理待处理输入，可能吞掉尚未交给本机的修饰键释放。
++
++自身回中之后只校准一次隐藏窗口：在桌面线程确认主机已离屏、低级钩子有效、窗口仍可见，
++且实际位置距本次回中点不超过 1 像素，才修正像素舍入差异。校准同时将这个像素放回普通
++窗口的最上方，不激活、不重新显示、不设 TOPMOST；不持续追踪独立触摸的位置，也不覆盖
++整块桌面，避免独立触摸被大面积隐藏窗口接收。
++
++真实连接中观察到：即使回中坐标完全正确，隐藏窗口位于 Chrome、微信等窗口之后，
++源机仍显示 Chrome 的光标。只向隐藏窗口发送 WM_SETCURSOR 不会改变鼠标输入所有者。
++将原有 1×1 窗口以 HWND_TOP、NOACTIVATE 提到上方后，WindowFromPoint 命中该窗口，
++250ms 与 1 秒后 GetCursorInfo 均为 handle=0、flags=0；前台窗口没有改变。
++
++本次点击故障在用户点击副屏桌面后恢复。被动采样中两端各收到 22 条按钮事件，组成完整
++的 11 对按下/松开，未发现持续按住的修饰键。这些证据不证明系统或应用焦点恢复的根因；
++因此没有加入强制抢焦点、全量松键或重启 Explorer 的操作。
++
++当时源端运行时为 `%LOCALAPPDATA%\MoonlightDeskflowBridge\v23`，核心提交 `aa4f1af`，
++版本 `1.26.0.12`。完整 Release 构建、路由回归与 13 项实际 hook 回调离线测试通过；
++测试只模拟 Win32 边界，没有安装钩子或注入键鼠。两端 Hub 仍为 2.0.21，qingxian 客户端
++核心未替换；原触摸过滤 DLL 哈希不变。
++
++部署后真实离屏状态连续 120 次被动采样（约 15 秒）均确认源端光标隐藏。日志也记录了
++正常的双向切屏，但这段采样没有覆盖本机活动状态，不能当作本机点击或独立触摸的端到端
++验收。记录目录为 `%LOCALAPPDATA%\MoonlightHub\cursor-visibility-fix-20261021`；v21、v22
++与启用前配置备份保留。
++
++2026-10-21 用户随后取消隐藏需求：源端离屏时保留可见光标。删除离屏后专门对齐、抬高
++隐藏窗口的同步消息；源端类光标使用系统箭头，源端进入与离开均不再修改 ShowCursor
++计数。客户端原有可见性处理保持原样。仍保留 tagged warp、物理像素位移、真实边界落点
++与仅接管鼠标移动的交接门控，避免为取消隐藏而退回旧的漂移或错误回位行为。
++
++该调整已部署为源端 v24（`c435c9e`，`1.26.0.14`）。完整构建、路由回归和 13 项交接
++回调测试通过；真实离屏状态连续三次采样均为可见系统箭头，停驻点稳定。两端已重新连接。
++
++## 2026-11-13：切回本机时的停顿和位移不足
++
++现场日志中，qingxian 返回 Desktop-Lin 的 `switch` 到 `entering screen` 通常为几毫秒，
++但存在 121ms、295ms、764ms 的异常样本。旧主机回位会持续清空输入队列，包括已经由
++低级钩子拦截的真实位移；桌面焦点恢复完成前，鼠标仍被当作远端输入拦截，后续标记又
++丢弃这部分移动。日志能证明切换延迟，不能单独确定每次停顿的具体阻塞调用。
++
++主机带标记回位不再发送 PRE/POST、让出时间片或清空真实输入。钩子按成功入队的顺序
++记录待消费位移，在 Server 真正处理高层运动事件时确认消费，保持键盘、按钮和运动的
++原始队列顺序。切回时在安装钩子的桌面线程合入尚未消费的位移，再提前恢复本机鼠标，
++键盘、按钮及窗口焦点仍走原来的交接时序。已合入的高层事件通过顺序号跳过，避免重放。
++
++SendInput 内重入的真实移动继续累计，每次最多校正四轮，必要时向桌面线程排入继续消息，
++不阻塞在无界重试里；每轮以实际落点为新基准，边界裁剪后立即反向也不会粘边。
++重装钩子保留尚未消费的累计和顺序号，避免旧消息确认时生成负累计。网络协议不变。
++
++验证包括 445 项实际生产 hook 回调离线检查、48 项从当前生产方法体提取的屏幕/桌面/
++Server 队列检查，以及原有路由、定位和本机松键回归。测试覆盖积压、重入、分批继续、
++已吸收事件不重放，以及按钮先于位移到达原电脑；不安装钩子、不注入真实输入。
++临时恢复旧 mark 过滤或取消已吸收 token 的拦截，相关回归均会失败。
++这些测试不等同于 Windows 实际调度、真实点击和独立触摸的端到端验收。
++
++新增回归入口：`tools/test-mouse-return.ps1`；交接回归入口仍为
++`tools/test-mouse-handoff.ps1`。构建、部署和旧运行时备份记录位于
++`%LOCALAPPDATA%\MoonlightHub\mouse-return-20261113`。
++
++已在 Desktop-Lin 启用 v25（`1.26.0.15`，部署时以工作区补丁构建）；通过进程的完整
++映像路径确认 wrapper 和 native core 均来自 v25，并核对核心 SHA-256 为
++`5C1D5F8CDB57A2F45F90BA1D3AB835FC213BEB71CB0E22269CCE00D400A81582`。
++完整 Release 构建及最终增量构建通过，原有路由回归、185318 项定位检查、80 项本机
++松键检查和 15 项真实 KeyState 状态回归均通过。触摸过滤 DLL、包装器哈希不变；
++运行时 `filter_installed=1 mouse_filter=1 keyboard_filter=1`，与 qingxian 的 TCP 连接
++已建立。尚未用用户实际往返操作完成新版本的手感验收，不把重连当作无卡顿的证明。
++
++激活时采用复制完整 staging 到 v25 并核对目标文件的方式，保留 staging 与 v24。
++需要重启时通过现有 `deskflow-daemon` 管道请求 Hub 重载 server，只重启 Deskflow。
++回退脚本为诊断目录内的 `rollback-runtime.ps1`，可将 v25 改名为 disabled-v25 并恢复
++v24 配置；回退后同样需要通过管道重载并确认实际进程路径。
+diff --git a/src/lib/common/Settings.cpp b/src/lib/common/Settings.cpp
+index 742ba99..8b3d900 100644
+--- a/src/lib/common/Settings.cpp
++++ b/src/lib/common/Settings.cpp
+@@ -212,7 +212,17 @@ QVariant Settings::defaultValue(const QString &key)
+ 
+ QString Settings::logLevelText()
+ {
+-  return Settings::m_logLevels.at(Settings::value(Log::Level).toInt());
++  // 已有 Windows 配置可能保存 "Info"，兼容旧版文字值和当前数字索引。
++  const auto level = Settings::value(Log::Level);
++  bool numeric = false;
++  int index = level.toInt(&numeric);
++  if (!numeric) {
++    index = m_logLevels.indexOf(level.toString().toUpper());
++  }
++  if (index < 0 || index >= m_logLevels.size()) {
++    index = 4; // INFO
++  }
++  return Settings::m_logLevels.at(index);
+ }
+ 
+ QSettingsProxy &Settings::proxy()
+diff --git a/src/lib/deskflow/CMakeLists.txt b/src/lib/deskflow/CMakeLists.txt
+index 46da197..3f55266 100644
+--- a/src/lib/deskflow/CMakeLists.txt
++++ b/src/lib/deskflow/CMakeLists.txt
+@@ -59,6 +59,7 @@ add_library(${lib_name} STATIC ${PLATFORM_CODE}
+   KeyMap.h
+   KeyState.cpp
+   KeyState.h
++  ModifierKeyRelease.h
+   MouseTypes.h
+   OptionTypes.h
+   PacketStreamFilter.cpp
+diff --git a/src/lib/deskflow/IKeyState.h b/src/lib/deskflow/IKeyState.h
+index ed034fc..076f6b2 100644
+--- a/src/lib/deskflow/IKeyState.h
++++ b/src/lib/deskflow/IKeyState.h
+@@ -94,6 +94,11 @@ public:
+   */
+   virtual bool fakeKeyUp(KeyButton button) = 0;
+ 
++  // 参数 id/mask：明确释放的按键及来源释放后的修饰状态；默认不做额外合成。
++  virtual void reconcileKeyRelease(KeyID, KeyModifierMask)
++  {
++  }
++
+   //! Fake key releases for all fake pressed keys
+   /*!
+   Synthesizes a key release event for every key that is synthetically
+diff --git a/src/lib/deskflow/IPlatformScreen.h b/src/lib/deskflow/IPlatformScreen.h
+index 3964d91..77f7939 100644
+--- a/src/lib/deskflow/IPlatformScreen.h
++++ b/src/lib/deskflow/IPlatformScreen.h
+@@ -55,6 +55,13 @@ public:
+   */
+   virtual void enter() = 0;
+ 
++  // 参数 token：捕获序号；dx/dy：实际位移。返回 false 表示位移已在入屏时合入。
++  // 默认平台无需确认，保留原有事件处理方式。
++  virtual bool consumeMouseMotion(uint64_t, int32_t, int32_t)
++  {
++    return true;
++  }
++
+   //! Leave screen
+   /*!
+   Called when the user navigates off the screen.  Returns true if
+diff --git a/src/lib/deskflow/IPrimaryScreen.cpp b/src/lib/deskflow/IPrimaryScreen.cpp
+index d7cd1f5..296868f 100644
+--- a/src/lib/deskflow/IPrimaryScreen.cpp
++++ b/src/lib/deskflow/IPrimaryScreen.cpp
+@@ -38,11 +38,12 @@ bool IPrimaryScreen::ButtonInfo::equal(const ButtonInfo *a, const ButtonInfo *b)
+ // IPrimaryScreen::MotionInfo
+ //
+ 
+-IPrimaryScreen::MotionInfo *IPrimaryScreen::MotionInfo::alloc(int32_t x, int32_t y)
++IPrimaryScreen::MotionInfo *IPrimaryScreen::MotionInfo::alloc(int32_t x, int32_t y, uint64_t token)
+ {
+   auto *info = (MotionInfo *)malloc(sizeof(MotionInfo));
+   info->m_x = x;
+   info->m_y = y;
++  info->m_token = token;
+   return info;
+ }
+ 
+diff --git a/src/lib/deskflow/IPrimaryScreen.h b/src/lib/deskflow/IPrimaryScreen.h
+index 406deae..ec57d07 100644
+--- a/src/lib/deskflow/IPrimaryScreen.h
++++ b/src/lib/deskflow/IPrimaryScreen.h
+@@ -41,11 +41,13 @@ public:
+   class MotionInfo
+   {
+   public:
+-    static MotionInfo *alloc(int32_t x, int32_t y);
++    // 参数 x/y：鼠标坐标或位移；token：捕获序号，0 表示无需确认的平台事件。
++    static MotionInfo *alloc(int32_t x, int32_t y, uint64_t token = 0);
+ 
+   public:
+     int32_t m_x;
+     int32_t m_y;
++    uint64_t m_token = 0;
+   };
+   //! Wheel motion event data
+   class WheelInfo
+diff --git a/src/lib/deskflow/KeyState.cpp b/src/lib/deskflow/KeyState.cpp
+index d924076..79c076d 100644
+--- a/src/lib/deskflow/KeyState.cpp
++++ b/src/lib/deskflow/KeyState.cpp
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "deskflow/KeyState.h"
++#include "deskflow/ModifierKeyRelease.h"
+ #include "base/Log.h"
+ 
+ #include <algorithm>
+@@ -692,6 +693,9 @@ void KeyState::onKey(KeyButton button, bool down, KeyModifierMask newState)
+     return;
+   }
+ 
++  // 真实本地按键不属于远程合成，不能用来源的修饰 mask 将它强行释放。
++  m_relayOwnedKeys[button] = false;
++
+   // update key state
+   if (down) {
+     m_keys[button] = 1;
+@@ -748,6 +752,7 @@ void KeyState::updateKeyState()
+   // reset our state
+   memset(&m_keys, 0, sizeof(m_keys));
+   memset(&m_syntheticKeys, 0, sizeof(m_syntheticKeys));
++  memset(&m_relayOwnedKeys, 0, sizeof(m_relayOwnedKeys));
+   memset(&m_keyClientData, 0, sizeof(m_keyClientData));
+   memset(&m_serverKeys, 0, sizeof(m_serverKeys));
+   m_activeModifiers.clear();
+@@ -829,6 +834,7 @@ void KeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton serverID, c
+   updateModifierKeyState(localID, oldActiveModifiers, m_activeModifiers);
+   if (localID != 0) {
+     // note keys down
++    m_relayOwnedKeys[localID] = m_relayOwnedKeys[localID] || m_keys[localID] == 0;
+     ++m_keys[localID];
+     ++m_syntheticKeys[localID];
+     m_keyClientData[localID] = keyItem->m_client;
+@@ -882,9 +888,11 @@ bool KeyState::fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyB
+     // note that old key is now up
+     --m_keys[oldLocalID];
+     --m_syntheticKeys[oldLocalID];
++    m_relayOwnedKeys[oldLocalID] = false;
+ 
+     // note keys down
+     updateModifierKeyState(localID, oldActiveModifiers, m_activeModifiers);
++    m_relayOwnedKeys[localID] = m_relayOwnedKeys[localID] || m_keys[localID] == 0;
+     ++m_keys[localID];
+     ++m_syntheticKeys[localID];
+     m_keyClientData[localID] = keyItem->m_client;
+@@ -911,6 +919,7 @@ bool KeyState::fakeKeyUp(KeyButton serverID)
+   // note keys down
+   --m_keys[localID];
+   --m_syntheticKeys[localID];
++  m_relayOwnedKeys[localID] = false;
+   m_serverKeys[serverID] = 0;
+ 
+   // check if this is a modifier
+@@ -939,6 +948,52 @@ bool KeyState::fakeKeyUp(KeyButton serverID)
+   return true;
+ }
+ 
++void KeyState::reconcileKeyRelease(KeyID id, KeyModifierMask mask)
++{
++  if (deskflow::releasedModifierMask(id) == 0) {
++    return;
++  }
++
++  Keystrokes keys;
++  KeyButtonSet released;
++  for (const auto &[generated, key] : m_activeModifiers) {
++    const KeyButton button = key.m_button & kButtonMask;
++    if (button != 0 && m_syntheticKeys[button] > 0 &&
++        deskflow::shouldReleaseImplicitModifier(id, mask, generated, key.m_lock, m_relayOwnedKeys[button]) &&
++        released.insert(button).second) {
++      keys.emplace_back(button, false, false, m_keyClientData[button]);
++      m_keys[button] = 0;
++      m_syntheticKeys[button] = 0;
++      m_relayOwnedKeys[button] = false;
++    }
++  }
++  if (keys.empty()) {
++    return;
++  }
++
++  // 同一合成键可能产生多个修饰位；实际释放后清理它的全部别名及 server 映射。
++  KeyModifierMask affected = 0;
++  for (auto entry = m_activeModifiers.begin(); entry != m_activeModifiers.end();) {
++    if (released.contains(entry->second.m_button & kButtonMask)) {
++      affected |= entry->first;
++      entry = m_activeModifiers.erase(entry);
++    } else {
++      ++entry;
++    }
++  }
++  for (auto &button : m_serverKeys) {
++    if (released.contains(button)) {
++      button = 0;
++    }
++  }
++  for (KeyModifierMask bit = 1; bit != 0; bit <<= 1) {
++    if ((affected & bit) != 0 && !m_activeModifiers.contains(bit)) {
++      m_mask &= ~bit;
++    }
++  }
++  fakeKeys(keys, 1);
++}
++
+ void KeyState::fakeAllKeysUp()
+ {
+   Keystrokes keys;
+@@ -947,6 +1002,7 @@ void KeyState::fakeAllKeysUp()
+       keys.push_back(Keystroke(i, false, false, m_keyClientData[i]));
+       m_keys[i] = 0;
+       m_syntheticKeys[i] = 0;
++      m_relayOwnedKeys[i] = false;
+     }
+   }
+   fakeKeys(keys, 1);
+@@ -1117,10 +1173,13 @@ void KeyState::updateModifierKeyState(
+     if (i->first != button) {
+       m_keys[i->first] = 0;
+       m_syntheticKeys[i->first] = 0;
++      m_relayOwnedKeys[i->first] = false;
+     }
+   }
+   for (deskflow::KeyMap::ButtonToKeyMap::const_iterator i = pressed.begin(); i != pressed.end(); ++i) {
+     if (i->first != button) {
++      // 已被本机物理按下的键不能因远端再次需要相同修饰键而重新取得合成所有权。
++      m_relayOwnedKeys[i->first] = m_relayOwnedKeys[i->first] || m_keys[i->first] == 0;
+       m_keys[i->first] = 1;
+       m_syntheticKeys[i->first] = 1;
+       m_keyClientData[i->first] = i->second->m_client;
+diff --git a/src/lib/deskflow/KeyState.h b/src/lib/deskflow/KeyState.h
+index 9aed6ac..5e80227 100644
+--- a/src/lib/deskflow/KeyState.h
++++ b/src/lib/deskflow/KeyState.h
+@@ -61,6 +61,7 @@ public:
+   void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang) override;
+   bool fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang) override;
+   bool fakeKeyUp(KeyButton button) override;
++  void reconcileKeyRelease(KeyID id, KeyModifierMask mask) override;
+   void fakeAllKeysUp() override;
+   bool fakeMediaKey(KeyID id) override;
+ 
+@@ -212,6 +213,9 @@ private:
+   // not synthesized yet.
+   int32_t m_syntheticKeys[s_numButtons];
+ 
++  // 仅由 fakeKeyDown/隐式修饰合成设置，任何真实物理事件都会撤销所有权。
++  bool m_relayOwnedKeys[s_numButtons]{};
++
+   // client data for each pressed key
+   uint32_t m_keyClientData[s_numButtons];
+ 
+diff --git a/src/lib/deskflow/ModifierKeyRelease.h b/src/lib/deskflow/ModifierKeyRelease.h
+new file mode 100644
+index 0000000..99fee4d
+--- /dev/null
++++ b/src/lib/deskflow/ModifierKeyRelease.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#pragma once
++
++#include "deskflow/KeyTypes.h"
++
++namespace deskflow {
++
++// 参数 id：明确收到释放的按键；只处理非锁定修饰键，普通键与锁定键返回 0。
++inline KeyModifierMask releasedModifierMask(KeyID id)
++{
++  switch (id) {
++  case kKeyShift_L:
++  case kKeyShift_R: return KeyModifierShift;
++  case kKeyControl_L:
++  case kKeyControl_R: return KeyModifierControl;
++  case kKeyAlt_L: return KeyModifierAlt;
++  case kKeyAlt_R: return KeyModifierAlt | KeyModifierAltGr;
++  case kKeyAltGr: return KeyModifierAltGr;
++  case kKeyMeta_L:
++  case kKeyMeta_R: return KeyModifierMeta;
++  case kKeySuper_L:
++  case kKeySuper_R: return KeyModifierSuper;
++  default: return 0;
++  }
++}
++
++// 参数 id/mask：来源释放事件及释放后的修饰状态；generated：当前合成键产生的修饰位；
++// locked：是否锁定键；owned：是否由接力合成且未被真实物理事件接管。
++inline bool shouldReleaseImplicitModifier(
++    KeyID id, KeyModifierMask mask, KeyModifierMask generated, bool locked, bool owned
++)
++{
++  return owned && !locked && generated != 0 &&
++      (generated & releasedModifierMask(id) & ~mask) == generated;
++}
++
++} // namespace deskflow
+diff --git a/src/lib/deskflow/PlatformScreen.cpp b/src/lib/deskflow/PlatformScreen.cpp
+index ec8d09b..4a929d2 100644
+--- a/src/lib/deskflow/PlatformScreen.cpp
++++ b/src/lib/deskflow/PlatformScreen.cpp
+@@ -48,6 +48,11 @@ bool PlatformScreen::fakeKeyUp(KeyButton button)
+   return getKeyState()->fakeKeyUp(button);
+ }
+ 
++void PlatformScreen::reconcileKeyRelease(KeyID id, KeyModifierMask mask)
++{
++  getKeyState()->reconcileKeyRelease(id, mask);
++}
++
+ void PlatformScreen::fakeAllKeysUp()
+ {
+   getKeyState()->fakeAllKeysUp();
+diff --git a/src/lib/deskflow/PlatformScreen.h b/src/lib/deskflow/PlatformScreen.h
+index 4a3b245..32b570b 100644
+--- a/src/lib/deskflow/PlatformScreen.h
++++ b/src/lib/deskflow/PlatformScreen.h
+@@ -53,6 +53,7 @@ public:
+   void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &) override;
+   bool fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang) override;
+   bool fakeKeyUp(KeyButton button) override;
++  void reconcileKeyRelease(KeyID id, KeyModifierMask mask) override;
+   void fakeAllKeysUp() override;
+   bool fakeCtrlAltDel() override;
+   bool isKeyDown(KeyButton) const override;
+diff --git a/src/lib/deskflow/Screen.cpp b/src/lib/deskflow/Screen.cpp
+index ad4a2ca..cc32a9b 100644
+--- a/src/lib/deskflow/Screen.cpp
++++ b/src/lib/deskflow/Screen.cpp
+@@ -162,6 +162,11 @@ void Screen::warpCursor(int32_t x, int32_t y)
+   m_screen->warpCursor(x, y);
+ }
+ 
++bool Screen::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)
++{
++  return m_screen->consumeMouseMotion(token, dx, dy);
++}
++
+ void Screen::setClipboard(ClipboardID id, const IClipboard *clipboard)
+ {
+   m_screen->setClipboard(id, clipboard);
+@@ -195,9 +200,10 @@ void Screen::keyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton
+   m_screen->fakeKeyRepeat(id, mask, count, button, lang);
+ }
+ 
+-void Screen::keyUp(KeyID, KeyModifierMask, KeyButton button)
++void Screen::keyUp(KeyID id, KeyModifierMask mask, KeyButton button)
+ {
+   m_screen->fakeKeyUp(button);
++  m_screen->reconcileKeyRelease(id, mask);
+ }
+ 
+ void Screen::mouseDown(ButtonID button)
+diff --git a/src/lib/deskflow/Screen.h b/src/lib/deskflow/Screen.h
+index 8859e85..6dcbd0f 100644
+--- a/src/lib/deskflow/Screen.h
++++ b/src/lib/deskflow/Screen.h
+@@ -84,6 +84,9 @@ public:
+   */
+   void warpCursor(int32_t x, int32_t y);
+ 
++  // 参数 token：捕获序号；dx/dy：待路由位移。跳过已经合入本机入屏位置的事件。
++  bool consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy);
++
+   //! Set clipboard
+   /*!
+   Sets the system's clipboard contents.  This is usually called
+diff --git a/src/lib/platform/CMakeLists.txt b/src/lib/platform/CMakeLists.txt
+index f86b8f5..5a7a9c0 100644
+--- a/src/lib/platform/CMakeLists.txt
++++ b/src/lib/platform/CMakeLists.txt
+@@ -26,6 +26,7 @@ if(WIN32)
+     MSWindowsClipboardHTMLConverter.h
+     MSWindowsClipboardUTF16Converter.cpp
+     MSWindowsClipboardUTF16Converter.h
++    MSWindowsCursorWarp.h
+     MSWindowsDebugOutputter.cpp
+     MSWindowsDebugOutputter.h
+     MSWindowsDesks.cpp
+@@ -36,6 +37,7 @@ if(WIN32)
+     MSWindowsHook.h
+     MSWindowsKeyState.cpp
+     MSWindowsKeyState.h
++    MSWindowsLocalKeyRelease.h
+     MSWindowsPowerManager.cpp
+     MSWindowsPowerManager.h
+     MSWindowsProcess.cpp
+diff --git a/src/lib/platform/MSWindowsCursorWarp.h b/src/lib/platform/MSWindowsCursorWarp.h
+new file mode 100644
+index 0000000..17e8303
+--- /dev/null
++++ b/src/lib/platform/MSWindowsCursorWarp.h
+@@ -0,0 +1,62 @@
++/*
++ * Deskflow -- mouse and keyboard sharing utility
++ * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++ */
++
++#pragma once
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <Windows.h>
++
++#include <algorithm>
++#include <cstdint>
++
++namespace deskflow::win32 {
++
++// 仅标记本核心的光标回位；不能与触摸提升签名或键盘补发标记混用。
++inline constexpr ULONG_PTR kCursorWarpTag = 0x4d484357u;
++
++struct CursorDesktopBounds
++{
++  int32_t x;
++  int32_t y;
++  int32_t width;
++  int32_t height;
++};
++
++// 参数 position/origin：物理像素坐标和桌面原点；extent：该轴像素数。
++// 定位到像素区间中央，避免直接用 65535/(extent-1) 在边界取到相邻像素。
++inline LONG normalizeCursorCoordinate(int32_t position, int32_t origin, int32_t extent)
++{
++  if (extent <= 0) {
++    return 0;
++  }
++  const int64_t offset = std::clamp<int64_t>(static_cast<int64_t>(position) - origin, 0, extent - 1);
++  return static_cast<LONG>(std::clamp<int64_t>((offset * 65536 + 32768) / extent, 0, 65535));
++}
++
++// 参数 x/y：目标物理像素；bounds：物理桌面范围；input：完整清零后写入的回位事件。
++inline bool makeCursorWarp(int32_t x, int32_t y, const CursorDesktopBounds &bounds, INPUT &input)
++{
++  input = {};
++  if (bounds.width <= 0 || bounds.height <= 0) {
++    return false;
++  }
++  input.type = INPUT_MOUSE;
++  input.mi.dx = normalizeCursorCoordinate(x, bounds.x, bounds.width);
++  input.mi.dy = normalizeCursorCoordinate(y, bounds.y, bounds.height);
++  input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
++  input.mi.dwExtraInfo = kCursorWarpTag;
++  return true;
++}
++
++// 参数 message/event：低级鼠标钩子的消息及原始数据；不放行其它注入或鼠标按键。
++inline bool isCursorWarp(WPARAM message, const MSLLHOOKSTRUCT &event)
++{
++  return message == WM_MOUSEMOVE && event.dwExtraInfo == kCursorWarpTag &&
++         (event.flags & LLMHF_INJECTED) != 0;
++}
++
++} // namespace deskflow::win32
+diff --git a/src/lib/platform/MSWindowsDesks.cpp b/src/lib/platform/MSWindowsDesks.cpp
+index a47b57a..582cfd3 100644
+--- a/src/lib/platform/MSWindowsDesks.cpp
++++ b/src/lib/platform/MSWindowsDesks.cpp
+@@ -173,6 +173,11 @@ void MSWindowsDesks::enter()
+   sendMessage(DESKFLOW_MSG_ENTER, 0, 0);
+ }
+ 
++void MSWindowsDesks::enter(POINT &position)
++{
++  sendMessage(DESKFLOW_MSG_ENTER, reinterpret_cast<WPARAM>(&position), 0);
++}
++
+ void MSWindowsDesks::leave(HKL keyLayout)
+ {
+   sendMessage(DESKFLOW_MSG_LEAVE, (WPARAM)keyLayout, 0);
+@@ -350,7 +355,8 @@ ATOM MSWindowsDesks::createDeskWindowClass(bool isPrimary) const
+   classInfo.cbWndExtra = 0;
+   classInfo.hInstance = MSWindowsScreen::getWindowInstance();
+   classInfo.hIcon = nullptr;
+-  classInfo.hCursor = m_cursor;
++  // 主机离屏仍显示普通光标；客户端保留原有的离屏光标行为。
++  classInfo.hCursor = isPrimary ? LoadCursor(nullptr, IDC_ARROW) : m_cursor;
+   classInfo.hbrBackground = nullptr;
+   classInfo.lpszMenuName = nullptr;
+   classInfo.lpszClassName = L"DeskflowDesk";
+@@ -496,10 +502,9 @@ void MSWindowsDesks::deskEnter(Desk *desk)
+ {
+   if (!m_isPrimary) {
+     ReleaseCapture();
++    setCursorVisibility(true);
+   }
+ 
+-  setCursorVisibility(true);
+-
+   SetWindowPos(desk->m_window, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+ 
+   // restore the foreground window
+@@ -519,12 +524,13 @@ void MSWindowsDesks::deskEnter(Desk *desk)
+ 
+ void MSWindowsDesks::deskLeave(Desk *desk, HKL keyLayout)
+ {
+-  setCursorVisibility(false);
++  if (!m_isPrimary) {
++    setCursorVisibility(false);
++  }
+ 
+   if (m_isPrimary) {
+-    // map a window to hide the cursor and to use whatever keyboard
+-    // layout we choose rather than the keyboard layout of the last
+-    // active window.
++    // map a window to use the requested keyboard layout rather than
++    // the keyboard layout of the last active window.
+     int x, y, w, h;
+     if (desk->m_lowLevel) {
+       // with a low level hook the cursor will never budge so
+@@ -667,10 +673,22 @@ void MSWindowsDesks::deskThread(const void *vdesk)
+       break;
+ 
+     case DESKFLOW_MSG_ENTER:
++      if (m_isPrimary && msg.wParam != 0) {
++        // 同线程处理最后一批位移和入屏定位，避免解除拦截后覆盖真实鼠标移动。
++        auto &position = *reinterpret_cast<POINT *>(msg.wParam);
++        if (!MSWindowsHook::returnMouseToPrimary(position)) {
++          LOG_WARN("could not confirm mouse return position; last known position %ld,%ld", position.x, position.y);
++        }
++      }
+       m_isOnScreen = true;
+       deskEnter(desk);
+       break;
+ 
++    case DESKFLOW_MSG_MOUSE_RETURN:
++      // 每轮只处理有限次回调重入，持续移动也不会堵住桌面消息循环。
++      MSWindowsHook::continueMouseReturn();
++      continue;
++
+     case DESKFLOW_MSG_LEAVE:
+       m_isOnScreen = false;
+       m_keyLayout = (HKL)msg.wParam;
+diff --git a/src/lib/platform/MSWindowsDesks.h b/src/lib/platform/MSWindowsDesks.h
+index 038b7bd..c71ef69 100644
+--- a/src/lib/platform/MSWindowsDesks.h
++++ b/src/lib/platform/MSWindowsDesks.h
+@@ -81,6 +81,10 @@ public:
+   */
+   void enter();
+ 
++  // 参数 position：入屏物理像素位置；返回合入待处理鼠标位移后的实际落点。
++  // 在安装钩子的桌面线程交接鼠标，随后沿用原来的窗口焦点恢复流程。
++  void enter(POINT &position);
++
+   //! Notify of leaving a desk
+   /*!
+   Prepares a desk for when the cursor leaves it.
+diff --git a/src/lib/platform/MSWindowsHook.cpp b/src/lib/platform/MSWindowsHook.cpp
+index c2ef1e1..0a37722 100644
+--- a/src/lib/platform/MSWindowsHook.cpp
++++ b/src/lib/platform/MSWindowsHook.cpp
+@@ -6,9 +6,14 @@
+  */
+ 
+ #include "platform/MSWindowsHook.h"
++#include "platform/MSWindowsCursorWarp.h"
++#include "platform/MSWindowsLocalKeyRelease.h"
+ #include "base/DirectionTypes.h"
+ #include "base/Log.h"
+ #include "deskflow/ScreenException.h"
++#include <atomic>
++#include <cstdlib>
++#include <mutex>
+ 
+ #ifndef WM_MOUSEHWHEEL
+ #define WM_MOUSEHWHEEL 0x020E
+@@ -22,7 +27,34 @@ static HHOOK g_getMessage = nullptr;
+ static HHOOK g_keyboardLL = nullptr;
+ static HHOOK g_mouseLL = nullptr;
+ static bool g_screenSaver = false;
+-static EHookMode g_mode = kHOOK_DISABLE;
++static std::atomic<EHookMode> g_mode{kHOOK_DISABLE};
++static std::atomic<bool> g_mouseHandoff{false};
++struct MouseMotionState
++{
++  std::mutex mutex;
++  int64_t pendingX = 0;
++  int64_t pendingY = 0;
++  int64_t targetX = 0;
++  int64_t targetY = 0;
++  uint64_t capturedCount = 0;
++  uint64_t receivedCount = 0;
++  uint64_t absorbedThrough = 0;
++  std::atomic<bool> local{false};
++  std::atomic<bool> returning{false};
++};
++static MouseMotionState g_mouseMotion;
++
++static void resetMouseMotion()
++{
++  std::scoped_lock lock(g_mouseMotion.mutex);
++  g_mouseMotion.pendingX = 0;
++  g_mouseMotion.pendingY = 0;
++  g_mouseMotion.capturedCount = 0;
++  g_mouseMotion.receivedCount = 0;
++  g_mouseMotion.absorbedThrough = 0;
++  g_mouseMotion.local = false;
++  g_mouseMotion.returning = false;
++}
+ static uint32_t g_zoneSides = 0;
+ static int32_t g_zoneSize = 0;
+ static int32_t g_xScreen = 0;
+@@ -95,6 +127,8 @@ int MSWindowsHook::init(DWORD threadID)
+ 
+   // set defaults
+   g_mode = kHOOK_DISABLE;
++  g_mouseHandoff = false;
++  resetMouseMotion();
+   g_zoneSides = 0;
+   g_zoneSize = 0;
+   g_xScreen = 0;
+@@ -107,6 +141,8 @@ int MSWindowsHook::init(DWORD threadID)
+ 
+ int MSWindowsHook::cleanup()
+ {
++  g_mouseHandoff = false;
++  resetMouseMotion();
+   if (g_processID == GetCurrentProcessId()) {
+     g_threadID = 0;
+   }
+@@ -135,11 +171,137 @@ void MSWindowsHook::setZone(int32_t x, int32_t y, int32_t w, int32_t h, int32_t
+ 
+ void MSWindowsHook::setMode(EHookMode mode)
+ {
+-  if (mode == g_mode) {
+-    // no change
+-    return;
+-  }
++  // 先发布正式模式再结束临时接管，避免两次写入之间重新放行真实移动。
+   g_mode = mode;
++  g_mouseMotion.local = false;
++  // 即使模式不变也结束临时接管，确保回本机、停用和清理路径不会残留。
++  g_mouseHandoff = false;
++}
++
++void MSWindowsHook::beginMouseHandoff()
++{
++  g_mouseHandoff = g_isPrimary && g_mode == kHOOK_WATCH_JUMP_ZONE && g_mouseLL != nullptr;
++}
++
++uint64_t MSWindowsHook::nextMouseMotionToken()
++{
++  std::scoped_lock lock(g_mouseMotion.mutex);
++  return ++g_mouseMotion.receivedCount;
++}
++
++bool MSWindowsHook::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)
++{
++  std::scoped_lock lock(g_mouseMotion.mutex);
++  if (token <= g_mouseMotion.absorbedThrough) {
++    return false;
++  }
++  g_mouseMotion.pendingX -= dx;
++  g_mouseMotion.pendingY -= dy;
++  return true;
++}
++
++// 参数 position：本轮最近一次有效的实际光标位置；输入的目标已保存在交接状态中。
++static bool finishMouseReturn(POINT &position)
++{
++  POINT actual{};
++  const bool hadCursor = GetPhysicalCursorPos(&actual) != FALSE;
++  if (!g_isPrimary || g_mouseLL == nullptr || GetCurrentThreadId() != g_hookThread) {
++    if (hadCursor) {
++      position = actual;
++    }
++    return false;
++  }
++
++  const auto dpiContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
++  const deskflow::win32::CursorDesktopBounds bounds{
++      GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
++      GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)};
++  if (hadCursor) {
++    position = actual;
++  }
++  bool complete = false;
++  // SendInput 可能重入真实硬件回调；每轮只合入新增量，最多四轮后把余量交还消息循环。
++  for (int attempt = 0; attempt < 4 && g_mouseMotion.returning.load(); ++attempt) {
++    INPUT input{};
++    bool valid = false;
++    {
++      std::scoped_lock lock(g_mouseMotion.mutex);
++      g_mouseMotion.targetX += g_mouseMotion.pendingX;
++      g_mouseMotion.targetY += g_mouseMotion.pendingY;
++      g_mouseMotion.pendingX = 0;
++      g_mouseMotion.pendingY = 0;
++      if (bounds.width > 0 && bounds.height > 0) {
++        const auto x = std::clamp<int64_t>(g_mouseMotion.targetX, bounds.x,
++                                         static_cast<int64_t>(bounds.x) + bounds.width - 1);
++        const auto y = std::clamp<int64_t>(g_mouseMotion.targetY, bounds.y,
++                                         static_cast<int64_t>(bounds.y) + bounds.height - 1);
++        valid = deskflow::win32::makeCursorWarp(static_cast<int32_t>(x), static_cast<int32_t>(y), bounds, input);
++      }
++    }
++    // 不持锁调用 SendInput：系统可能在此调用本线程的低级钩子。
++    const bool moved = valid && SendInput(1, &input, sizeof(input)) == 1;
++    POINT latest{};
++    const bool haveCursor = GetPhysicalCursorPos(&latest) != FALSE;
++    if (haveCursor) {
++      position = latest;
++    }
++    std::scoped_lock lock(g_mouseMotion.mutex);
++    if (!moved || !haveCursor) {
++      g_mouseMotion.local = true;
++      g_mouseMotion.returning = false;
++      break;
++    }
++    // 桌面边缘或显示器间隙可能裁剪目标；下一轮应从实际落点继续，避免反向移动被越界余量吞掉。
++    g_mouseMotion.targetX = position.x;
++    g_mouseMotion.targetY = position.y;
++    if (g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0) {
++      // 先排入校准坐标，再放行本机移动，保证后续绝对坐标不会被旧坐标覆盖。
++      PostThreadMessage(g_threadID, DESKFLOW_MSG_MOUSE_MOVE, position.x, position.y);
++      g_mouseMotion.local = true;
++      g_mouseMotion.returning = false;
++      complete = true;
++      break;
++    }
++  }
++  if (g_mouseMotion.returning.load() &&
++      !PostThreadMessage(g_hookThread, DESKFLOW_MSG_MOUSE_RETURN, 0, 0)) {
++    g_mouseMotion.local = true;
++    g_mouseMotion.returning = false;
++  }
++  if (dpiContext != nullptr) {
++    SetThreadDpiAwarenessContext(dpiContext);
++  }
++  return complete;
++}
++
++bool MSWindowsHook::returnMouseToPrimary(POINT &position)
++{
++  if (!g_isPrimary || g_mouseLL == nullptr || GetCurrentThreadId() != g_hookThread) {
++    POINT actual{};
++    if (GetPhysicalCursorPos(&actual)) {
++      position = actual;
++    }
++    return false;
++  }
++  {
++    std::scoped_lock lock(g_mouseMotion.mutex);
++    g_mouseMotion.targetX = position.x;
++    g_mouseMotion.targetY = position.y;
++    g_mouseMotion.absorbedThrough = g_mouseMotion.capturedCount;
++    g_mouseMotion.returning = true;
++    g_mouseMotion.local = false;
++  }
++  g_mouseHandoff = false;
++  return finishMouseReturn(position);
++}
++
++bool MSWindowsHook::continueMouseReturn()
++{
++  if (!g_mouseMotion.returning.load()) {
++    return true;
++  }
++  POINT actual{};
++  return finishMouseReturn(actual);
+ }
+ 
+ static void keyboardGetState(BYTE keys[256], DWORD vkCode, bool kf_up)
+@@ -435,6 +597,11 @@ static LRESULT CALLBACK keyboardLLHook(int code, WPARAM wParam, LPARAM lParam)
+     // decode the message
+     KBDLLHOOKSTRUCT *info = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
+ 
++    // 本机遗留按键的精确释放直接到达 Windows，不重新当成远端用户输入。
++    if (deskflow::win32::isLocalKeyRelease(*info)) {
++      return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
++    }
++
+     bool const injected = info->flags & LLKHF_INJECTED;
+     if (!g_isPrimary && injected) {
+       return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
+@@ -471,7 +638,8 @@ static LRESULT CALLBACK keyboardLLHook(int code, WPARAM wParam, LPARAM lParam)
+ // events very early.  the earlier the better.
+ //
+ 
+-static bool mouseHookHandler(WPARAM wParam, int32_t x, int32_t y, int32_t data)
++// 参数 wParam：鼠标消息；x/y：物理坐标；data：按键或滚轮数据；motionMode：仅控制移动的模式。
++static bool mouseHookHandler(WPARAM wParam, int32_t x, int32_t y, int32_t data, EHookMode motionMode)
+ {
+   switch (wParam) {
+   case WM_LBUTTONDOWN:
+@@ -518,11 +686,11 @@ static bool mouseHookHandler(WPARAM wParam, int32_t x, int32_t y, int32_t data)
+ 
+   case WM_NCMOUSEMOVE:
+   case WM_MOUSEMOVE:
+-    if (g_mode == kHOOK_RELAY_EVENTS) {
++    if (motionMode == kHOOK_RELAY_EVENTS) {
+       // relay and eat event
+       PostThreadMessage(g_threadID, DESKFLOW_MSG_MOUSE_MOVE, x, y);
+       return true;
+-    } else if (g_mode == kHOOK_WATCH_JUMP_ZONE) {
++    } else if (motionMode == kHOOK_WATCH_JUMP_ZONE) {
+       // low level hooks can report bogus mouse positions that are
+       // outside of the screen.  jeez.  naturally we end up getting
+       // fake motion in the other direction to get the position back
+@@ -582,6 +750,12 @@ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
+     // decode the message
+     MSLLHOOKSTRUCT *info = reinterpret_cast<MSLLHOOKSTRUCT *>(lParam);
+ 
++    // 本核心的回中和入屏定位只更新 Windows，不产生新的跨屏运动。
++    // 标记跟随事件，延迟到另一个 hook 模式后仍能精确识别。
++    if (deskflow::win32::isCursorWarp(wParam, *info)) {
++      return CallNextHookEx(g_mouseLL, code, wParam, lParam);
++    }
++
+     bool const injected = info->flags & LLMHF_INJECTED;
+     if (!g_isPrimary && injected) {
+       return CallNextHookEx(g_mouseLL, code, wParam, lParam);
+@@ -590,9 +764,50 @@ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
+     int32_t x = static_cast<int32_t>(info->pt.x);
+     int32_t y = static_cast<int32_t>(info->pt.y);
+     int32_t w = static_cast<int16_t>(HIWORD(info->mouseData));
++    const bool mouseHandoff = g_mouseHandoff.load();
++    const bool mouseReturning = g_mouseMotion.returning.load();
++    const EHookMode mouseMode = mouseReturning ? kHOOK_RELAY_EVENTS :
++                               (g_mouseMotion.local.load() ? kHOOK_WATCH_JUMP_ZONE : g_mode.load());
++    // 共享逻辑布局需要看见尚未被 Windows 屏幕边缘裁剪的真实移动。
++    if (g_isPrimary && !mouseHandoff && mouseMode == kHOOK_WATCH_JUMP_ZONE && wParam == WM_MOUSEMOVE &&
++        std::getenv("DESKFLOW_MONITOR_TOPOLOGY") != nullptr) {
++      PostThreadMessage(g_threadID, DESKFLOW_MSG_MOUSE_MOVE, x, y);
++      return CallNextHookEx(g_mouseLL, code, wParam, lParam);
++    }
++
++    // 在远端控制模式下，钩子会吞掉本机移动，实际光标仍停在原位。
++    // 在钩子中计算每条事件的位移，避免排队后回中消息丢弃真实移动。
++    if (g_isPrimary && (mouseMode == kHOOK_RELAY_EVENTS || mouseHandoff) && wParam == WM_MOUSEMOVE) {
++      POINT cursor;
++      // 钩子坐标使用物理像素；明确查询线程的 DPI 上下文，避免缩放坐标混用。
++      const auto dpiContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
++      const bool haveCursor = GetPhysicalCursorPos(&cursor);
++      if (dpiContext != nullptr) {
++        SetThreadDpiAwarenessContext(dpiContext);
++      }
++      if (haveCursor) {
++        const int32_t dx = x - cursor.x;
++        const int32_t dy = y - cursor.y;
++        if (dx != 0 || dy != 0) {
++          std::scoped_lock lock(g_mouseMotion.mutex);
++          if (mouseReturning || PostThreadMessage(g_threadID, DESKFLOW_MSG_MOUSE_MOVE_DELTA, dx, dy)) {
++            g_mouseMotion.pendingX += dx;
++            g_mouseMotion.pendingY += dy;
++            if (!mouseReturning) {
++              ++g_mouseMotion.capturedCount;
++            }
++          }
++        }
++        return 1;
++      }
++      // 临时接管时查询失败也不放行移动，避免离屏过程中再次移出停车点。
++      if (mouseHandoff || mouseReturning) {
++        return 1;
++      }
++    }
+ 
+     // handle the message
+-    if (mouseHookHandler(wParam, x, y, w)) {
++    if (mouseHookHandler(wParam, x, y, w, mouseMode)) {
+       return 1;
+     }
+   }
+@@ -653,6 +868,9 @@ EHookResult MSWindowsHook::install()
+ 
+ int MSWindowsHook::uninstall()
+ {
++  g_mouseHandoff = false;
++  g_mouseMotion.local = false;
++  g_mouseMotion.returning = false;
+   // discard old dead keys
+   g_deadVirtKey = 0;
+   g_deadLParam = 0;
+diff --git a/src/lib/platform/MSWindowsHook.h b/src/lib/platform/MSWindowsHook.h
+index 438e734..a883f12 100644
+--- a/src/lib/platform/MSWindowsHook.h
++++ b/src/lib/platform/MSWindowsHook.h
+@@ -21,9 +21,11 @@
+ #define DESKFLOW_MSG_PRE_WARP WM_APP + 0x0017     // x; y
+ #define DESKFLOW_MSG_SCREEN_SAVER WM_APP + 0x0018 // activated; <unused>
+ #define DESKFLOW_MSG_DEBUG WM_APP + 0x0019        // data, data
++#define DESKFLOW_MSG_MOUSE_MOVE_DELTA WM_APP + 0x001a // dx; dy, captured before queued cursor warps
++#define DESKFLOW_MSG_MOUSE_RETURN WM_APP + 0x001b // finish a bounded mouse-return step on the hook thread
+ #define DESKFLOW_MSG_INPUT_FIRST DESKFLOW_MSG_KEY
+ #define DESKFLOW_MSG_INPUT_LAST DESKFLOW_MSG_PRE_WARP
+-#define DESKFLOW_HOOK_LAST_MSG DESKFLOW_MSG_DEBUG
++#define DESKFLOW_HOOK_LAST_MSG DESKFLOW_MSG_MOUSE_RETURN
+ 
+ #define DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY VK_CANCEL
+ #define DESKFLOW_HOOK_FAKE_INPUT_SCANCODE 0
+@@ -62,6 +64,22 @@ public:
+ 
+   void setMode(EHookMode mode);
+ 
++  // 仅在主机离屏前接管真实鼠标移动；键盘和鼠标按键仍沿用当前模式。
++  void beginMouseHandoff();
++
++  // 主线程每取出一条原始位移消息时获取顺序号，包括已合入入屏位置的清理消息。
++  static uint64_t nextMouseMotionToken();
++
++  // 参数 token：位移消息顺序号；dx/dy：实际派发到服务端的位移；已合入入屏位置时返回 false。
++  static bool consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy);
++
++  // 参数 position：输入为入屏物理坐标，输出为实际光标位置；仅限安装钩子的线程调用。
++  // 将未消费位移一次并入入屏位置，再恢复本机鼠标移动；键盘和按钮仍沿用当前模式。
++  static bool returnMouseToPrimary(POINT &position);
++
++  // 在安装钩子的线程继续有限轮次的入屏补偿，避免同步处理持续输入而阻塞消息循环。
++  static bool continueMouseReturn();
++
+   static EHookResult install();
+ 
+   static int uninstall();
+diff --git a/src/lib/platform/MSWindowsLocalKeyRelease.h b/src/lib/platform/MSWindowsLocalKeyRelease.h
+new file mode 100644
+index 0000000..b2b16d3
+--- /dev/null
++++ b/src/lib/platform/MSWindowsLocalKeyRelease.h
+@@ -0,0 +1,96 @@
++/*
++ * Deskflow -- mouse and keyboard sharing utility
++ * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++ */
++
++#pragma once
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <Windows.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <vector>
++
++namespace deskflow::win32 {
++
++// 仅标记“本机按下、离开后物理松开”的补发释放，不能把全部注入输入放行。
++inline constexpr ULONG_PTR kLocalKeyReleaseTag = 0x4d484c55u;
++
++// 参数 virtualKey：左右独立的虚拟键；button：低 8 位扫描码，0x100 为扩展键。
++inline INPUT makeLocalKeyRelease(WORD virtualKey, uint16_t button)
++{
++  INPUT input{};
++  input.type = INPUT_KEYBOARD;
++  input.ki.wVk = virtualKey;
++  input.ki.wScan = static_cast<WORD>(button & 0xffu);
++  input.ki.dwFlags = KEYEVENTF_KEYUP | ((button & 0x100u) ? KEYEVENTF_EXTENDEDKEY : 0);
++  input.ki.dwExtraInfo = kLocalKeyReleaseTag;
++  return input;
++}
++
++// 参数 event：低级键盘钩子收到的原始事件；只接受本模块带标记的注入释放。
++inline bool isLocalKeyRelease(const KBDLLHOOKSTRUCT &event)
++{
++  return event.dwExtraInfo == kLocalKeyReleaseTag &&
++         (event.flags & (LLKHF_INJECTED | LLKHF_UP)) == (LLKHF_INJECTED | LLKHF_UP);
++}
++
++class LocalKeyReleaseState
++{
++public:
++  // 参数 button：离开主屏前已经在本机按下的扫描码；已有失败释放不能被覆盖。
++  void capture(uint16_t button)
++  {
++    if (find(button) == m_keys.end()) {
++      m_keys.push_back({button, false});
++    }
++  }
++
++  // 进入本机后真实松开会直接到达系统，仅保留已经失败的补发释放。
++  void forgetHeldKeys()
++  {
++    std::erase_if(m_keys, [](const auto &key) { return !key.released; });
++  }
++
++  // 参数 button/down：真实按键事件；send：精确补发释放，成功返回 true。
++  template <typename Send> bool onKey(uint16_t button, bool down, Send send)
++  {
++    auto key = find(button);
++    if (key == m_keys.end()) {
++      return false;
++    }
++    if (down) {
++      // 新按下暂停旧的失败释放，等这一次真实松开再补发，避免遗留本机按下状态。
++      key->released = false;
++      return false;
++    }
++    key->released = true;
++    if (send(button)) {
++      m_keys.erase(key);
++    }
++    return true;
++  }
++
++  // 参数 send：只重试已经收到真实 key-up 的记录；不扫描或释放其它按键。
++  template <typename Send> void retry(Send send)
++  {
++    std::erase_if(m_keys, [&](const auto &key) { return key.released && send(key.button); });
++  }
++
++private:
++  struct Key
++  {
++    uint16_t button;
++    bool released;
++  };
++  std::vector<Key>::iterator find(uint16_t button)
++  {
++    return std::find_if(m_keys.begin(), m_keys.end(), [button](const auto &key) { return key.button == button; });
++  }
++  std::vector<Key> m_keys;
++};
++
++} // namespace deskflow::win32
+diff --git a/src/lib/platform/MSWindowsScreen.cpp b/src/lib/platform/MSWindowsScreen.cpp
+index f2f5a16..c59ba12 100644
+--- a/src/lib/platform/MSWindowsScreen.cpp
++++ b/src/lib/platform/MSWindowsScreen.cpp
+@@ -23,6 +23,7 @@
+ #include "deskflow/KeyMap.h"
+ #include "deskflow/ScreenException.h"
+ #include "platform/MSWindowsClipboard.h"
++#include "platform/MSWindowsCursorWarp.h"
+ #include "platform/MSWindowsDesks.h"
+ #include "platform/MSWindowsEventQueueBuffer.h"
+ #include "platform/MSWindowsKeyState.h"
+@@ -234,7 +235,20 @@ void MSWindowsScreen::disable()
+ 
+ void MSWindowsScreen::enter()
+ {
+-  m_desks->enter();
++  if (m_isPrimary && !m_isOnScreen) {
++    POINT position{m_xCursor, m_yCursor};
++    m_desks->enter(position);
++
++    // 桌面线程已合入全部旧位移；极端重入的校正由该线程分批完成。
++    // 只移除已合入的消息；本机绝对坐标、键盘和按钮事件仍保留原来的时序。
++    MSG msg;
++    while (PeekMessage(&msg, nullptr, DESKFLOW_MSG_MOUSE_MOVE_DELTA, DESKFLOW_MSG_MOUSE_MOVE_DELTA, PM_REMOVE)) {
++      MSWindowsHook::nextMouseMotionToken();
++    }
++    saveMousePosition(position.x, position.y);
++  } else {
++    m_desks->enter();
++  }
+   if (m_isPrimary) {
+     // enable special key sequences on win95 family
+     enableSpecialKeys(true);
+@@ -245,7 +259,7 @@ void MSWindowsScreen::enter()
+     // all messages prior to now are invalid
+     nextMark();
+ 
+-    m_primaryKeyDownList.clear();
++    m_primaryKeyReleases.forgetHeldKeys();
+   } else {
+     // Entering a secondary screen. Ensure that no screensaver is active
+     // and that the screen is not in powersave mode.
+@@ -284,6 +298,11 @@ void MSWindowsScreen::leave()
+   // tell the key mapper about the keyboard layout
+   m_keyState->setKeyLayout(m_keyLayout);
+ 
++  if (m_isPrimary) {
++    // 回中前先接管真实鼠标移动，防止切屏期间漂移；键盘松键仍走原路径。
++    m_hook.beginMouseHandoff();
++  }
++
+   // tell desk that we're leaving and tell it the keyboard layout
+   m_desks->leave(m_keyLayout);
+ 
+@@ -303,10 +322,10 @@ void MSWindowsScreen::leave()
+ 
+     m_hook.setMode(kHOOK_RELAY_EVENTS);
+ 
+-    m_primaryKeyDownList.clear();
++    m_primaryKeyReleases.forgetHeldKeys();
+     for (KeyButton i = 0; i < IKeyState::s_numButtons; ++i) {
+       if (m_keyState->isKeyDown(i)) {
+-        m_primaryKeyDownList.push_back(i);
++        m_primaryKeyReleases.capture(i);
+         LOG_DEBUG1("key button %d is down before leaving to another screen", i);
+       }
+     }
+@@ -465,14 +484,40 @@ bool MSWindowsScreen::getThisCursorPos(LPPOINT pos)
+ 
+ bool MSWindowsScreen::setThisCursorPos(int x, int y)
+ {
+-  auto result = SetCursorPos(x, y);
++  const auto move = [this, x, y]() {
++    if (!m_isPrimary) {
++      return SetCursorPos(x, y) != FALSE;
++    }
++
++    // 目标和桌面范围均使用物理像素，混合 DPI 屏幕不能沿用调用线程的缩放坐标。
++    const auto dpiContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
++    const deskflow::win32::CursorDesktopBounds bounds{
++        GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
++        GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)};
++    INPUT input{};
++    const bool valid = deskflow::win32::makeCursorWarp(x, y, bounds, input);
++    if (dpiContext != nullptr) {
++      SetThreadDpiAwarenessContext(dpiContext);
++    }
++    if (!valid) {
++      SetLastError(ERROR_INVALID_PARAMETER);
++      return false;
++    }
++    // 失败不退回未标记的 SetCursorPos，否则仍会把程序回位当成真实鼠标移动。
++    return SendInput(1, &input, sizeof(input)) == 1;
++  };
++
++  auto result = move();
+   if (!result) {
+     LOG_DEBUG("could not set cursor pos, error: %s", windowsErrorToString(GetLastError()).c_str());
+ 
+     LOG_DEBUG("retrying to set cursor pos");
+-    result = SetCursorPos(x, y);
++    result = move();
+     if (!result) {
+       LOG_DEBUG("could not set cursor pos, error: %s", windowsErrorToString(GetLastError()).c_str());
++      if (m_isPrimary) {
++        LOG_WARN("tagged cursor warp failed; requested position %d,%d was not confirmed", x, y);
++      }
+ 
+       updateDesktopThread();
+     }
+@@ -516,16 +561,25 @@ uint32_t MSWindowsScreen::activeSides()
+ void MSWindowsScreen::warpCursor(int32_t x, int32_t y)
+ {
+   // warp mouse
+-  warpCursorNoFlush(x, y);
++  const bool moved = warpCursorNoFlush(x, y);
+ 
+-  // remove all input events before and including warp
+-  MSG msg;
+-  while (PeekMessage(&msg, nullptr, DESKFLOW_MSG_INPUT_FIRST, DESKFLOW_MSG_INPUT_LAST, PM_REMOVE)) {
+-    // do nothing
++  if (!m_isPrimary) {
++    // 客户端保留旧的未标记回位清理；主机回位有独立标记，不清真实输入。
++    MSG msg;
++    while (PeekMessage(&msg, nullptr, DESKFLOW_MSG_INPUT_FIRST, DESKFLOW_MSG_INPUT_LAST, PM_REMOVE)) {
++      // do nothing
++    }
+   }
+ 
+   // save position to compute delta of next motion
+-  saveMousePosition(x, y);
++  if (moved) {
++    saveMousePosition(x, y);
++  } else {
++    POINT actual{};
++    if (GetPhysicalCursorPos(&actual)) {
++      saveMousePosition(actual.x, actual.y);
++    }
++  }
+ }
+ 
+ void MSWindowsScreen::saveMousePosition(int32_t x, int32_t y)
+@@ -896,6 +950,9 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
+   case DESKFLOW_MSG_MOUSE_MOVE:
+     return onMouseMove(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
+ 
++  case DESKFLOW_MSG_MOUSE_MOVE_DELTA:
++    return onMouseMoveDelta(static_cast<int32_t>(wParam), static_cast<int32_t>(lParam));
++
+   case DESKFLOW_MSG_MOUSE_WHEEL:
+     return onMouseWheel(static_cast<int32_t>(lParam), static_cast<int32_t>(wParam));
+ 
+@@ -1040,16 +1097,9 @@ bool MSWindowsScreen::onKey(WPARAM wParam, LPARAM lParam)
+   // record keyboard state
+   m_keyState->onKey(button, down, oldState);
+ 
+-  if (!down && m_isPrimary && !m_isOnScreen) {
+-    PrimaryKeyDownList::iterator find = std::find(m_primaryKeyDownList.begin(), m_primaryKeyDownList.end(), button);
+-    if (find != m_primaryKeyDownList.end()) {
+-      LOG_DEBUG1("release key button %d on primary", *find);
+-      m_hook.setMode(kHOOK_WATCH_JUMP_ZONE);
+-      fakeLocalKey(*find, false);
+-      m_primaryKeyDownList.erase(find);
+-      m_hook.setMode(kHOOK_RELAY_EVENTS);
+-      return true;
+-    }
++  // 真实事件先更新待补发状态；新的物理按下必须在热键或 mark 提前返回之前取消旧重试。
++  if (m_isPrimary) {
++    m_primaryKeyReleases.onKey(button, down, [this](KeyButton key) { return releaseLocalKey(key); });
+   }
+ 
+   // windows doesn't tell us the modifier key state on mouse or key
+@@ -1263,6 +1313,22 @@ bool MSWindowsScreen::onMouseMove(int32_t mx, int32_t my)
+   return true;
+ }
+ 
++bool MSWindowsScreen::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)
++{
++  return MSWindowsHook::consumeMouseMotion(token, dx, dy);
++}
++
++// 参数 dx/dy：钩子已拦截的真实位移；与按键一起排队，路由前再确认消费。
++bool MSWindowsScreen::onMouseMoveDelta(int32_t dx, int32_t dy)
++{
++  const auto token = MSWindowsHook::nextMouseMotionToken();
++  if (!m_isOnScreen && (dx != 0 || dy != 0)) {
++    LOG_DEBUG2("mouse move from hook: %+d,%+d", dx, dy);
++    sendEvent(EventTypes::PrimaryScreenMotionOnSecondary, MotionInfo::alloc(dx, dy, token));
++  }
++  return true;
++}
++
+ bool MSWindowsScreen::onMouseWheel(int32_t xDelta, int32_t yDelta)
+ {
+   // ignore message if posted prior to last mark change
+@@ -1351,23 +1417,34 @@ void MSWindowsScreen::onClipboardChange()
+   }
+ }
+ 
+-void MSWindowsScreen::warpCursorNoFlush(int32_t x, int32_t y)
++bool MSWindowsScreen::warpCursorNoFlush(int32_t x, int32_t y)
+ {
+-  // send an event that we can recognize before the mouse warp
+-  PostThreadMessage(GetCurrentThreadId(), DESKFLOW_MSG_PRE_WARP, x, y);
++  // Secondary screens retain the legacy bracket around the untagged warp.
++  if (!m_isPrimary) {
++    PostThreadMessage(GetCurrentThreadId(), DESKFLOW_MSG_PRE_WARP, x, y);
++  }
+ 
+-  // warp mouse.  hopefully this inserts a mouse motion event
+-  // between the previous message and the following message.
+-  setThisCursorPos(x, y);
++  // Primary warps carry their own tag; the hook never reports them as motion.
++  const bool moved = setThisCursorPos(x, y);
+ 
+   // check to see if the mouse pos was set correctly
+-  POINT cursorPos;
+-  getThisCursorPos(&cursorPos);
++  POINT cursorPos{};
++  const bool haveCursor = m_isPrimary ? GetPhysicalCursorPos(&cursorPos) != FALSE : getThisCursorPos(&cursorPos);
++
++  if (m_isPrimary) {
++    // 主机回位由事件标记精确识别，无需 PRE/POST 清队列或让出时间片。
++    if (moved) {
++      saveMousePosition(x, y);
++    } else if (haveCursor) {
++      saveMousePosition(cursorPos.x, cursorPos.y);
++    }
++    return moved;
++  }
+ 
+   // there is a bug or round error in SetCursorPos and GetCursorPos on
+   // a high DPI setting. The check here is for Vista/7 login screen.
+   // since this feature is mainly for client, so only check on client.
+-  if (!isPrimary()) {
++  if (!isPrimary() && haveCursor) {
+     if ((cursorPos.x != x) && (cursorPos.y != y)) {
+       LOG_DEBUG("function 'SetCursorPos' failed; trying 'fakeMouseMove'");
+       LOG_DEBUG("cursor pos %d, %d expected pos %d, %d", cursorPos.x, cursorPos.y, x, y);
+@@ -1382,7 +1459,8 @@ void MSWindowsScreen::warpCursorNoFlush(int32_t x, int32_t y)
+     }
+   }
+ 
+-  // yield the CPU.  there's a race condition when warping:
++  // Yield for the legacy untagged path. Primary warp recognition no longer
++  // depends on callback timing. The original race was:
+   //   a hardware mouse event occurs
+   //   the mouse hook is not called because that process doesn't have the CPU
+   //   we send PRE_WARP, SetCursorPos(), send POST_WARP
+@@ -1402,6 +1480,7 @@ void MSWindowsScreen::warpCursorNoFlush(int32_t x, int32_t y)
+ 
+   // send an event that we can recognize after the mouse warp
+   PostThreadMessage(GetCurrentThreadId(), DESKFLOW_MSG_POST_WARP, 0, 0);
++  return moved;
+ }
+ 
+ void MSWindowsScreen::nextMark()
+@@ -1437,6 +1516,11 @@ void MSWindowsScreen::updateScreenShape()
+ 
+ void MSWindowsScreen::handleFixes()
+ {
++  if (m_isPrimary) {
++    // 复用已有定时器，只重试已经物理松开但 SendInput 失败的精确按键。
++    m_primaryKeyReleases.retry([this](KeyButton button) { return releaseLocalKey(button); });
++  }
++
+   // fix clipboard chain
+   fixClipboardViewer();
+ 
+@@ -1675,16 +1759,15 @@ LRESULT CALLBACK MSWindowsScreen::wndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
+   return result;
+ }
+ 
+-void MSWindowsScreen::fakeLocalKey(KeyButton button, bool press) const
++bool MSWindowsScreen::releaseLocalKey(KeyButton button) const
+ {
+-  INPUT input;
+-  input.type = INPUT_KEYBOARD;
+-  input.ki.wVk = m_keyState->mapButtonToVirtualKey(button);
+-  DWORD pressFlag = press ? KEYEVENTF_EXTENDEDKEY : KEYEVENTF_KEYUP;
+-  input.ki.dwFlags = pressFlag;
+-  input.ki.time = 0;
+-  input.ki.dwExtraInfo = 0;
+-  SendInput(1, &input, sizeof(input));
++  INPUT input = deskflow::win32::makeLocalKeyRelease(m_keyState->mapButtonToVirtualKey(button), button);
++  if (input.ki.wVk == 0 || SendInput(1, &input, sizeof(input)) != 1) {
++    LOG_DEBUG1("local key release pending for button %d, error %d", button, GetLastError());
++    return false;
++  }
++  LOG_DEBUG1("released key button %d on primary", button);
++  return true;
+ }
+ 
+ //
+diff --git a/src/lib/platform/MSWindowsScreen.h b/src/lib/platform/MSWindowsScreen.h
+index 4d6e951..aaaacca 100644
+--- a/src/lib/platform/MSWindowsScreen.h
++++ b/src/lib/platform/MSWindowsScreen.h
+@@ -10,6 +10,7 @@
+ 
+ #include "deskflow/PlatformScreen.h"
+ #include "platform/MSWindowsHook.h"
++#include "platform/MSWindowsLocalKeyRelease.h"
+ #include "platform/MSWindowsPowerManager.h"
+ 
+ #include <map>
+@@ -109,6 +110,9 @@ public:
+   void enable() override;
+   void disable() override;
+   void enter() override;
++  // 参数 token：捕获位移的顺序号；dx/dy：已排队的物理像素位移。
++  // 已经合入返回位置的事件不再发送给另一台电脑。
++  bool consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy) override;
+   bool canLeave() override;
+   void leave() override;
+   bool setClipboard(ClipboardID, const IClipboard *) override;
+@@ -128,8 +132,8 @@ protected:
+   void updateButtons() override;
+   IKeyState *getKeyState() const override;
+ 
+-  // simulate a local key to the system directly
+-  void fakeLocalKey(KeyButton button, bool press) const;
++  // 参数 button：已经物理松开的本机扫描码；成功补发系统释放时返回 true。
++  bool releaseLocalKey(KeyButton button) const;
+ 
+ private:
+   // initialization and shutdown operations
+@@ -170,13 +174,15 @@ private: // HACK
+   bool onHotKey(WPARAM, LPARAM);
+   bool onMouseButton(WPARAM, LPARAM);
+   bool onMouseMove(int32_t x, int32_t y);
++  // dx/dy：钩子捕获的单次像素位移，沿用 Windows 当前速度与加速设置。
++  bool onMouseMoveDelta(int32_t dx, int32_t dy);
+   bool onMouseWheel(int32_t xDelta, int32_t yDelta);
+   bool onScreensaver(bool activated);
+   bool onDisplayChange();
+   void onClipboardChange();
+ 
+-  // warp cursor without discarding queued events
+-  void warpCursorNoFlush(int32_t x, int32_t y);
++  // 参数 x/y：目标像素；不清输入队列，返回回位请求是否成功发出。
++  bool warpCursorNoFlush(int32_t x, int32_t y);
+ 
+   // discard posted messages
+   void nextMark();
+@@ -243,7 +249,6 @@ private:
+   using HotKeyMap = std::map<uint32_t, HotKeyItem>;
+   using HotKeyIDList = std::vector<uint32_t>;
+   using HotKeyToIDMap = std::map<HotKeyItem, uint32_t>;
+-  using PrimaryKeyDownList = std::vector<KeyButton>;
+ 
+   static HINSTANCE s_windowInstance;
+ 
+@@ -334,6 +339,6 @@ private:
+ 
+   std::string m_desktopPath;
+ 
+-  PrimaryKeyDownList m_primaryKeyDownList;
++  deskflow::win32::LocalKeyReleaseState m_primaryKeyReleases;
+   MSWindowsPowerManager m_powerManager;
+ };
+diff --git a/src/lib/server/MonitorTopologyRouter.h b/src/lib/server/MonitorTopologyRouter.h
+new file mode 100644
+index 0000000..95803a8
+--- /dev/null
++++ b/src/lib/server/MonitorTopologyRouter.h
+@@ -0,0 +1,172 @@
++// SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
++#pragma once
++
++#include <QDateTime>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <functional>
++#include <limits>
++#include <optional>
++#include <string>
++#include <vector>
++
++class MonitorTopologyRouter
++{
++public:
++  struct Motion {
++    std::string owner;
++    int32_t oldX, oldY, nextX, nextY;
++  };
++  struct Destination {
++    std::string owner;
++    int32_t x, y;
++  };
++
++  // motion：当前电脑及原始像素移动；available：该电脑是否仍连接到服务端。
++  std::optional<Destination> route(const Motion &motion, const std::function<bool(const std::string &)> &available)
++  {
++    refresh();
++    const Monitor *current = findCurrent(motion.owner, motion.oldX, motion.oldY);
++    if (current == nullptr) return std::nullopt;
++    // Windows 会把移动裁到最后一个像素；到达边缘且继续向外时仍需要跨屏。
++    auto nextX = motion.nextX;
++    auto nextY = motion.nextY;
++    if (nextX == current->nativeX && nextX < motion.oldX) --nextX;
++    else if (nextX == current->nativeX + current->w - 1 && nextX > motion.oldX) ++nextX;
++    if (nextY == current->nativeY && nextY < motion.oldY) --nextY;
++    else if (nextY == current->nativeY + current->h - 1 && nextY > motion.oldY) ++nextY;
++    if (current->contains(nextX, nextY)) return std::nullopt;
++    const auto &from = *current;
++    const double gx = from.x + (motion.oldX - from.nativeX) * from.canvasW / from.w;
++    const double gy = from.y + (motion.oldY - from.nativeY) * from.canvasH / from.h;
++    const double dx = (nextX - motion.oldX) * from.canvasW / from.w;
++    const double dy = (nextY - motion.oldY) * from.canvasH / from.h;
++    const bool exitsX = (dx < 0 && nextX < from.nativeX) || (dx > 0 && nextX >= from.nativeX + from.w);
++    const bool exitsY = (dy < 0 && nextY < from.nativeY) || (dy > 0 && nextY >= from.nativeY + from.h);
++    if (!exitsX && !exitsY) return std::nullopt;
++    // 同时越出两条边时按最先经过的边切屏，不能固定优先左右边。
++    const double timeX = exitsX ? ((dx > 0 ? from.x + from.canvasW : from.x) - gx) / dx
++                               : std::numeric_limits<double>::max();
++    const double timeY = exitsY ? ((dy > 0 ? from.y + from.canvasH : from.y) - gy) / dy
++                               : std::numeric_limits<double>::max();
++    bool horizontal = exitsX && (!exitsY || timeX <= timeY);
++    const double exitTime = std::clamp(horizontal ? timeX : timeY, 0.0, 1.0);
++    // horizontal：检查左右边或上下边；只沿最先穿过的边寻找最近且对齐的屏幕。
++    const auto findTarget = [&](bool horizontal) {
++      const bool positive = horizontal ? dx > 0 : dy > 0;
++      const double crossing = horizontal ? gy + dy * exitTime : gx + dx * exitTime;
++      const Monitor *target = nullptr;
++      double best = std::numeric_limits<double>::max();
++      for (const auto &candidate : m_monitors) {
++        if (&candidate == current || !available(candidate.owner)) continue;
++        const double along = horizontal
++            ? (positive ? candidate.x - (from.x + from.canvasW) : from.x - (candidate.x + candidate.canvasW))
++            : (positive ? candidate.y - (from.y + from.canvasH) : from.y - (candidate.y + candidate.canvasH));
++        if (along < -1.0) continue;
++        // 用实际过边交点选目标，半开区间让接缝点只属于一块屏，避免快速斜移时选中旧行。
++        const double acrossStart = horizontal ? candidate.y : candidate.x;
++        const double acrossEnd = acrossStart + (horizontal ? candidate.canvasH : candidate.canvasW);
++        if (crossing < acrossStart || crossing >= acrossEnd) continue;
++        const double score = std::max(0.0, along);
++        if (score < best) { best = score; target = &candidate; }
++      }
++      return target;
++    };
++    const Monitor *target = findTarget(horizontal);
++    // 正好穿过角点时两条边同样早；第一条边未连通，才允许检查另一条。
++    if (target == nullptr && exitsX && exitsY && std::abs(timeX - timeY) <= 1e-9) {
++      horizontal = !horizontal;
++      target = findTarget(horizontal);
++    }
++    if (target == nullptr) return std::nullopt;
++    const bool positive = horizontal ? dx > 0 : dy > 0;
++    double tx = std::clamp(gx + dx, target->x, target->x + target->canvasW - 1);
++    double ty = std::clamp(gy + dy, target->y, target->y + target->canvasH - 1);
++    if (horizontal) {
++      const double overshoot = std::max(0.0, positive ? gx + dx - from.x - from.canvasW : from.x - gx - dx);
++      tx = positive ? target->x + overshoot : target->x + target->canvasW - 1 - overshoot;
++    } else {
++      const double overshoot = std::max(0.0, positive ? gy + dy - from.y - from.canvasH : from.y - gy - dy);
++      ty = positive ? target->y + overshoot : target->y + target->canvasH - 1 - overshoot;
++    }
++    return Destination {target->owner,
++        static_cast<int32_t>(target->nativeX + std::clamp((tx - target->x) * target->w / target->canvasW, 0.0, target->w - 1)),
++        static_cast<int32_t>(target->nativeY + std::clamp((ty - target->y) * target->h / target->canvasH, 0.0, target->h - 1))};
++  }
++
++  // motion：用当前单块显示器限制移动；有独立屏幕拓扑时不再使用整台电脑的大矩形切屏。
++  std::optional<Destination> clamp(const Motion &motion)
++  {
++    refresh();
++    const Monitor *current = findCurrent(motion.owner, motion.oldX, motion.oldY);
++    if (current != nullptr)
++      return Destination {motion.owner,
++          static_cast<int32_t>(std::clamp(static_cast<double>(motion.nextX), current->nativeX, current->nativeX + current->w - 1)),
++          static_cast<int32_t>(std::clamp(static_cast<double>(motion.nextY), current->nativeY, current->nativeY + current->h - 1))};
++    return std::nullopt;
++  }
++
++private:
++  struct Monitor {
++    std::string owner;
++    double x, y, nativeX, nativeY, w, h, canvasW, canvasH;
++    // px/py：真实桌面的像素坐标。
++    bool contains(double px, double py) const { return px >= nativeX && py >= nativeY && px < nativeX + w && py < nativeY + h; }
++    // Windows 可能把边界位置裁到显示器外 1px；只在查找“当前显示器”时容忍这个误差。
++    bool touches(double px, double py) const
++    {
++      constexpr double kEdge = 1.5;
++      return px >= nativeX - kEdge && px < nativeX + w + kEdge &&
++             py >= nativeY - kEdge && py < nativeY + h + kEdge;
++    }
++  };
++
++  // owner/px/py：当前电脑名和真实桌面坐标；优先精确命中，再按边界容差命中。
++  const Monitor *findCurrent(const std::string &owner, int32_t px, int32_t py) const
++  {
++    for (const auto &monitor : m_monitors)
++      if (monitor.owner == owner && monitor.contains(px, py)) return &monitor;
++    for (const auto &monitor : m_monitors)
++      if (monitor.owner == owner && monitor.touches(px, py)) return &monitor;
++    return nullptr;
++  }
++  std::vector<Monitor> m_monitors;
++  qint64 m_nextCheck = 0;
++  QDateTime m_modified;
++
++  void refresh()
++  {
++    const auto now = QDateTime::currentMSecsSinceEpoch();
++    if (now < m_nextCheck) return;
++    m_nextCheck = now + 300;
++    const char *path = std::getenv("DESKFLOW_MONITOR_TOPOLOGY");
++    if (path == nullptr) return;
++    const QString filePath = QString::fromUtf8(path);
++    const QFileInfo info(filePath);
++    if (!info.exists() || info.lastModified() == m_modified) return;
++    QFile file(filePath);
++    if (!file.open(QIODevice::ReadOnly)) return;
++    QJsonParseError error;
++    const auto json = QJsonDocument::fromJson(file.readAll(), &error);
++    if (error.error != QJsonParseError::NoError || !json.isObject()) return;
++    std::vector<Monitor> updated;
++    for (const auto &value : json.object().value("monitors").toArray()) {
++      const auto item = value.toObject();
++      if (!item.value("active").toBool()) continue;
++      Monitor monitor {item.value("owner").toString().toStdString(), item.value("x").toDouble(), item.value("y").toDouble(),
++          item.value("nativeX").toDouble(), item.value("nativeY").toDouble(), item.value("width").toDouble(), item.value("height").toDouble(),
++          item.value("canvasWidth").toDouble(), item.value("canvasHeight").toDouble()};
++      if (monitor.w <= 0 || monitor.h <= 0 || monitor.canvasW <= 0 || monitor.canvasH <= 0 || monitor.owner.empty()) continue;
++      updated.push_back(std::move(monitor));
++    }
++    if (updated.empty()) return;
++    m_monitors = std::move(updated);
++    m_modified = info.lastModified();
++  }
++};
+diff --git a/src/lib/server/PrimaryClient.cpp b/src/lib/server/PrimaryClient.cpp
+index a98cd9b..cf091f4 100644
+--- a/src/lib/server/PrimaryClient.cpp
++++ b/src/lib/server/PrimaryClient.cpp
+@@ -59,6 +59,11 @@ void PrimaryClient::getCursorCenter(int32_t &x, int32_t &y) const
+   m_screen->getCursorCenter(x, y);
+ }
+ 
++bool PrimaryClient::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)
++{
++  return m_screen->consumeMouseMotion(token, dx, dy);
++}
++
+ KeyModifierMask PrimaryClient::getToggleMask() const
+ {
+   return m_screen->pollActiveModifiers();
+diff --git a/src/lib/server/PrimaryClient.h b/src/lib/server/PrimaryClient.h
+index 68d1c61..57f16fc 100644
+--- a/src/lib/server/PrimaryClient.h
++++ b/src/lib/server/PrimaryClient.h
+@@ -84,6 +84,9 @@ public:
+   */
+   void getCursorCenter(int32_t &x, int32_t &y) const;
+ 
++  // 参数 token：捕获序号；dx/dy：待路由位移。由主屏确认事件是否仍需处理。
++  bool consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy);
++
+   //! Get toggle key state
+   /*!
+   Returns the primary screen's current toggle modifier key state.
+diff --git a/src/lib/server/Server.cpp b/src/lib/server/Server.cpp
+index 3ddf065..9c5c64b 100644
+--- a/src/lib/server/Server.cpp
++++ b/src/lib/server/Server.cpp
+@@ -1256,6 +1256,10 @@ void Server::handleMotionPrimaryEvent(const Event &event)
+ void Server::handleMotionSecondaryEvent(const Event &event)
+ {
+   const auto *info = static_cast<IPlatformScreen::MotionInfo *>(event.getData());
++  // 在原有队列顺序中确认消费，避免位移超越此前的按键或鼠标按钮事件。
++  if (info->m_token != 0 && !m_primaryClient->consumeMouseMotion(info->m_token, info->m_x, info->m_y)) {
++    return;
++  }
+   onMouseMoveSecondary(info->m_x, info->m_y);
+ }
+ 
+@@ -1608,6 +1612,24 @@ bool Server::onMouseMovePrimary(int32_t x, int32_t y)
+     return false;
+   }
+ 
++  // save last delta
++  if (!isLockedToScreenServer()) {
++    const auto destination = m_monitorRouter.route({getName(m_active), m_x, m_y, x, y}, [this](const auto &name) { return m_clients.contains(name); });
++    if (destination) {
++      auto *client = m_clients.find(destination->owner)->second;
++      if (client == m_active) { m_x = destination->x; m_y = destination->y; client->mouseMove(m_x, m_y); return false; }
++      switchScreen(client, destination->x, destination->y, false);
++      return true;
++    }
++    if (const auto position = m_monitorRouter.clamp({getName(m_active), m_x, m_y, x, y})) {
++      m_x = position->x;
++      m_y = position->y;
++      // Windows 可能已跨过本机原生接缝；同步实际光标，避免下一次移动使用错误起点。
++      if (m_x != x || m_y != y) m_active->mouseMove(m_x, m_y);
++      return false;
++    }
++  }
++
+   // save last delta
+   m_xDelta2 = m_xDelta;
+   m_yDelta2 = m_yDelta;
+@@ -1734,6 +1756,21 @@ void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)
+   // save old position
+   const int32_t xOld = m_x;
+   const int32_t yOld = m_y;
++  if (!isLockedToScreenServer()) {
++    const auto destination = m_monitorRouter.route({getName(m_active), m_x, m_y, m_x + dx, m_y + dy}, [this](const auto &name) { return m_clients.contains(name); });
++    if (destination) {
++      auto *client = m_clients.find(destination->owner)->second;
++      if (client == m_active) { m_x = destination->x; m_y = destination->y; client->mouseMove(m_x, m_y); }
++      else switchScreen(client, destination->x, destination->y, false);
++      return;
++    }
++    if (const auto position = m_monitorRouter.clamp({getName(m_active), m_x, m_y, m_x + dx, m_y + dy})) {
++      m_x = position->x;
++      m_y = position->y;
++      m_active->mouseMove(m_x, m_y);
++      return;
++    }
++  }
+ 
+   // save last delta
+   m_xDelta2 = m_xDelta;
+diff --git a/src/lib/server/Server.h b/src/lib/server/Server.h
+index 3fc7d76..e2442a8 100644
+--- a/src/lib/server/Server.h
++++ b/src/lib/server/Server.h
+@@ -7,6 +7,7 @@
+  */
+ 
+ #pragma once
++#include "server/MonitorTopologyRouter.h"
+ 
+ #include "base/Event.h"
+ #include "base/NetworkProtocol.h"
+@@ -373,6 +374,7 @@ private:
+ 
+   // the Primary Screen Client
+   PrimaryClient *m_primaryClient = nullptr;
++  MonitorTopologyRouter m_monitorRouter;
+ 
+   // the client with focus
+   BaseClientProxy *m_active = nullptr;
+diff --git a/tools/build-pointer-core.ps1 b/tools/build-pointer-core.ps1
+new file mode 100644
+index 0000000..2ae51c0
+--- /dev/null
++++ b/tools/build-pointer-core.ps1
+@@ -0,0 +1,49 @@
++﻿[CmdletBinding()]
++param(
++    # QtRoot：Qt 6.7+ 的 MSVC x64 SDK 目录。
++    [Parameter(Mandatory = $true)][string]$QtRoot,
++    # OpenSslRoot：包含 include/openssl 和 lib/*.lib 的 OpenSSL SDK 目录。
++    [Parameter(Mandatory = $true)][string]$OpenSslRoot,
++    # BuildDir：独立的编译产物目录，不与 Sunshine 或 Hub 共用。
++    [Parameter(Mandatory = $true)][string]$BuildDir,
++    # CMake：CMake 可执行文件路径；需要 Ninja 已加入 PATH。
++    [string]$CMake = 'cmake',
++    # Jobs：并行编译数量。
++    [int]$Jobs = 6,
++    # TestRouting：编译并运行不接管键鼠的跨屏路由测试。
++    [switch]$TestRouting
++)
++
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++$env:PATH = "$msvcRoot\bin\Hostx64\x64;$sdkRoot\bin\$sdkVersion\x64;$QtRoot\bin;$env:PATH"
++$env:VSLANG = '1033'
++
++& $CMake -S $sourceRoot -B $BuildDir -G Ninja `
++    -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Release `
++    "-DCMAKE_PREFIX_PATH=$QtRoot" "-DOPENSSL_ROOT_DIR=$OpenSslRoot" `
++    -DCMAKE_NINJA_CMCLDEPS_RC=OFF `
++    -DBUILD_TESTS=OFF -DBUILD_INSTALLER=OFF -DBUILD_USER_DOCS=OFF
++if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
++# 完整重编译：部分中文 MSVC 的 /showIncludes 依赖识别失败，类布局变化不能混用旧对象文件。
++& $CMake --build $BuildDir --target deskflow-core --clean-first -j $Jobs
++if ($LASTEXITCODE -ne 0) { throw 'Deskflow core build failed.' }
++if ($TestRouting) {
++    & cl /nologo /utf-8 /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD `
++        "/I$sourceRoot\src\lib" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" `
++        "$PSScriptRoot\test-monitor-routing.cpp" "/Fe:$BuildDir\test-monitor-routing.exe" "/Fo:$BuildDir\test-monitor-routing.obj" `
++        /link "/LIBPATH:$QtRoot\lib" Qt6Core.lib
++    if ($LASTEXITCODE -ne 0) { throw 'Monitor routing test build failed.' }
++    & "$BuildDir\test-monitor-routing.exe"
++    if ($LASTEXITCODE -ne 0) { throw 'Monitor routing tests failed.' }
++}
+diff --git a/tools/test-cursor-warp.cpp b/tools/test-cursor-warp.cpp
+new file mode 100644
+index 0000000..cc5f60e
+--- /dev/null
++++ b/tools/test-cursor-warp.cpp
+@@ -0,0 +1,120 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++
++#include "platform/MSWindowsCursorWarp.h"
++#include "platform/MSWindowsHook.h"
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <limits>
++#include <vector>
++
++using namespace deskflow::win32;
++
++static int checks = 0;
++
++// 参数 success：断言结果；message：失败时输出的行为说明。
++static void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) {
++    std::fprintf(stderr, "FAIL: %s\n", message);
++    std::exit(1);
++  }
++}
++
++// 参数 normalized：SendInput 绝对坐标；origin/extent：物理桌面范围；模拟像素区间映射。
++static int64_t physicalPixel(LONG normalized, int32_t origin, int32_t extent)
++{
++  return origin + static_cast<int64_t>(normalized) * extent / 65536;
++}
++
++// 参数 position/origin/extent：物理像素及该轴范围；验证规范化后仍落在原像素。
++static void checkPixel(int32_t position, int32_t origin, int32_t extent)
++{
++  const auto normalized = normalizeCursorCoordinate(position, origin, extent);
++  check(normalized >= 0 && normalized <= 65535, "normalized absolute coordinate is in range");
++  check(physicalPixel(normalized, origin, extent) == position, "pixel center maps to the original physical pixel");
++}
++
++int main()
++{
++  const std::array<CursorDesktopBounds, 5> desktops{{
++      {0, 0, 1920, 1080}, {-2560, -1200, 6480, 2640},
++      {-2736, 0, 4656, 1920}, {800, -2400, 3840, 4560},
++      {0, 0, 65536, 1},
++  }};
++  for (const auto &bounds : desktops) {
++    for (int32_t offset = 0; offset < bounds.width; ++offset) {
++      checkPixel(bounds.x + offset, bounds.x, bounds.width);
++    }
++    for (int32_t offset = 0; offset < bounds.height; ++offset) {
++      checkPixel(bounds.y + offset, bounds.y, bounds.height);
++    }
++    INPUT input{};
++    check(makeCursorWarp(bounds.x + bounds.width - 1, bounds.y, bounds, input), "construct physical desktop corner warp");
++    check(input.type == INPUT_MOUSE, "warp is a mouse input");
++    check(input.mi.dwFlags == static_cast<DWORD>(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK),
++          "warp maps the entire virtual desktop without acceleration");
++    check(input.mi.mouseData == 0 && input.mi.time == 0, "unused input fields are zero initialized");
++    check(input.mi.dwExtraInfo == kCursorWarpTag, "warp carries the dedicated core tag");
++    check(physicalPixel(input.mi.dx, bounds.x, bounds.width) == bounds.x + bounds.width - 1 &&
++          physicalPixel(input.mi.dy, bounds.y, bounds.height) == bounds.y, "negative desktop origin and corners retain target");
++  }
++
++  const CursorDesktopBounds bounds{-2560, -1200, 6480, 2640};
++  INPUT input{};
++  check(makeCursorWarp(1918, 721, bounds, input), "construct reentry warp far from the source center");
++  check(physicalPixel(input.mi.dx, bounds.x, bounds.width) == 1918 &&
++        physicalPixel(input.mi.dy, bounds.y, bounds.height) == 721, "reentry uses mapped target, not the hidden center anchor");
++  check(normalizeCursorCoordinate(-10000, bounds.x, bounds.width) == normalizeCursorCoordinate(bounds.x, bounds.x, bounds.width),
++        "out-of-desktop low coordinate clamps to the first pixel");
++  check(normalizeCursorCoordinate(10000, bounds.x, bounds.width) == normalizeCursorCoordinate(bounds.x + bounds.width - 1, bounds.x, bounds.width),
++        "out-of-desktop high coordinate clamps to the final pixel");
++  check(normalizeCursorCoordinate((std::numeric_limits<int32_t>::max)(), (std::numeric_limits<int32_t>::min)(),
++                                  (std::numeric_limits<int32_t>::max)()) <= 65535,
++        "wide signed coordinate subtraction cannot overflow");
++  checkPixel(-123, -123, 1);
++  check(!makeCursorWarp(0, 0, {0, 0, 0, 1080}, input), "reject empty desktop width");
++  check(!makeCursorWarp(0, 0, {0, 0, 1920, -1}, input), "reject invalid desktop height");
++  check(input.mi.dx == 0 && input.mi.dy == 0 && input.mi.dwFlags == 0 && input.mi.dwExtraInfo == 0,
++        "invalid desktop returns a zero initialized input");
++
++  MSLLHOOKSTRUCT event{};
++  event.dwExtraInfo = kCursorWarpTag;
++  event.flags = LLMHF_INJECTED;
++  check(isCursorWarp(WM_MOUSEMOVE, event), "recognize only the program's tagged injected move");
++  check(!isCursorWarp(WM_LBUTTONDOWN, event), "tag never bypasses a mouse press");
++  check(!isCursorWarp(WM_MOUSEWHEEL, event), "tag never bypasses a mouse wheel");
++  event.flags = 0;
++  check(!isCursorWarp(WM_MOUSEMOVE, event), "tag without injected flag cannot bypass physical motion");
++  event.flags = LLMHF_INJECTED;
++  for (const ULONG_PTR otherTag : {ULONG_PTR{0}, ULONG_PTR{0xff515780u}, ULONG_PTR{0x4d484c55u}, kCursorWarpTag ^ ULONG_PTR{1}}) {
++    event.dwExtraInfo = otherTag;
++    check(!isCursorWarp(WM_MOUSEMOVE, event), "ordinary injection, touch, and key-release tags are not cursor warps");
++  }
++  event.dwExtraInfo = kCursorWarpTag;
++  event.flags = LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED;
++  check(isCursorWarp(WM_MOUSEMOVE, event), "core tag remains recognizable with additional injected metadata");
++
++  // 延迟的中心/入屏回位即使跨过模式切换也不转发，紧随其后的真实运动必须保留。
++  for (const auto mode : {kHOOK_DISABLE, kHOOK_WATCH_JUMP_ZONE, kHOOK_RELAY_EVENTS}) {
++    std::vector<POINT> relayed;
++    for (const POINT point : {POINT{960, 540}, POINT{1918, 721}, POINT{1917, 723}}) {
++      event.pt = point;
++      event.dwExtraInfo = point.x == 1917 ? 0 : kCursorWarpTag;
++      event.flags = point.x == 1917 ? 0 : LLMHF_INJECTED;
++      if (!isCursorWarp(WM_MOUSEMOVE, event) && mode != kHOOK_DISABLE) {
++        relayed.push_back(point);
++      }
++    }
++    if (mode == kHOOK_DISABLE) {
++      check(relayed.empty(), "disabled hook forwards no motion to the server");
++    } else {
++      check(relayed.size() == 1 && relayed.front().x == 1917 && relayed.front().y == 723,
++            "delayed warp is ignored across hook modes while real motion is retained");
++    }
++  }
++
++  std::printf("PASS: %d cursor warp checks; no hooks installed and no desktop input injected.\n", checks);
++}
+diff --git a/tools/test-cursor-warp.ps1 b/tools/test-cursor-warp.ps1
+new file mode 100644
+index 0000000..7ac090b
+--- /dev/null
++++ b/tools/test-cursor-warp.ps1
+@@ -0,0 +1,24 @@
++[CmdletBinding()]
++param(
++    # BuildDir: isolated fixture outputs; never installs hooks or sends desktop input.
++    [string]$BuildDir = "$env:TEMP\moonlight-cursor-warp-tests"
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /permissive- /MD `
++    "/I$sourceRoot\src\lib" "$PSScriptRoot\test-cursor-warp.cpp" `
++    "/Fe:$BuildDir\test-cursor-warp.exe" "/Fo:$BuildDir\test-cursor-warp.obj"
++if ($LASTEXITCODE -ne 0) { throw 'Cursor warp tests did not compile.' }
++& "$BuildDir\test-cursor-warp.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Cursor warp tests failed.' }
+diff --git a/tools/test-local-key-release.cpp b/tools/test-local-key-release.cpp
+new file mode 100644
+index 0000000..049bcbb
+--- /dev/null
++++ b/tools/test-local-key-release.cpp
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++
++#include "platform/MSWindowsLocalKeyRelease.h"
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++using namespace deskflow::win32;
++
++static int checks = 0;
++
++// 参数 success：断言结果；message：失败时输出的行为说明。
++static void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) {
++    std::fprintf(stderr, "FAIL: %s\n", message);
++    std::exit(1);
++  }
++}
++
++int main()
++{
++  struct Modifier
++  {
++    WORD vk;
++    uint16_t scan;
++    bool extended;
++  };
++  const std::array<Modifier, 8> modifiers{{
++      {VK_LMENU, 0x038, false}, {VK_RMENU, 0x138, true},
++      {VK_LCONTROL, 0x01d, false}, {VK_RCONTROL, 0x11d, true},
++      {VK_LSHIFT, 0x02a, false}, {VK_RSHIFT, 0x036, false},
++      {VK_LWIN, 0x15b, true}, {VK_RWIN, 0x15c, true},
++  }};
++  for (const auto &key : modifiers) {
++    auto input = makeLocalKeyRelease(key.vk, key.scan);
++    check(input.type == INPUT_KEYBOARD && input.ki.wVk == key.vk, "preserve left/right virtual key");
++    check(input.ki.wScan == (key.scan & 0xff), "initialize scan code");
++    check(input.ki.dwFlags == static_cast<DWORD>(KEYEVENTF_KEYUP | (key.extended ? KEYEVENTF_EXTENDEDKEY : 0)),
++          "right Alt/Ctrl/Win release carries extended flag; right Shift does not");
++    check(input.ki.time == 0 && input.ki.dwExtraInfo == kLocalKeyReleaseTag, "zero initialized and tagged release");
++    KBDLLHOOKSTRUCT event{};
++    event.vkCode = key.vk;
++    event.scanCode = input.ki.wScan;
++    event.dwExtraInfo = input.ki.dwExtraInfo;
++    event.flags = LLKHF_INJECTED | LLKHF_UP | (key.extended ? LLKHF_EXTENDED : 0);
++    check(isLocalKeyRelease(event), "allow precisely tagged injected key-up");
++    event.flags &= ~LLKHF_UP;
++    check(!isLocalKeyRelease(event), "never bypass injected key-down");
++    event.flags = LLKHF_UP;
++    check(!isLocalKeyRelease(event), "never bypass real physical input");
++    event.flags |= LLKHF_INJECTED;
++    event.dwExtraInfo ^= 1;
++    check(!isLocalKeyRelease(event), "never bypass arbitrary injected key-up");
++  }
++
++  LocalKeyReleaseState state;
++  std::vector<uint16_t> sent;
++  auto accept = [&](uint16_t button) { sent.push_back(button); return true; };
++  auto reject = [&](uint16_t button) { sent.push_back(button); return false; };
++  state.capture(0x38);
++  state.retry(accept);
++  check(sent.empty(), "do not release a modifier still physically held across screens");
++  check(!state.onKey(0x38, true, accept), "held-key autorepeat does not release it");
++  check(sent.empty(), "autorepeat emits no synthetic release");
++  check(state.onKey(0x38, false, accept), "physical key-up repairs the original machine");
++  state.retry(accept);
++  check(sent == std::vector<uint16_t>{0x38}, "successful key-up is sent only once");
++  check(!state.onKey(0x138, false, accept), "no release for an unrelated key or other side");
++
++  state.capture(0x138);
++  state.onKey(0x138, false, reject);
++  state.forgetHeldKeys();
++  state.capture(0x138);
++  state.retry(accept);
++  check(sent == std::vector<uint16_t>({0x38, 0x138, 0x138}),
++        "failed release survives enter/leave and succeeds on an exact retry");
++  state.retry(accept);
++  check(sent.size() == 3, "successful retry is removed");
++
++  state.capture(0x1d);
++  state.onKey(0x1d, false, reject);
++  state.onKey(0x1d, true, accept);
++  state.retry(accept);
++  check(sent.size() == 4, "new physical key-down cancels pending repair before hotkey handling");
++  check(state.onKey(0x1d, false, accept), "later real key-up repairs the still held original machine key");
++  check(sent.size() == 5 && sent.back() == 0x1d, "repair resumes only once the new press is physically released");
++
++  state.capture(0x138);
++  state.capture(0x1d);
++  state.onKey(0x138, false, accept);
++  check(sent.back() == 0x138, "releasing right Alt does not release still held left Ctrl/AltGr companion");
++  state.retry(accept);
++  check(sent.size() == 6, "AltGr companion remains held until its own real key-up");
++  state.onKey(0x1d, false, accept);
++  check(sent.size() == 7 && sent.back() == 0x1d, "release AltGr companion on its own key-up");
++
++  state.capture(0x1e);
++  state.onKey(0x1e, false, accept);
++  check(sent.size() == 8 && sent.back() == 0x1e, "ordinary keys held before leave also receive exact cleanup");
++  state.capture(0x2a);
++  state.forgetHeldKeys();
++  state.onKey(0x2a, false, accept);
++  check(sent.size() == 8, "a still held key returned to primary follows normal physical release");
++
++  std::printf("PASS: %d local key release checks; no desktop input injected\n", checks);
++}
+diff --git a/tools/test-local-key-release.ps1 b/tools/test-local-key-release.ps1
+new file mode 100644
+index 0000000..c855d07
+--- /dev/null
++++ b/tools/test-local-key-release.ps1
+@@ -0,0 +1,24 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：独立测试产物目录，测试不安装钩子或向桌面发送按键。
++    [string]$BuildDir = "$env:TEMP\moonlight-local-key-release-tests"
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /permissive- /MD `
++    "/I$sourceRoot\src\lib" "$PSScriptRoot\test-local-key-release.cpp" `
++    "/Fe:$BuildDir\test-local-key-release.exe" "/Fo:$BuildDir\test-local-key-release.obj"
++if ($LASTEXITCODE -ne 0) { throw 'Local key release tests did not compile.' }
++& "$BuildDir\test-local-key-release.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Local key release tests failed.' }
+diff --git a/tools/test-modifier-reconcile.cpp b/tools/test-modifier-reconcile.cpp
+new file mode 100644
+index 0000000..5e896a6
+--- /dev/null
++++ b/tools/test-modifier-reconcile.cpp
+@@ -0,0 +1,119 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "deskflow/KeyState.h"
++#include "deskflow/ModifierKeyRelease.h"
++#include "base/Log.h"
++
++#include <cstdio>
++#include <cstdlib>
++
++static int checks = 0;
++static void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) {
++    std::fprintf(stderr, "FAIL: %s\n", message);
++    std::exit(1);
++  }
++}
++
++// 只提供键盘映射数据；实际状态更新和释放均调用生产 KeyState，绝不调用桌面注入。
++class FixtureMap : public deskflow::KeyMap
++{
++public:
++  const KeyItem *mapKey(
++      Keystrokes &, KeyID id, int32_t, ModifierToKeys &active, KeyModifierMask &current,
++      KeyModifierMask desired, bool, const std::string &
++  ) const override
++  {
++    if (desired & KeyModifierAlt) active.emplace(KeyModifierAlt, modifier(kKeyAlt_L, 0x38, KeyModifierAlt));
++    if (desired & KeyModifierControl) active.emplace(KeyModifierControl, modifier(kKeyControl_L, 0x1d, KeyModifierControl));
++    if (desired & KeyModifierAltGr) active.emplace(KeyModifierAltGr, modifier(kKeyAltGr, 0x138, KeyModifierAltGr));
++    current = desired;
++    m_key = modifier(id, 0x1e, 0);
++    return &m_key;
++  }
++  static KeyItem modifier(KeyID id, KeyButton button, KeyModifierMask generated)
++  {
++    KeyItem key{};
++    key.m_id = id;
++    key.m_button = button;
++    key.m_generates = generated;
++    key.m_client = button;
++    return key;
++  }
++private:
++  mutable KeyItem m_key;
++};
++
++class FixtureState : public KeyState
++{
++public:
++  explicit FixtureState(FixtureMap &map) : KeyState(nullptr, map, {"en"}, false) {}
++  int32_t pollActiveGroup() const override { return 0; }
++  KeyModifierMask pollActiveModifiers() const override { return getActiveModifiers(); }
++  bool fakeCtrlAltDel() override { return false; }
++  void pollPressedKeys(KeyButtonSet &) const override {}
++  std::vector<KeyButton> released;
++protected:
++  void getKeyMap(deskflow::KeyMap &) override {}
++  void fakeKey(const Keystroke &key) override
++  {
++    if (key.m_type == Keystroke::KeyType::Button && !key.m_data.m_button.m_press) {
++      released.push_back(key.m_data.m_button.m_button);
++    }
++  }
++};
++
++int main()
++{
++  Log log;
++  FixtureMap map;
++  FixtureState state(map);
++  state.fakeKeyDown('a', KeyModifierAlt | KeyModifierControl, 0x1e, "en");
++  check(state.isKeyDown(0x38) && state.isKeyDown(0x1d), "fixture retains synthetic Alt and Ctrl for reconciliation checks");
++  check(!state.fakeKeyUp(0x38), "fixture synthetic Alt has no server-key mapping");
++  state.reconcileKeyRelease(kKeyAlt_L, KeyModifierControl);
++  check(state.released == std::vector<KeyButton>{0x38}, "explicit Alt up releases the implicit Alt immediately");
++  check(!state.isKeyDown(0x38) && state.isKeyDown(0x1d), "Alt cleanup preserves still held Ctrl companion");
++  check(state.getActiveModifiers() == KeyModifierControl, "shadow mask clears only released modifier class");
++  state.reconcileKeyRelease(kKeyAlt_L, 0);
++  check(state.released.size() == 1, "duplicate Alt up emits no duplicate release");
++  state.reconcileKeyRelease(kKeyControl_L, 0);
++  check(state.released.size() == 2 && state.released.back() == 0x1d, "Ctrl releases on its own explicit up");
++
++  FixtureState sides(map);
++  sides.fakeKeyDown('a', KeyModifierAlt, 0x1e, "en");
++  sides.reconcileKeyRelease(kKeyAlt_R, KeyModifierAlt);
++  check(sides.released.empty() && sides.isKeyDown(0x38), "other-side Alt still held in source mask is preserved");
++  sides.onKey(0x38, true, KeyModifierAlt);
++  sides.reconcileKeyRelease(kKeyAlt_L, 0);
++  check(sides.released.empty() && sides.isKeyDown(0x38), "real client keyboard press takes ownership and is never released");
++
++  FixtureState alreadyPhysical(map);
++  alreadyPhysical.onKey(0x38, true, KeyModifierAlt);
++  alreadyPhysical.fakeKeyDown('a', KeyModifierAlt, 0x1e, "en");
++  alreadyPhysical.reconcileKeyRelease(kKeyAlt_L, 0);
++  check(alreadyPhysical.released.empty() && alreadyPhysical.isKeyDown(0x38), "a later remote shortcut cannot take ownership of an already physically held Alt");
++
++  FixtureState physical(map);
++  physical.fakeKeyDown('a', KeyModifierAlt, 0x1e, "en");
++  physical.reconcileKeyRelease(kKeyAlt_L, 0);
++  physical.onKey(0x38, true, KeyModifierAlt);
++  physical.reconcileKeyRelease(kKeyAlt_L, 0);
++  check(physical.released.size() == 1, "stale client data after an earlier remote release cannot release a later physical press");
++
++  FixtureState altgr(map);
++  altgr.fakeKeyDown('a', KeyModifierControl | KeyModifierAltGr, 0x1e, "en");
++  altgr.reconcileKeyRelease(kKeyAlt_R, KeyModifierControl);
++  check(altgr.released == std::vector<KeyButton>{0x138} && altgr.isKeyDown(0x1d), "right Alt releases AltGr without releasing Ctrl");
++  altgr.reconcileKeyRelease(kKeyControl_R, KeyModifierControl);
++  check(altgr.released.size() == 1, "other-side Ctrl still held is preserved");
++  altgr.reconcileKeyRelease('a', 0);
++  altgr.reconcileKeyRelease(kKeyCapsLock, 0);
++  altgr.reconcileKeyRelease(kKeyNumLock, 0);
++  altgr.reconcileKeyRelease(kKeyScrollLock, 0);
++  check(altgr.released.size() == 1 && altgr.isKeyDown(0x1d), "ordinary and lock-key releases never clear unrelated modifiers");
++  check(!deskflow::shouldReleaseImplicitModifier(kKeyAlt_L, 0, KeyModifierAlt, true, true), "locking key is excluded even with matching generated bit");
++
++  std::printf("PASS: %d real KeyState reconciliation checks; no desktop input injected\n", checks);
++}
+diff --git a/tools/test-modifier-reconcile.ps1 b/tools/test-modifier-reconcile.ps1
+new file mode 100644
+index 0000000..76bfddf
+--- /dev/null
++++ b/tools/test-modifier-reconcile.ps1
+@@ -0,0 +1,35 @@
++﻿[CmdletBinding()]
++param(
++    # QtRoot：现有 MSVC x64 Qt SDK；测试仅使用映射与状态，不安装输入钩子。
++    [Parameter(Mandatory = $true)][string]$QtRoot,
++    # CoreBuildDir：已编译 Deskflow 的静态库目录，用于链接日志等未修改依赖。
++    [Parameter(Mandatory = $true)][string]$CoreBuildDir,
++    # BuildDir：独立测试产物目录。
++    [string]$BuildDir = "$env:TEMP\moonlight-modifier-reconcile-tests"
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++$env:PATH = "$QtRoot\bin;$env:PATH"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++$supportLibraries = Get-ChildItem -LiteralPath "$CoreBuildDir\src\lib" -Filter '*.lib' -Recurse |
++    Select-Object -ExpandProperty FullName
++$sources = @('KeyState.cpp', 'KeyMap.cpp', 'IKeyState.cpp', 'KeyTypes.cpp') |
++    ForEach-Object { "$sourceRoot\src\lib\deskflow\$_" }
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD /O2 /DNDEBUG `
++    "/I$sourceRoot\src\lib" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" "/I$QtRoot\include\QtNetwork" `
++    "$PSScriptRoot\test-modifier-reconcile.cpp" @sources "/Fe:$BuildDir\test-modifier-reconcile.exe" "/Fo:$BuildDir\\" `
++    /link @supportLibraries "/LIBPATH:$QtRoot\lib" Qt6Core.lib Qt6Gui.lib Qt6Network.lib `
++    user32.lib advapi32.lib ws2_32.lib wtsapi32.lib iphlpapi.lib shell32.lib userenv.lib version.lib
++if ($LASTEXITCODE -ne 0) { throw 'Modifier reconciliation tests did not compile.' }
++& "$BuildDir\test-modifier-reconcile.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Modifier reconciliation tests failed.' }
+diff --git a/tools/test-monitor-routing.cpp b/tools/test-monitor-routing.cpp
+new file mode 100644
+index 0000000..e87f52d
+--- /dev/null
++++ b/tools/test-monitor-routing.cpp
+@@ -0,0 +1,149 @@
++#include "server/MonitorTopologyRouter.h"
++#include <QCoreApplication>
++#include <QTemporaryFile>
++#include <iostream>
++#include <stdexcept>
++
++// owner：所属电脑；id：显示器标识；native/global：真实像素位置和逻辑布局位置。
++QJsonObject monitor(const char *owner, const char *id, int nx, int ny, int gx, int gy, int width, int height, int logicalWidth, int logicalHeight)
++{
++  return {{"owner", owner}, {"id", id}, {"nativeX", nx}, {"nativeY", ny}, {"x", gx}, {"y", gy},
++      {"width", width}, {"height", height}, {"canvasWidth", logicalWidth}, {"canvasHeight", logicalHeight}, {"active", true}};
++}
++
++int main(int argc, char **argv)
++{
++  QCoreApplication app(argc, argv);
++  try {
++  QTemporaryFile file;
++  if (!file.open()) return 1;
++  QJsonArray monitors {
++      monitor("laptop", "local", 0, 0, 0, 0, 1000, 800, 1000, 800),
++      monitor("remote", "real", 0, 0, 1300, 0, 1920, 1080, 1920, 1080),
++      monitor("remote", "virtual", 3000, 0, 3800, 0, 1824, 840, 912, 420)};
++  file.write(QJsonDocument(QJsonObject {{"monitors", monitors}}).toJson()); file.flush();
++  qputenv("DESKFLOW_MONITOR_TOPOLOGY", file.fileName().toUtf8());
++  MonitorTopologyRouter router;
++  const auto available = [](const auto &) { return true; };
++  auto cross = router.route({"laptop", 999, 300, 1003, 300}, available);
++  if (!cross || cross->owner != "remote" || cross->x != 3 || cross->y != 300) throw std::runtime_error("Cross-device gap lost motion");
++  auto physicalToVirtual = router.route({"remote", 1919, 200, 1923, 200}, available);
++  if (!physicalToVirtual || physicalToVirtual->x != 3006 || physicalToVirtual->y != 400) throw std::runtime_error("DPI/gap conversion failed");
++  auto reverse = router.route({"remote", 3000, 400, 2996, 400}, available);
++  if (!reverse || reverse->x != 1917 || reverse->y != 200) throw std::runtime_error("Reverse DPI/gap conversion failed");
++  if (router.route({"laptop", 999, 300, 1003, 300}, [](const auto &owner) { return owner == "laptop"; })) throw std::runtime_error("Offline host accepted");
++  if (router.route({"remote", 3100, 300, 3105, 302}, available)) throw std::runtime_error("Motion inside one monitor was changed");
++  QTemporaryFile currentLayout;
++  if (!currentLayout.open()) return 1;
++  QJsonArray currentMonitors {
++      monitor("qingxian", "main", 0, 0, 47, -1080, 1920, 1080, 1920, 1080),
++      monitor("qingxian", "phone", 1920, -364, 1967, -924, 4096, 2160, 1170, 617),
++      monitor("Desktop-Lin", "tablet", 0, 0, 21, 0, 2000, 1200, 1143, 686)};
++  currentLayout.write(QJsonDocument(QJsonObject {{"monitors", currentMonitors}}).toJson()); currentLayout.flush();
++  qputenv("DESKFLOW_MONITOR_TOPOLOGY", currentLayout.fileName().toUtf8());
++  MonitorTopologyRouter currentRouter;
++  auto direct = currentRouter.route({"qingxian", 500, 1079, 500, 1084}, available);
++  if (!direct || direct->owner != "Desktop-Lin" || direct->x < 900 || direct->x > 950 || direct->y > 10)
++    throw std::runtime_error("Qingxian main did not go directly to Lin virtual display");
++  auto back = currentRouter.route({"Desktop-Lin", 920, 0, 920, -5}, available);
++  if (!back || back->owner != "qingxian" || back->x > 1920 || back->y < 1070 || back->y >= 1080)
++    throw std::runtime_error("Lin virtual display did not return directly to Qingxian main");
++  auto phone = currentRouter.route({"qingxian", 1919, 600, 1924, 600}, available);
++  if (!phone || phone->owner != "qingxian" || phone->x < 1920)
++    throw std::runtime_error("Qingxian main could not enter its virtual display");
++  auto clipped = currentRouter.route({"Desktop-Lin", 920, 5, 920, 0}, available);
++  if (!clipped || clipped->owner != "qingxian" || clipped->y >= 1080)
++    throw std::runtime_error("Windows-clipped border did not enter Qingxian main directly");
++  auto interior = currentRouter.clamp({"Desktop-Lin", 920, 5, 920, 2});
++  if (!interior || interior->y != 2) throw std::runtime_error("Legacy whole-desktop switching was not suppressed");
++
++  QTemporaryFile actualLayout;
++  if (!actualLayout.open()) return 1;
++  QJsonArray actualMonitors {
++      monitor("Desktop-Lin", "dell", 0, 0, -380, -14, 2560, 1440, 2560, 1440),
++      monitor("Desktop-Lin", "laptop", 2560, 1292, 2180, 1278, 1920, 1080, 1536, 864),
++      monitor("qingxian", "main", 0, 0, 2180, 198, 1920, 1080, 1920, 1080),
++      monitor("qingxian", "virtual", 1536, 1080, 3716, 1278, 2000, 1200, 1000, 600)};
++  actualLayout.write(QJsonDocument(QJsonObject {{"monitors", actualMonitors}}).toJson()); actualLayout.flush();
++  qputenv("DESKFLOW_MONITOR_TOPOLOGY", actualLayout.fileName().toUtf8());
++  MonitorTopologyRouter actualRouter;
++  auto local = actualRouter.route({"Desktop-Lin", 2559, 1300, 2560, 1300}, available);
++  if (!local || local->owner != "Desktop-Lin" || local->x != 2560 || local->y != 1302)
++    throw std::runtime_error("Local monitor transition was not routed");
++  auto remote = actualRouter.route({"Desktop-Lin", 2559, 500, 2560, 500}, available);
++  if (!remote || remote->owner != "qingxian" || remote->x != 0 || remote->y != 288)
++    throw std::runtime_error("Remote monitor transition was not routed");
++  if (actualRouter.route({"Desktop-Lin", 2559, 150, 2560, 150}, available))
++    throw std::runtime_error("Non-overlapping screen was accepted");
++  auto clippedGap = actualRouter.clamp({"Desktop-Lin", 2559, 150, 2560, 150});
++  if (!clippedGap || clippedGap->owner != "Desktop-Lin" || clippedGap->x != 2559 || clippedGap->y != 150)
++    throw std::runtime_error("Boundary clamp did not stay on the current monitor");
++  if (actualRouter.route({"Desktop-Lin", 3715, 2200, 3716, 2200}, available))
++    throw std::runtime_error("Non-overlapping virtual display was accepted");
++
++  QTemporaryFile diagonalLayout;
++  if (!diagonalLayout.open()) return 1;
++  QJsonArray diagonalMonitors {
++      monitor("source", "main", 0, 0, 0, 0, 1000, 1000, 1000, 1000),
++      monitor("upper", "right", 0, 0, 1000, 0, 1000, 500, 1000, 500),
++      monitor("lower", "right", 0, 0, 1000, 500, 2000, 1000, 1000, 500),
++      monitor("bottom", "wide", 0, 0, 0, 1000, 2000, 1000, 2000, 1000)};
++  diagonalLayout.write(QJsonDocument(QJsonObject {{"monitors", diagonalMonitors}}).toJson()); diagonalLayout.flush();
++  qputenv("DESKFLOW_MONITOR_TOPOLOGY", diagonalLayout.fileName().toUtf8());
++  MonitorTopologyRouter diagonalRouter;
++  auto slope = diagonalRouter.route({"source", 990, 490, 1010, 530}, available);
++  if (!slope || slope->owner != "lower" || slope->x != 20 || slope->y != 60)
++    throw std::runtime_error("Diagonal crossing used the old row instead of the edge intersection");
++  auto seam = diagonalRouter.route({"source", 990, 490, 1010, 510}, available);
++  if (!seam || seam->owner != "lower" || seam->y != 20)
++    throw std::runtime_error("Exact shared seam selected both rows");
++  auto fast = diagonalRouter.route({"source", 900, 400, 1100, 700}, available);
++  if (!fast || fast->owner != "lower" || fast->x != 200 || fast->y != 400)
++    throw std::runtime_error("Fast diagonal crossing selected the wrong monitor");
++  auto firstEdge = diagonalRouter.route({"source", 990, 980, 1010, 1030}, available);
++  if (!firstEdge || firstEdge->owner != "bottom" || firstEdge->x != 1010 || firstEdge->y != 30)
++    throw std::runtime_error("Diagonal corner ignored the first crossed edge");
++  if (diagonalRouter.route({"source", 990, 980, 1010, 1030}, [](const auto &owner) { return owner != "bottom"; }))
++    throw std::runtime_error("Disconnected first edge was skipped in favor of a later edge");
++  auto reverseDiagonal = diagonalRouter.route({"lower", 0, 20, -20, -20}, available);
++  if (!reverseDiagonal || reverseDiagonal->owner != "source" || reverseDiagonal->x != 989 || reverseDiagonal->y != 490)
++    throw std::runtime_error("Reverse diagonal crossing lost DPI mapping");
++
++  QTemporaryFile liveLayout;
++  if (!liveLayout.open()) return 1;
++  QJsonArray liveMonitors {
++      monitor("Desktop-Lin", "dell", -2560, -1440, 8362, 1050, 2560, 1440, 2560, 1440),
++      monitor("Desktop-Lin", "laptop", 0, 0, 10702, 2490, 1920, 1080, 1536, 864),
++      monitor("qingxian", "main", 0, 0, 10922, 1234, 1920, 1080, 1920, 1080)};
++  liveLayout.write(QJsonDocument(QJsonObject {{"monitors", liveMonitors}}).toJson()); liveLayout.flush();
++  qputenv("DESKFLOW_MONITOR_TOPOLOGY", liveLayout.fileName().toUtf8());
++  MonitorTopologyRouter liveRouter;
++  auto dellToLaptop = liveRouter.route({"Desktop-Lin", -100, -1, -100, 4}, available);
++  if (!dellToLaptop || dellToLaptop->owner != "Desktop-Lin" || dellToLaptop->x != 150 || dellToLaptop->y != 5)
++    throw std::runtime_error("Dell bottom overlap did not map to the scaled laptop");
++  auto laptopToDell = liveRouter.route({"Desktop-Lin", 150, 0, 150, -5}, available);
++  if (!laptopToDell || laptopToDell->owner != "Desktop-Lin" || laptopToDell->x != -100 || laptopToDell->y != -5)
++    throw std::runtime_error("Scaled laptop did not return to the Dell bottom overlap");
++  auto laptopGap = liveRouter.route({"Desktop-Lin", 500, 0, 500, -5}, available);
++  if (!laptopGap || laptopGap->owner != "qingxian" || laptopGap->x != 180 || laptopGap->y != 1075)
++    throw std::runtime_error("Laptop did not cross the 176 logical pixel gap to Qingxian");
++  auto dellToQingxian = liveRouter.route({"Desktop-Lin", -1, -800, 4, -800}, available);
++  if (!dellToQingxian || dellToQingxian->owner != "qingxian" || dellToQingxian->x != 4 || dellToQingxian->y != 456)
++    throw std::runtime_error("Dell side crossing lost the shared logical position");
++  auto dellCorner = liveRouter.route({"Desktop-Lin", -1, -1, 1, 1}, available);
++  if (!dellCorner || dellCorner->owner != "Desktop-Lin" || dellCorner->x != 276 || dellCorner->y != 1)
++    throw std::runtime_error("Exact Dell corner did not use its only connected edge");
++  if (liveRouter.route({"Desktop-Lin", -300, -1, -300, 4}, available))
++    throw std::runtime_error("Dell bottom outside the 220 pixel overlap switched monitors");
++  auto primaryClamp = liveRouter.clamp({"Desktop-Lin", -300, -1, 0, 4});
++  if (!primaryClamp || primaryClamp->x != -1 || primaryClamp->y != -1)
++    throw std::runtime_error("Native Windows crossing did not supply the current-monitor warp position");
++  auto stableInterior = liveRouter.clamp({"Desktop-Lin", -300, -100, -290, -95});
++  if (!stableInterior || stableInterior->x != -290 || stableInterior->y != -95)
++    throw std::runtime_error("Interior primary motion requested an unnecessary warp");
++  std::cout << "PASS monitor routing: gaps, DPI, offline targets, edge overlap, diagonal intersection, first crossed edge, exact seams, fast motion, live Dell/laptop/Qingxian layout and primary clamp positions\n";
++  } catch (const std::exception &e) {
++    std::cerr << "FAIL: " << e.what() << '\n';
++    return 2;
++  }
++}
+diff --git a/tools/test-mouse-handoff.cpp b/tools/test-mouse-handoff.cpp
+new file mode 100644
+index 0000000..cf3536f
+--- /dev/null
++++ b/tools/test-mouse-handoff.cpp
+@@ -0,0 +1,295 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "platform/MSWindowsHook.h"
++#include "platform/MSWindowsCursorWarp.h"
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++namespace {
++struct Posted { UINT message; WPARAM w; LPARAM l; };
++POINT physical{960, 540};
++bool cursorAvailable = true;
++bool postAvailable = true;
++bool sendAvailable = true;
++bool validBounds = true;
++DWORD currentThread = 7;
++int reentrantMoves = 0;
++POINT reentrantDelta{7, -3};
++int passed = 0;
++int checks = 0;
++std::vector<Posted> posted;
++std::vector<INPUT> sentInputs;
++LRESULT deliverWarp(const INPUT &input);
++void deliverHardwareBeforeWarp();
++BOOL WINAPI readCursor(LPPOINT p) { *p = physical; return cursorAvailable; }
++DPI_AWARENESS_CONTEXT WINAPI dpiScope(DPI_AWARENESS_CONTEXT) { return nullptr; }
++BOOL WINAPI post(DWORD, UINT message, WPARAM w, LPARAM l) {
++  if (!postAvailable) { return FALSE; }
++  posted.push_back({message, w, l});
++  return TRUE;
++}
++DWORD WINAPI threadId() { return currentThread; }
++int WINAPI metrics(int index) {
++  if (index == SM_CXVIRTUALSCREEN) { return validBounds ? 8192 : 0; }
++  if (index == SM_CYVIRTUALSCREEN) { return 4096; }
++  return 0;
++}
++UINT WINAPI sendInputs(UINT count, LPINPUT inputs, int size) {
++  if (!sendAvailable || count != 1 || size != sizeof(INPUT)) { return 0; }
++  sentInputs.push_back(*inputs);
++  if (reentrantMoves > 0) {
++    --reentrantMoves;
++    deliverHardwareBeforeWarp();
++  }
++  deliverWarp(*inputs);
++  physical.x = inputs->mi.dx * 8192 / 65536;
++  physical.y = inputs->mi.dy * 4096 / 65536;
++  return 1;
++}
++LRESULT WINAPI pass(HHOOK, int, WPARAM, LPARAM) { ++passed; return 0; }
++SHORT WINAPI keyState(int) { return 0; }
++int WINAPI translate(UINT, UINT, const BYTE *, LPWSTR, int, UINT) { return 0; }
++BOOL WINAPI unhook(HHOOK) { return TRUE; }
++void check(bool success, const char *message) {
++  ++checks;
++  if (!success) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
++}
++}
++
++// 编译实际生产回调；仅替换与桌面交互的 Win32 API，不安装钩子或注入输入。
++#define GetPhysicalCursorPos readCursor
++#define SetThreadDpiAwarenessContext dpiScope
++#undef PostThreadMessage
++#define PostThreadMessage post
++#define CallNextHookEx pass
++#define GetAsyncKeyState keyState
++#define ToUnicode translate
++#define UnhookWindowsHookEx unhook
++#define GetCurrentThreadId threadId
++#define GetSystemMetrics metrics
++#define SendInput sendInputs
++#pragma warning(push)
++#pragma warning(disable: 4457) // 原键盘回调内的同名参数不属于本次修改。
++#include "../src/lib/platform/MSWindowsHook.cpp"
++#pragma warning(pop)
++
++namespace {
++LRESULT deliverWarp(const INPUT &input) {
++  MSLLHOOKSTRUCT warp{};
++  warp.dwExtraInfo = input.mi.dwExtraInfo;
++  warp.flags = LLMHF_INJECTED;
++  return mouseLLHook(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&warp));
++}
++void deliverHardwareBeforeWarp() {
++  MSLLHOOKSTRUCT hardware{};
++  hardware.pt = {physical.x + reentrantDelta.x, physical.y + reentrantDelta.y};
++  mouseLLHook(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&hardware));
++}
++}
++
++// 未调用的初始化错误路径仍需链接；触发即失败，不伪造待测回调行为。
++Log *Log::getInstance() { std::abort(); }
++void Log::print(const char *, int, const char *, ...) { std::abort(); }
++BaseException::BaseException() : std::runtime_error("") {}
++const char *BaseException::what() const noexcept { std::abort(); }
++std::string BaseException::format(const char *, const char *, ...) const noexcept { std::abort(); }
++std::string ScreenOpenFailureException::getWhat() const noexcept { std::abort(); }
++
++int main() {
++  MSWindowsHook hook;
++  g_mouseLL = reinterpret_cast<HHOOK>(1);
++  g_isPrimary = TRUE;
++  g_hookThread = currentThread;
++  _putenv_s("DESKFLOW_MONITOR_TOPOLOGY", "fixture-only");
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  MSLLHOOKSTRUCT mouse{};
++  mouse.pt = {969, 548};
++  const auto move = [&] { return mouseLLHook(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse)); };
++  check(move() == 0 && passed == 1, "normal local motion still reaches Windows");
++  hook.beginMouseHandoff();
++  posted.clear();
++  check(move() == 1 && passed == 1, "handoff consumes real movement before the parking warp");
++  check(posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_MOVE_DELTA &&
++        posted[0].w == 9 && posted[0].l == 8, "handoff keeps the actual hardware delta");
++  KBDLLHOOKSTRUCT key{};
++  key.vkCode = VK_LMENU; key.scanCode = 0x38; key.flags = LLKHF_UP;
++  check(keyboardLLHook(HC_ACTION, WM_SYSKEYUP, reinterpret_cast<LPARAM>(&key)) == 0,
++        "Alt release during handoff still reaches the source OS before input-queue flushing");
++  mouse.dwExtraInfo = deskflow::win32::kCursorWarpTag; mouse.flags = LLMHF_INJECTED;
++  const auto count = posted.size();
++  check(move() == 0 && posted.size() == count, "own tagged warp passes without adding a relayed delta");
++  mouse.dwExtraInfo = 0; mouse.flags = 0;
++  cursorAvailable = false;
++  check(move() == 1, "failed cursor query cannot reopen the handoff movement gap");
++  cursorAvailable = true;
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  check(!g_mouseHandoff.load() && move() == 1, "formal remote mode ends the temporary gate and keeps motion relayed");
++  check(keyboardLLHook(HC_ACTION, WM_SYSKEYUP, reinterpret_cast<LPARAM>(&key)) == 1,
++        "formal remote mode still relays keyboard events using the original keyboard transition");
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  check(!g_mouseHandoff.load() && move() == 0, "return to the source restores normal local motion");
++  hook.beginMouseHandoff(); hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  check(!g_mouseHandoff.load(), "same-mode reset also clears handoff");
++  hook.beginMouseHandoff(); hook.cleanup();
++  check(!g_mouseHandoff.load(), "cleanup clears handoff");
++  hook.beginMouseHandoff(); hook.uninstall();
++  check(!g_mouseHandoff.load(), "uninstall clears handoff without real hooks");
++  g_mouseLL = reinterpret_cast<HHOOK>(1); g_isPrimary = FALSE;
++  hook.beginMouseHandoff();
++  check(!g_mouseHandoff.load(), "secondary screen cannot start a source handoff");
++
++  g_isPrimary = TRUE;
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  physical = {960, 540};
++  posted.clear();
++  sentInputs.clear();
++  for (int i = 0; i < 200; ++i) {
++    mouse.pt = {963, 542};
++    check(move() == 1, "queued remote motion stays consumed while returning");
++  }
++  const auto firstToken = MSWindowsHook::nextMouseMotionToken();
++  check(MSWindowsHook::consumeMouseMotion(firstToken, 3, 2), "the active motion token consumes its pending delta");
++  POINT destination{100, 200};
++  check(MSWindowsHook::returnMouseToPrimary(destination), "return succeeds on the hook thread");
++  check(destination.x == 697 && destination.y == 598 && physical.x == 697 && physical.y == 598,
++        "200 queued deltas are conserved exactly and the acknowledged delta is not replayed");
++  check(sentInputs.size() == 1 && sentInputs[0].mi.dwExtraInfo == deskflow::win32::kCursorWarpTag,
++        "pending motion is applied with exactly one tagged warp");
++  check(posted.size() == 201 && posted.back().message == DESKFLOW_MSG_MOUSE_MOVE &&
++        g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
++        "own reentrant warp callback does not add a delta and transferred pending motion is empty");
++  for (int i = 1; i < 200; ++i) {
++    check(!MSWindowsHook::consumeMouseMotion(MSWindowsHook::nextMouseMotionToken(), 3, 2),
++          "delayed tokens already absorbed into the return position cannot replay their movement");
++  }
++  check(g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
++        "draining absorbed raw messages does not create negative pending movement");
++  posted.clear();
++  mouse.pt = {703, 604};
++  check(move() == 0 && posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_MOVE &&
++        posted[0].w == 703 && posted[0].l == 604,
++        "new local absolute motion passes immediately before formal keyboard mode changes");
++  _putenv_s("DESKFLOW_MONITOR_TOPOLOGY", "");
++  hook.setZone(0, 0, 8192, 4096, 1);
++  hook.setSides(0);
++  posted.clear();
++  check(move() == 0 && posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_MOVE,
++        "local movement override also bypasses relay without the logical monitor router");
++  _putenv_s("DESKFLOW_MONITOR_TOPOLOGY", "fixture-only");
++  check(keyboardLLHook(HC_ACTION, WM_SYSKEYUP, reinterpret_cast<LPARAM>(&key)) == 1,
++        "early mouse return preserves the existing keyboard relay timing");
++  check(mouseLLHook(HC_ACTION, WM_LBUTTONDOWN, reinterpret_cast<LPARAM>(&mouse)) == 1,
++        "early mouse return preserves the existing mouse button relay timing");
++
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  check(!g_mouseMotion.local.load(), "formal mode changes clear the temporary local movement override");
++  physical = {960, 540};
++  mouse.pt = {965, 538};
++  postAvailable = false;
++  check(move() == 1 && g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
++        "a failed delta post does not create phantom pending movement");
++  postAvailable = true;
++  check(move() == 1, "remote motion resumes after a failed post");
++  destination = {100, 200};
++  sendAvailable = false;
++  check(!MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 960 && destination.y == 540,
++        "failed return injection reports the actual cursor position instead of the requested target");
++  check(g_mouseMotion.local.load(), "injection failure still releases local mouse movement");
++  sendAvailable = true;
++
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  destination = {100, 200};
++  ++currentThread;
++  const auto beforeWrongThread = sentInputs.size();
++  check(!MSWindowsHook::returnMouseToPrimary(destination) && sentInputs.size() == beforeWrongThread &&
++        !g_mouseMotion.local.load(), "wrong-thread return cannot inject or change movement ownership");
++  --currentThread;
++
++  destination = {100, 200};
++  validBounds = false;
++  check(!MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 960 && destination.y == 540,
++        "invalid desktop bounds do not inject or fabricate a cursor position");
++  validBounds = true;
++  cursorAvailable = false;
++  sendAvailable = false;
++  destination = {100, 200};
++  check(!MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 100 && destination.y == 200,
++        "unavailable position and failed injection return failure without inventing a measured position");
++  cursorAvailable = true;
++  sendAvailable = true;
++
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  check(move() == 1 && g_mouseMotion.pendingX == 5 && g_mouseMotion.pendingY == -2,
++        "fresh remote motion starts a new pending accumulator");
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  check(g_mouseMotion.pendingX == 5 && g_mouseMotion.pendingY == -2,
++        "same-mode transitions retain unconsumed remote movement");
++  hook.cleanup();
++  check(g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0 && !g_mouseMotion.local.load(),
++        "cleanup resets pending movement and temporary movement ownership");
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  move();
++  hook.uninstall();
++  check(g_mouseMotion.pendingX == 5 && g_mouseMotion.pendingY == -2 && !g_mouseMotion.local.load(),
++        "uninstall retains pending movement for messages already in the main queue");
++  check(MSWindowsHook::consumeMouseMotion(MSWindowsHook::nextMouseMotionToken(), 5, -2) &&
++        g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
++        "a queued pre-uninstall message acknowledges correctly without creating a negative accumulator");
++  g_mouseLL = reinterpret_cast<HHOOK>(1);
++  destination = {100, 200};
++  check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 100 && destination.y == 200,
++        "return after hook reinstall does not invent reverse movement from an old acknowledgement");
++
++  hook.cleanup();
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  physical = {960, 540};
++  posted.clear();
++  sentInputs.clear();
++  reentrantMoves = 1;
++  destination = {100, 200};
++  check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 107 && destination.y == 197 &&
++        sentInputs.size() == 2, "a hardware callback reentering before the tagged warp is conserved exactly once");
++  check(posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_MOVE &&
++        g_mouseMotion.capturedCount == 0 && g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
++        "return-only reentrant motion does not produce stale ordinary delta messages");
++
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  physical = {960, 540};
++  posted.clear();
++  sentInputs.clear();
++  reentrantMoves = 9;
++  destination = {100, 200};
++  check(!MSWindowsHook::returnMouseToPrimary(destination) && sentInputs.size() == 4 &&
++        g_mouseMotion.returning.load() && !g_mouseMotion.local.load() &&
++        posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_RETURN,
++        "four reentrant corrections yield to the hook queue with ownership and remaining movement retained");
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  check(g_mouseMotion.returning.load(), "formal keyboard mode changes cannot cancel an unfinished mouse return");
++  check(!MSWindowsHook::continueMouseReturn() && sentInputs.size() == 8 &&
++        g_mouseMotion.returning.load() && posted.size() == 2 &&
++        posted[1].message == DESKFLOW_MSG_MOUSE_RETURN,
++        "a continuation performs at most four further corrections before yielding again");
++  check(MSWindowsHook::continueMouseReturn() && sentInputs.size() == 10 && !g_mouseMotion.returning.load() &&
++        g_mouseMotion.local.load() && physical.x == 163 && physical.y == 173,
++        "multiple continuations conserve all nine reentrant hardware moves without unbounded synchronous work");
++  check(posted.size() == 3 && posted[2].message == DESKFLOW_MSG_MOUSE_MOVE &&
++        posted[2].w == 163 && posted[2].l == 173 &&
++        g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
++        "asynchronous return publishes its final actual position before releasing native movement");
++  const auto sentBeforeNoop = sentInputs.size();
++  check(MSWindowsHook::continueMouseReturn() && sentInputs.size() == sentBeforeNoop,
++        "a stale continuation after completion cannot inject or duplicate motion");
++
++  hook.cleanup();
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  physical = {960, 540};
++  mouse.pt = {950, 540};
++  move();
++  reentrantDelta = {3, 0};
++  reentrantMoves = 1;
++  destination = {1, 100};
++  check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 3 && destination.y == 100,
++        "reverse hardware movement after an edge clamp starts at the actual cursor position");
++  reentrantDelta = {7, -3};
++  std::printf("PASS: %d production mouse-handoff callback checks; no hooks or input injected.\n", checks);
++}
+diff --git a/tools/test-mouse-handoff.ps1 b/tools/test-mouse-handoff.ps1
+new file mode 100644
+index 0000000..2d9e487
+--- /dev/null
++++ b/tools/test-mouse-handoff.ps1
+@@ -0,0 +1,31 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：隔离的离线测试输出目录，不安装钩子或注入输入。
++    [string]$BuildDir = "$env:TEMP\moonlight-mouse-handoff-tests",
++    # QtRoot：与核心构建相同的 MSVC Qt 开发环境。
++    [string]$QtRoot = 'D:\tmp\codex-deskflow-sdk\Qt\6.10.1\msvc2022_64',
++    # CoreBuildDir：提供已有核心构建生成的配置头文件。
++    [string]$CoreBuildDir = 'D:\tmp\codex-deskflow-sdk\build-modifiers-msvc'
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD /O2 /Gy `
++    /DUNICODE /D_UNICODE /DSYSAPI_WIN32 /DWINAPI_MSWINDOWS /DHAVE_FORMAT /DQT_NO_KEYWORDS `
++    /DQT_NO_VERSION_TAGGING /D_CRT_SECURE_NO_WARNINGS /DNDEBUG `
++    "/I$sourceRoot\src\lib" "/I$CoreBuildDir\src\lib" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" `
++    "$PSScriptRoot\test-mouse-handoff.cpp" "/Fe:$BuildDir\test-mouse-handoff.exe" "/Fo:$BuildDir\test-mouse-handoff.obj" `
++    /link /OPT:REF user32.lib
++if ($LASTEXITCODE -ne 0) { throw 'Mouse handoff tests did not compile.' }
++& "$BuildDir\test-mouse-handoff.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Mouse handoff tests failed.' }
+diff --git a/tools/test-mouse-return.cpp b/tools/test-mouse-return.cpp
+new file mode 100644
+index 0000000..dd4c360
+--- /dev/null
++++ b/tools/test-mouse-return.cpp
+@@ -0,0 +1,377 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "platform/MSWindowsHook.h"
++#include "base/Event.h"
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <deque>
++#include <functional>
++#include <set>
++#include <vector>
++
++// 脚本抽取当前生产方法体；这里只替换它们依赖的桌面、消息队列和事件分发边界。
++// 不构造完整生产类，不验证 Windows 实际调度，不安装钩子或向桌面注入输入。
++namespace {
++struct Fixture {
++  POINT physical{960, 540};
++  POINT pending{-12, 7};
++  bool warpSuccess = true;
++  bool cursorAvailable = true;
++  bool returnSuccess = true;
++  bool released = false;
++  bool focusAfterRelease = false;
++  int peekCalls = 0;
++  int sleepCalls = 0;
++  int fakeMoves = 0;
++  int returnCalls = 0;
++  int deskCalls = 0;
++  int continueCalls = 0;
++  int events = 0;
++  int routes = 0;
++  int consumed = 0;
++  int checks = 0;
++  uint64_t lastToken = 0;
++  uint64_t absorbedThrough = 0;
++  POINT ack{};
++  POINT delivered{};
++  std::function<void()> onMotion;
++  std::vector<int> order;
++  std::vector<bool> buttonDestinations;
++  std::set<uint64_t> consumedTokens;
++  std::vector<MSG> queue;
++} f;
++
++// 参数 success：断言结果；message：失败时输出的行为说明。
++void check(bool success, const char *message)
++{
++  ++f.checks;
++  if (!success) {
++    std::fprintf(stderr, "FAIL: %s\n", message);
++    std::exit(1);
++  }
++}
++
++// 参数 message/first/last/remove：模拟当前线程的精确消息过滤及移除，不访问系统队列。
++BOOL WINAPI peek(LPMSG message, HWND, UINT first, UINT last, UINT remove)
++{
++  ++f.peekCalls;
++  auto match = std::find_if(f.queue.begin(), f.queue.end(), [&](const MSG &entry) {
++    return entry.message >= first && entry.message <= last;
++  });
++  if (match == f.queue.end()) return FALSE;
++  *message = *match;
++  if (remove & PM_REMOVE) f.queue.erase(match);
++  return TRUE;
++}
++
++// 参数 message/w/l：记录应用发出的消息，不投递真实线程消息。
++BOOL WINAPI post(DWORD, UINT message, WPARAM w, LPARAM l)
++{
++  MSG entry{};
++  entry.message = message; entry.wParam = w; entry.lParam = l;
++  f.queue.push_back(entry);
++  return TRUE;
++}
++
++// 参数 position：返回模拟物理光标位置。
++BOOL WINAPI readCursor(LPPOINT position) { *position = f.physical; return f.cursorAvailable; }
++void enqueue(UINT message) { MSG entry{}; entry.message = message; f.queue.push_back(entry); }
++bool contains(UINT message)
++{
++  return std::any_of(f.queue.begin(), f.queue.end(), [&](const MSG &entry) { return entry.message == message; });
++}
++}
++
++#define LOG_DEBUG(...) ((void)0)
++#define LOG_DEBUG1(...) ((void)0)
++#define LOG_DEBUG2(...) ((void)0)
++#define LOG_WARN(...) ((void)0)
++#undef PeekMessage
++#define PeekMessage peek
++#undef PostThreadMessage
++#define PostThreadMessage post
++#define GetCurrentThreadId() DWORD{1}
++#define GetPhysicalCursorPos readCursor
++
++struct IPlatformScreen {
++struct MotionInfo {
++  int32_t m_x, m_y;
++  uint64_t m_token;
++  static MotionInfo *alloc(int32_t x, int32_t y, uint64_t token = 0)
++  {
++    auto *motion = static_cast<MotionInfo *>(std::malloc(sizeof(MotionInfo)));
++    if (!motion) std::abort();
++    motion->m_x = x; motion->m_y = y; motion->m_token = token;
++    return motion;
++  }
++};
++struct ButtonInfo { int m_button; };
++};
++using MotionInfo = IPlatformScreen::MotionInfo;
++
++struct EventQueue {
++  std::deque<Event> queued;
++  void addEvent(Event event)
++  {
++    check((event.getFlags() & Event::EventFlags::DeliverImmediately) == 0, "input remains in its original asynchronous queue order");
++    if (event.getType() == EventTypes::PrimaryScreenMotionOnSecondary) ++f.events;
++    queued.push_back(std::move(event));
++  }
++};
++struct Arch { static void sleep(double) { ++f.sleepCalls; } };
++struct ArchMiscWindows { static void wakeupDisplay() {} };
++struct ScreenSaver { void deactivate() {} };
++struct KeyReleases { void forgetHeldKeys() {} };
++
++MSWindowsHook::~MSWindowsHook() = default;
++void MSWindowsHook::setMode(EHookMode) { f.order.push_back(5); }
++uint64_t MSWindowsHook::nextMouseMotionToken()
++{
++  return ++f.lastToken;
++}
++bool MSWindowsHook::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)
++{
++  if (token <= f.absorbedThrough || f.consumedTokens.contains(token)) return false;
++  f.consumedTokens.insert(token); ++f.consumed;
++  f.ack = {dx, dy}; f.order.push_back(1);
++  f.pending.x -= dx; f.pending.y -= dy;
++  return true;
++}
++bool MSWindowsHook::returnMouseToPrimary(POINT &position)
++{
++  ++f.returnCalls; f.order.push_back(3);
++  position.x += f.pending.x; position.y += f.pending.y;
++  f.physical = position; f.pending = {}; f.released = true;
++  f.absorbedThrough = f.lastToken + std::count_if(f.queue.begin(), f.queue.end(), [](const MSG &entry) {
++    return entry.message == DESKFLOW_MSG_MOUSE_MOVE_DELTA;
++  });
++  // 模拟恢复本机移动后新产生的 ABS，必须不被主线程的 DELTA 清理删除。
++  enqueue(DESKFLOW_MSG_MOUSE_MOVE);
++  return f.returnSuccess;
++}
++bool MSWindowsHook::continueMouseReturn() { ++f.continueCalls; return true; }
++
++class MSWindowsDesks {
++public:
++  struct Desk {};
++  bool m_isPrimary = true;
++  bool m_isOnScreen = false;
++  void enter();
++  void enter(POINT &position);
++  void sendMessage(UINT message, WPARAM w, LPARAM l);
++  void deskEnter(Desk *)
++  {
++    ++f.deskCalls; f.order.push_back(4);
++    f.focusAfterRelease = f.released;
++    check(m_isOnScreen, "desk state is local before foreground work");
++  }
++};
++
++class MSWindowsScreen {
++public:
++  bool m_isPrimary = true;
++  bool m_isOnScreen = false;
++  int32_t m_xCursor = 2550, m_yCursor = 700;
++  bool m_screensaverActive = false;
++  unsigned m_mark = 4, m_markReceived = 3;
++  MSWindowsHook m_hook;
++  KeyReleases m_primaryKeyReleases;
++  ScreenSaver *m_screensaver = nullptr;
++  MSWindowsDesks *m_desks = nullptr;
++  EventQueue *m_events = nullptr;
++  void enter();
++  void warpCursor(int32_t x, int32_t y);
++  bool warpCursorNoFlush(int32_t x, int32_t y);
++  void saveMousePosition(int32_t x, int32_t y);
++  bool onMouseMoveDelta(int32_t dx, int32_t dy);
++  bool consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy);
++  bool isPrimary() const { return m_isPrimary; }
++  bool ignore() const { return m_mark != m_markReceived; }
++  void *getEventTarget() { return this; }
++  void sendEvent(EventTypes type, void *data = nullptr);
++  void enableSpecialKeys(bool) {}
++  void setupMouseKeys() {}
++  void nextMark() { ++m_mark; }
++  bool setThisCursorPos(int32_t x, int32_t y)
++  {
++    if (f.warpSuccess) f.physical = {x, y};
++    return f.warpSuccess;
++  }
++  bool getThisCursorPos(POINT *position) { return readCursor(position) != FALSE; }
++  void fakeMouseMove(int32_t, int32_t) { ++f.fakeMoves; }
++};
++
++class Screen {
++public:
++  MSWindowsScreen *m_screen;
++  bool consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy);
++};
++class PrimaryClient {
++public:
++  Screen *m_screen;
++  bool consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy);
++};
++class Server {
++public:
++  PrimaryClient *m_primaryClient;
++  MSWindowsScreen *platform;
++  void handleMotionSecondaryEvent(const Event &event);
++  void handleButtonDownEvent(const Event &event);
++  void handleButtonUpEvent(const Event &event);
++  void onMouseMoveSecondary(int32_t dx, int32_t dy)
++  {
++    ++f.routes; f.delivered = {dx, dy}; f.order.push_back(2);
++    if (f.onMotion) f.onMotion();
++  }
++  void onMouseDown(int) { f.buttonDestinations.push_back(platform->m_isOnScreen); }
++  void onMouseUp(int) { f.buttonDestinations.push_back(platform->m_isOnScreen); }
++};
++
++// 此头由脚本从当前工作区源文件提取，禁止手工维护待测逻辑副本。
++#include "mouse-return-production.inc"
++
++// 参数 queue/server：按真实事件队列的 FIFO 顺序分发，生产 Server 回调决定是否消费和路由。
++void drain(EventQueue &queue, Server &server)
++{
++  while (!queue.queued.empty()) {
++    Event event = std::move(queue.queued.front()); queue.queued.pop_front();
++    switch (event.getType()) {
++    case EventTypes::PrimaryScreenMotionOnSecondary: server.handleMotionSecondaryEvent(event); break;
++    case EventTypes::PrimaryScreenButtonDown: server.handleButtonDownEvent(event); break;
++    case EventTypes::PrimaryScreenButtonUp: server.handleButtonUpEvent(event); break;
++    default: std::abort();
++    }
++    std::free(event.getData());
++  }
++}
++
++void button(EventQueue &queue, EventTypes type)
++{
++  auto *info = static_cast<IPlatformScreen::ButtonInfo *>(std::malloc(sizeof(IPlatformScreen::ButtonInfo)));
++  if (!info) std::abort();
++  info->m_button = 1;
++  queue.addEvent(Event(type, nullptr, info));
++}
++
++int main()
++{
++  EventQueue events;
++  MSWindowsDesks desks;
++  MSWindowsScreen screen;
++  screen.m_desks = &desks; screen.m_events = &events;
++  Screen routedScreen{&screen};
++  PrimaryClient primary{&routedScreen};
++  Server server{&primary, &screen};
++
++  for (bool success : {true, false}) {
++    f.queue.clear(); f.order.clear();
++    enqueue(DESKFLOW_MSG_KEY); enqueue(DESKFLOW_MSG_MOUSE_BUTTON); enqueue(DESKFLOW_MSG_MOUSE_MOVE);
++    enqueue(DESKFLOW_MSG_MOUSE_MOVE_DELTA); enqueue(DESKFLOW_MSG_SCREEN_SAVER); enqueue(DESKFLOW_MSG_DEBUG);
++    f.warpSuccess = success; f.physical = {100, 200};
++    const int peeks = f.peekCalls, sleeps = f.sleepCalls;
++    screen.warpCursor(2500, 800);
++    check(f.queue.size() == 6 && contains(DESKFLOW_MSG_MOUSE_MOVE_DELTA), "primary warp preserves every queued real input");
++    check(f.peekCalls == peeks && f.sleepCalls == sleeps, "primary warp neither scans queue nor yields the thread");
++    check(!contains(DESKFLOW_MSG_PRE_WARP) && !contains(DESKFLOW_MSG_POST_WARP), "primary warp sends no PRE or POST markers");
++    check(screen.m_xCursor == (success ? 2500 : 100) && screen.m_yCursor == (success ? 800 : 200),
++          "successful or failed primary warp saves the reached baseline");
++  }
++
++  f.order.clear(); f.queue.clear();
++  check(screen.ignore(), "fixture creates a pending mark boundary");
++  check(screen.onMouseMoveDelta(-21, 9), "delta handler consumes its message");
++  check(f.events == 1 && f.consumed == 0 && f.routes == 0 && events.queued.size() == 1,
++        "delta crosses a pending mark and remains pending until original-order server dispatch");
++  drain(events, server);
++  check(f.consumed == 1 && f.ack.x == -21 && f.ack.y == 9 && f.delivered.x == -21 && f.delivered.y == 9,
++        "server consumes the exact token and delta through PrimaryClient, Screen and Windows forwarding");
++  screen.m_isOnScreen = true;
++  f.order.clear();
++  screen.onMouseMoveDelta(8, -4);
++  check(f.events == 1 && f.consumed == 1 && f.lastToken == 2,
++        "late local delta advances its token without remote routing or duplicate consumption");
++  screen.m_isOnScreen = false;
++  f.order.clear();
++  screen.onMouseMoveDelta(0, 0);
++  check(f.events == 1 && f.consumed == 1 && f.lastToken == 3,
++        "zero movement advances its token without allocating a route event");
++
++  for (bool confirmed : {true, false}) {
++    f.returnSuccess = confirmed; f.queue.clear(); f.order.clear(); f.released = false;
++    f.pending = {-12, 7}; screen.m_xCursor = 2550; screen.m_yCursor = 700; screen.m_isOnScreen = false;
++    enqueue(DESKFLOW_MSG_KEY); enqueue(DESKFLOW_MSG_MOUSE_BUTTON); enqueue(DESKFLOW_MSG_MOUSE_WHEEL);
++    enqueue(DESKFLOW_MSG_MOUSE_MOVE); enqueue(DESKFLOW_MSG_MOUSE_MOVE_DELTA); enqueue(DESKFLOW_MSG_MOUSE_MOVE_DELTA);
++    enqueue(DESKFLOW_MSG_SCREEN_SAVER); enqueue(DESKFLOW_MSG_DEBUG);
++    const uint64_t beforeTokens = f.lastToken;
++    screen.enter();
++    check(f.focusAfterRelease && f.order.size() >= 3 && f.order[0] == 3 && f.order[1] == 4,
++          "hook thread transfers pending movement and releases before foreground work");
++    check(screen.m_isOnScreen && screen.m_xCursor == 2538 && screen.m_yCursor == 707,
++          "synchronous desktop return writes the final landing position back into the screen");
++    check(!contains(DESKFLOW_MSG_MOUSE_MOVE_DELTA) && f.queue.size() == 7,
++          "return clears only incorporated DELTA messages, preserving new ABS and other events");
++    check(f.lastToken == beforeTokens + 2, "each discarded raw delta advances its original-order token");
++    check(contains(DESKFLOW_MSG_KEY) && contains(DESKFLOW_MSG_MOUSE_BUTTON) && contains(DESKFLOW_MSG_MOUSE_WHEEL) &&
++          contains(DESKFLOW_MSG_MOUSE_MOVE) && contains(DESKFLOW_MSG_SCREEN_SAVER) && contains(DESKFLOW_MSG_DEBUG),
++          "keyboard, buttons, wheel, ABS, screensaver and debug messages survive return");
++  }
++
++  const int returns = f.returnCalls;
++  screen.enter();
++  check(f.returnCalls == returns, "already local enter avoids transferring pending movement twice");
++
++  f.order.clear(); f.queue.clear(); f.pending = {-16, 8}; f.warpSuccess = true;
++  screen.m_isOnScreen = false;
++  enqueue(DESKFLOW_MSG_MOUSE_MOVE_DELTA); enqueue(DESKFLOW_MSG_KEY);
++  button(events, EventTypes::PrimaryScreenButtonDown);
++  button(events, EventTypes::PrimaryScreenButtonUp);
++  f.onMotion = [&] {
++    // 模拟同步 Server 路由在当前位移内越过边界，使用生产定位和入屏方法完成交接。
++    screen.warpCursor(2541, 702);
++    screen.enter();
++  };
++  const int routes = f.routes, consumed = f.consumed;
++  screen.onMouseMoveDelta(-9, 2);
++  screen.onMouseMoveDelta(-4, 3);
++  check(!screen.m_isOnScreen && f.routes == routes && f.buttonDestinations.empty(),
++        "collecting raw motion cannot overtake buttons already in the high-level queue");
++  drain(events, server);
++  f.onMotion = {};
++  check(screen.m_isOnScreen && screen.m_xCursor == 2534 && screen.m_yCursor == 708,
++        "routing-triggered return incorporates only movement not yet acknowledged");
++  check(f.order.size() >= 5 && f.order[0] == 1 && f.order[1] == 2 && f.order[2] == 3 && f.order[3] == 4,
++        "ordered token consumption, route, pending transfer and foreground work occur in that order");
++  check(f.buttonDestinations.size() == 2 && !f.buttonDestinations[0] && !f.buttonDestinations[1],
++        "button press and release queued before the boundary motion both reach the remote computer");
++  check(f.routes == routes + 1 && f.consumed == consumed + 1 && f.pending.x == 0 && f.pending.y == 0,
++        "old high-level motion already absorbed into the landing point is never routed or subtracted again");
++  check(contains(DESKFLOW_MSG_KEY) && contains(DESKFLOW_MSG_MOUSE_MOVE) && !contains(DESKFLOW_MSG_MOUSE_MOVE_DELTA),
++        "reentrant return removes incorporated deltas while preserving local and keyboard messages");
++
++  events.addEvent(Event(EventTypes::PrimaryScreenMotionOnSecondary, nullptr, MotionInfo::alloc(1, 2)));
++  drain(events, server);
++  check(f.routes == routes + 2 && f.consumed == consumed + 1,
++        "untagged motion from unchanged platforms retains the legacy routing path");
++
++  const int desksBeforeContinue = f.deskCalls;
++  desks.sendMessage(DESKFLOW_MSG_MOUSE_RETURN, 0, 0);
++  check(f.continueCalls == 1 && f.deskCalls == desksBeforeContinue,
++        "deferred return messages continue hook compensation without repeating foreground work");
++  const int reentrantReturns = f.returnCalls;
++  screen.m_isPrimary = false; desks.m_isPrimary = false; screen.m_isOnScreen = false;
++  screen.enter();
++  check(f.returnCalls == reentrantReturns && screen.m_isOnScreen, "secondary enter retains the original no-position path");
++
++  f.queue.clear(); f.warpSuccess = true;
++  enqueue(DESKFLOW_MSG_KEY); enqueue(DESKFLOW_MSG_MOUSE_MOVE); enqueue(DESKFLOW_MSG_MOUSE_MOVE_DELTA);
++  enqueue(DESKFLOW_MSG_DEBUG);
++  const int sleeps = f.sleepCalls;
++  check(screen.warpCursorNoFlush(100, 200), "secondary no-flush warp still succeeds");
++  check(contains(DESKFLOW_MSG_PRE_WARP) && contains(DESKFLOW_MSG_POST_WARP) && f.sleepCalls == sleeps + 1,
++        "secondary legacy warp retains markers and yielding");
++  screen.warpCursor(110, 210);
++  check(!contains(DESKFLOW_MSG_KEY) && !contains(DESKFLOW_MSG_MOUSE_MOVE) && contains(DESKFLOW_MSG_DEBUG),
++        "secondary full warp retains the legacy input-range cleanup");
++
++  std::printf("PASS: %d extracted production screen/desktop/server return checks; no desktop input injected.\n", f.checks);
++}
+diff --git a/tools/test-mouse-return.ps1 b/tools/test-mouse-return.ps1
+new file mode 100644
+index 0000000..ffc415d
+--- /dev/null
++++ b/tools/test-mouse-return.ps1
+@@ -0,0 +1,82 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：离线测试输出目录，不安装钩子或向桌面注入输入。
++    [string]$BuildDir = "$env:TEMP\moonlight-mouse-return-tests"
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++
++# 参数 Text：当前生产源代码；Signature：精确函数声明。提取整个方法体，不维护逻辑副本。
++function Get-ProductionMethod([string]$Text, [string]$Signature) {
++    $offset = $Text.IndexOf($Signature + "`n{", [StringComparison]::Ordinal)
++    if ($offset -lt 0) { throw "Production method not found: $Signature" }
++    $brace = $Text.IndexOf('{', $offset)
++    $depth = 0
++    for ($i = $brace; $i -lt $Text.Length; ++$i) {
++        if ($Text[$i] -eq '{') { ++$depth }
++        elseif ($Text[$i] -eq '}') {
++            --$depth
++            if ($depth -eq 0) { return $Text.Substring($offset, $i - $offset + 1) }
++        }
++    }
++    throw "Unclosed production method: $Signature"
++}
++$screen = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\platform\MSWindowsScreen.cpp')).Replace("`r`n", "`n")
++$desks = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\platform\MSWindowsDesks.cpp')).Replace("`r`n", "`n")
++$server = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\server\Server.cpp')).Replace("`r`n", "`n")
++$primary = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\server\PrimaryClient.cpp')).Replace("`r`n", "`n")
++$screenWrapper = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\deskflow\Screen.cpp')).Replace("`r`n", "`n")
++$methods = @(
++    Get-ProductionMethod $screen 'void MSWindowsScreen::enter()'
++    Get-ProductionMethod $screen 'void MSWindowsScreen::warpCursor(int32_t x, int32_t y)'
++    Get-ProductionMethod $screen 'bool MSWindowsScreen::warpCursorNoFlush(int32_t x, int32_t y)'
++    Get-ProductionMethod $screen 'void MSWindowsScreen::saveMousePosition(int32_t x, int32_t y)'
++    Get-ProductionMethod $screen 'bool MSWindowsScreen::onMouseMoveDelta(int32_t dx, int32_t dy)'
++    Get-ProductionMethod $screen 'bool MSWindowsScreen::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)'
++    Get-ProductionMethod $screen 'void MSWindowsScreen::sendEvent(EventTypes type, void *data)'
++    Get-ProductionMethod $desks 'void MSWindowsDesks::enter()'
++    Get-ProductionMethod $desks 'void MSWindowsDesks::enter(POINT &position)'
++    Get-ProductionMethod $screenWrapper 'bool Screen::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)'
++    Get-ProductionMethod $primary 'bool PrimaryClient::consumeMouseMotion(uint64_t token, int32_t dx, int32_t dy)'
++    Get-ProductionMethod $server 'void Server::handleMotionSecondaryEvent(const Event &event)'
++    Get-ProductionMethod $server 'void Server::handleButtonDownEvent(const Event &event)'
++    Get-ProductionMethod $server 'void Server::handleButtonUpEvent(const Event &event)'
++)
++$case = [regex]::Match($desks, '(?s)    case DESKFLOW_MSG_ENTER:.*?(?=    case DESKFLOW_MSG_LEAVE:)')
++if (!$case.Success) { throw 'Production desktop ENTER dispatch case not found.' }
++$methods += @"
++void MSWindowsDesks::sendMessage(UINT message, WPARAM w, LPARAM l)
++{
++  MSG msg{}; msg.message = message; msg.wParam = w; msg.lParam = l;
++  Desk instance; Desk *desk = &instance;
++  bool dispatch = true;
++  while (dispatch) {
++    dispatch = false;
++    switch (message) {
++$($case.Value)
++    default: std::abort();
++    }
++  }
++}
++"@
++$define = [regex]::Match($desks, '(?m)^#define DESKFLOW_MSG_ENTER .+$').Value
++if (!$define) { throw 'Production ENTER message constant not found.' }
++[IO.File]::WriteAllText((Join-Path $BuildDir 'mouse-return-production.inc'), ($define + "`n" + ($methods -join "`n`n")), [Text.UTF8Encoding]::new($false))
++
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /permissive- /MD `
++    "/I$sourceRoot\src\lib" "/I$BuildDir" "$PSScriptRoot\test-mouse-return.cpp" `
++    "/Fe:$BuildDir\test-mouse-return.exe" "/Fo:$BuildDir\test-mouse-return.obj"
++if ($LASTEXITCODE -ne 0) { throw 'Mouse return tests did not compile.' }
++& "$BuildDir\test-mouse-return.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Mouse return tests failed.' }

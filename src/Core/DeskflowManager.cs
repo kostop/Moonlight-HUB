@@ -132,7 +132,7 @@ public sealed class DeskflowStatus
     public bool SecurityOff { get; init; }
     public DateTime TimeUtc { get; init; } = DateTime.UtcNow;
 
-    public string Summary => !Installed ? "未安装"
+    public string Summary => !Installed ? (OperatingSystem.IsWindows() ? "缺少随附键鼠组件" : "未安装")
         : RunningRole switch
         {
             DeskflowRole.Server => Peers.Count > 0 ? $"服务端 · 已连接 {string.Join(", ", Peers)}" : (Listening ? $"服务端 · 等待客户端 (:{Port})" : "服务端 · 启动中"),
@@ -193,7 +193,7 @@ public sealed class DeskflowManager : IDisposable
         _settings = DeskflowSettings.Load();
         _settingsStamp = SettingsStamp();
         _host = OperatingSystem.IsWindows()
-            ? new DeskflowWindowsHost(() => Settings, UpdateSettingsSilently, OnReloadRequested)
+            ? new DeskflowWindowsHost(UpdateSettingsSilently, OnReloadRequested)
             : new DeskflowLinuxHost();
         _link = new PeerLink(this);
         _timer = new System.Threading.Timer(_ => Tick(), null, Timeout.Infinite, Timeout.Infinite);
@@ -407,7 +407,9 @@ public sealed class DeskflowManager : IDisposable
                 try { SetPeerHost(remoteHost); } catch (Exception ex) { Log.Warn("更新对端地址失败: " + ex.Message); }
             }
         }
-        if (!_host.Installed) return (false, "没有安装 Deskflow（" + _host.InstallLocation + "）");
+        if (!_host.Installed) return (false, OperatingSystem.IsWindows()
+            ? "Moonlight Hub 缺少随附的键鼠组件，请使用完整安装包（" + _host.InstallLocation + "）"
+            : "没有安装 Deskflow（" + _host.InstallLocation + "）");
 
         await _switchLock.WaitAsync().ConfigureAwait(false);
         try

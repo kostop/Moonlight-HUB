@@ -1,0 +1,22 @@
+﻿{
+    "snapshot":  "2026-11-13",
+    "source":  "Moonlight workspace local Deskflow integration",
+    "files":  [
+                  {
+                      "path":  "deskflow/touch/deskflow_touch_launcher.cpp",
+                      "sha256":  "6e3a7c330d678ff5b56a0ff9116437454ef236b10471f9889bfc92c8caf2510c"
+                  },
+                  {
+                      "path":  "deskflow/touch/deskflow_touch_filter.cpp",
+                      "sha256":  "97a8d24dba33884952358bdc5c87e43165caf2ca5a210c660278905ce7d0a4e4"
+                  },
+                  {
+                      "path":  "deskflow/touch/deskflow_touch_filter_shared.h",
+                      "sha256":  "dd00db66ec6afb32136db54013eb860077654a792cc839e6964f75ba3424cabf"
+                  },
+                  {
+                      "path":  "deskflow/touch/touch_mouse_isolator.cpp",
+                      "sha256":  "bbb0af6fe659e130069665fd316eff9261d769d6d4cc63e94837d58e0ba1f605"
+                  }
+              ]
+}

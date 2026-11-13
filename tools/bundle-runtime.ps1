@@ -7,13 +7,17 @@ param(
     # Parsec 官方驱动安装包（ParsecVDisplay 附带的 driver\parsec-vdd-setup.exe）
     [string]$DriverSetup = 'D:\YingYong\ParsecVDisplay\driver\parsec-vdd-setup.exe',
     # MSYS2 ucrt64 的 bin 目录，用于 strip 掉 sunshine.exe 的调试段（225 MB -> 45 MB）；找不到就原样复制
-    [string]$Ucrt64Bin = 'D:\tmp\sunshine-msys2\msys64\ucrt64\bin'
+    [string]$Ucrt64Bin = 'D:\tmp\sunshine-msys2\msys64\ucrt64\bin',
+    # DeskflowSource：由本仓库 deskflow-patches/build.ps1 构建的随附组件。
+    [string]$DeskflowSource = (Join-Path (Split-Path -Parent $PSScriptRoot) 'artifacts\deskflow-runtime')
 )
 
 # 把 Moonlight Hub 依赖的运行时嵌入到发布目录：
 #   <Target>\sunshine\   定制版 Sunshine（去掉调试符号），配置不放在这里（运行时写到 %LOCALAPPDATA%\MoonlightHub\sunshine）
 #   <Target>\drivers\    parsec-vdd-setup.exe，Hub 检测不到驱动时用它静默安装
 $ErrorActionPreference = 'Stop'
+
+& (Join-Path $PSScriptRoot 'bundle-deskflow.ps1') -Target $Target -DeskflowSource $DeskflowSource
 
 $sunshineDir = Join-Path $Target 'sunshine'
 $driversDir = Join-Path $Target 'drivers'

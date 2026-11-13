@@ -3,7 +3,7 @@
 把平板 / 手机变成 Windows 电脑的**多块低延迟副屏**：一个 Logitech G HUB 风格的桌面上位机，
 统一管理 **Parsec 虚拟显示驱动（Parsec VDD）**、**Sunshine 多实例**和 **Moonlight 客户端配对**。
 
-![.NET 9](https://img.shields.io/badge/.NET-9.0%20WPF-512BD4) ![Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6)
+![.NET 9](https://img.shields.io/badge/.NET-9.0%20Avalonia-512BD4) ![Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6)
 
 ## 功能
 
@@ -24,6 +24,7 @@
 * **布局记忆**：手动摆放后物理屏与虚拟屏的位置记入状态文件，每次应用方案 / 开机后恢复；显示器重新枚举期间的瞬态布局不会被误记。
 * **守护**：虚拟屏丢失自动重建、实例掉线自动重启、睡眠唤醒/显示变更后复核。
 * **无中断更新**：`tools/update-hub.ps1` 热替换正在运行的 Hub，虚拟屏与串流会话不断。
+* **内置跨电脑键鼠共享**：Deskflow 作为 Hub 随附组件，由 Hub 统一配置、启动和守护；无需另装或维护 Deskflow。定制核心、鼠标切回与按键交接修复统一保存在本仓库，见 [构建说明](deskflow-patches/README.md)。
 * **命令行**：`MoonlightHub.exe --cli status|displays|apply <方案>|instances|pair <id> <PIN>|clients|unpair|adapter [restart|install]|takeover|restore|autostart on|off|shutdown …`
 
 ## 运行要求
@@ -44,9 +45,11 @@
 ## 构建
 
 ```powershell
+# 首先构建 Hub 随附的键鼠组件（Qt/OpenSSL SDK 和 DLL 目录按本机填写）
+.\deskflow-patches\build.ps1 -QtRoot <Qt-MSVС-x64> -OpenSslRoot <OpenSSL-SDK> -DependencySource <OpenSSL-DLL目录> -Test
 cd src
-dotnet publish -c Release -r win-x64 --self-contained false -o ..\dist
-# 嵌入 Sunshine 运行时与驱动安装包（来源路径可用参数指定）
+dotnet publish -c Release -f net9.0-windows -r win-x64 --self-contained false -o ..\dist
+# 嵌入 Deskflow、Sunshine 与驱动安装包（来源路径可用参数指定）
 ..\tools\bundle-runtime.ps1 -Target ..\dist
 # 安装包（需要 Inno Setup 6）
 ISCC.exe ..\installer\MoonlightHub.iss
@@ -60,10 +63,12 @@ ISCC.exe ..\installer\MoonlightHub.iss
 
 | 目录 | 内容 |
 | --- | --- |
-| `src/` | WPF 应用源码（Core = 驱动/显示/Sunshine/守护逻辑，UI = 界面） |
+| `src/` | Avalonia 应用源码（Core = 驱动/显示/键鼠/Sunshine/守护逻辑，UI = 界面） |
 | `installer/` | Inno Setup 脚本 |
-| `tools/` | `update-hub.ps1` 热更新、`bundle-runtime.ps1` 嵌入 Sunshine/驱动、`organize-folder.ps1` 工作区整理 |
+| `tools/` | `update-hub.ps1` 热更新、`bundle-runtime.ps1` 嵌入键鼠/Sunshine/驱动、`organize-folder.ps1` 工作区整理 |
 | `sunshine-patches/` | 定制 Sunshine 的补丁与说明 |
+| `deskflow-patches/` | 随附 Deskflow 核心的固定版本、完整补丁、构建和回归入口 |
+| `native/deskflow-touch/` | Hub 的触摸过滤、包装器与键盘释放适配源码 |
 
 ## 原理简述
 
@@ -78,3 +83,4 @@ ISCC.exe ..\installer\MoonlightHub.iss
 ## 许可
 
 本仓库暂未指定开源许可证（All rights reserved），如需开源请自行添加 LICENSE。
+第三方 Deskflow、Qt、OpenSSL 等组件保留各自的许可证；本项目自身的声明不替代第三方许可。

@@ -3,7 +3,9 @@ bin/
 obj/
 dist/
 dist-staging/
+dist-staging-*/
 release/
+artifacts/
 *.user
 *.suo
 .vs/

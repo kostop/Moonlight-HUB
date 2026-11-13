@@ -1,0 +1,448 @@
+diff --git a/src/lib/platform/MSWindowsHook.cpp b/src/lib/platform/MSWindowsHook.cpp
+index 8d0edcd..66dac56 100644
+--- a/src/lib/platform/MSWindowsHook.cpp
++++ b/src/lib/platform/MSWindowsHook.cpp
+@@ -29,6 +29,7 @@ static HHOOK g_mouseLL = nullptr;
+ static bool g_screenSaver = false;
+ static std::atomic<EHookMode> g_mode{kHOOK_DISABLE};
+ static std::atomic<bool> g_mouseHandoff{false};
++static deskflow::win32::LocalKeyOwnership g_localKeyOwnership;
+ struct MouseMotionState
+ {
+   std::mutex mutex;
+@@ -129,6 +130,7 @@ int MSWindowsHook::init(DWORD threadID)
+   g_mode = kHOOK_DISABLE;
+   g_mouseHandoff = false;
+   resetMouseMotion();
++  g_localKeyOwnership.clear();
+   g_zoneSides = 0;
+   g_zoneSize = 0;
+   g_xScreen = 0;
+@@ -143,6 +145,7 @@ int MSWindowsHook::cleanup()
+ {
+   g_mouseHandoff = false;
+   resetMouseMotion();
++  g_localKeyOwnership.clear();
+   if (g_processID == GetCurrentProcessId()) {
+     g_threadID = 0;
+   }
+@@ -368,7 +371,8 @@ static void setDeadKey(WCHAR wc[], int size, UINT flags)
+   }
+ }
+ 
+-static bool keyboardHookHandler(WPARAM wParam, LPARAM lParam)
++// 参数 wParam/lParam：原键盘事件；localRelease：该真实松开还会放行给原本机。
++static bool keyboardHookHandler(WPARAM wParam, LPARAM lParam, bool localRelease = false)
+ {
+   DWORD vkCode = static_cast<DWORD>(wParam);
+   bool kf_up = (lParam & (KF_UP << 16)) != 0;
+@@ -558,6 +562,9 @@ static bool keyboardHookHandler(WPARAM wParam, LPARAM lParam)
+   // XXX -- with hot keys for actions we may only need to do this when
+   // forwarding.
+   if (charAndVirtKey != 0) {
++    if (localRelease) {
++      charAndVirtKey |= deskflow::win32::kLocalKeyReleasePassed;
++    }
+     PostThreadMessage(g_threadID, DESKFLOW_MSG_DEBUG, charAndVirtKey | 0x07000000, lParam);
+     PostThreadMessage(g_threadID, DESKFLOW_MSG_KEY, charAndVirtKey, lParam);
+   }
+@@ -623,8 +630,18 @@ static LRESULT CALLBACK keyboardLLHook(int code, WPARAM wParam, LPARAM lParam)
+     // we don't know that info.  as a result we'll never generate
+     // key repeat events.
+ 
+-    // handle the message
+-    if (keyboardHookHandler(wParam, lParam)) {
++    // 只对本机实际收到过按下的物理键归还松开；不依赖离屏时可能过时的系统快照。
++    const uint16_t button = static_cast<uint16_t>((info->scanCode & 0xffu) |
++        (((info->flags & LLKHF_EXTENDED) != 0 && info->vkCode != VK_RSHIFT) ? 0x100u : 0));
++    const bool down = (info->flags & LLKHF_UP) == 0;
++    const bool physicalPrimary = g_isPrimary && !injected;
++    const bool localRelease = physicalPrimary && !down &&
++        g_localKeyOwnership.release(button, static_cast<uint16_t>(info->vkCode));
++    const bool suppress = keyboardHookHandler(wParam, lParam, localRelease);
++    if (physicalPrimary && down && !suppress) {
++      g_localKeyOwnership.capture(button, static_cast<uint16_t>(info->vkCode));
++    }
++    if (suppress && !localRelease) {
+       return 1;
+     }
+   }
+diff --git a/src/lib/platform/MSWindowsLocalKeyRelease.h b/src/lib/platform/MSWindowsLocalKeyRelease.h
+index a6d69c3..8379fd6 100644
+--- a/src/lib/platform/MSWindowsLocalKeyRelease.h
++++ b/src/lib/platform/MSWindowsLocalKeyRelease.h
+@@ -11,6 +11,8 @@
+ #include <Windows.h>
+ 
+ #include <algorithm>
++#include <array>
++#include <atomic>
+ #include <cstdint>
+ #include <vector>
+ 
+@@ -18,6 +20,39 @@ namespace deskflow::win32 {
+ 
+ // 仅标记“本机按下、离开后物理松开”的补发释放，不能把全部注入输入放行。
+ inline constexpr ULONG_PTR kLocalKeyReleaseTag = 0x4d484c55u;
++// 线程消息内的来源标记，不属于发送给 Windows 的虚拟键或扫描码。
++inline constexpr WPARAM kLocalKeyReleasePassed = 0x02000000u;
++
++class LocalKeyOwnership
++{
++public:
++  // 参数 button：低级钩子的扫描码（含扩展位）；virtualKey：扫描码缺失时的备用键值。
++  void capture(uint16_t button, uint16_t virtualKey)
++  {
++    m_keys[index(button, virtualKey)] = true;
++  }
++
++  // 参数 button/virtualKey：真实松开的按键；只归还曾经放行给本机的那次按下。
++  bool release(uint16_t button, uint16_t virtualKey)
++  {
++    return m_keys[index(button, virtualKey)].exchange(false);
++  }
++
++  void clear()
++  {
++    for (auto &key : m_keys) {
++      key = false;
++    }
++  }
++
++private:
++  // 参数 button/virtualKey：与 capture 一致；普通扫描码与无扫描码键使用独立槽位。
++  static size_t index(uint16_t button, uint16_t virtualKey)
++  {
++    return button != 0 ? button & 0x1ffu : 0x200u + (virtualKey & 0xffu);
++  }
++  std::array<std::atomic<bool>, 0x300> m_keys{};
++};
+ 
+ // 参数 virtualKey：左右独立的虚拟键；button：低 8 位扫描码，0x100 为扩展键。
+ inline INPUT makeLocalKeyRelease(WORD virtualKey, uint16_t button)
+diff --git a/src/lib/platform/MSWindowsScreen.cpp b/src/lib/platform/MSWindowsScreen.cpp
+index fef5d19..279f5de 100644
+--- a/src/lib/platform/MSWindowsScreen.cpp
++++ b/src/lib/platform/MSWindowsScreen.cpp
+@@ -1065,6 +1065,9 @@ bool MSWindowsScreen::onMark(uint32_t mark)
+ bool MSWindowsScreen::onKey(WPARAM wParam, LPARAM lParam)
+ {
+   static const KeyModifierMask s_ctrlAlt = KeyModifierControl | KeyModifierAlt;
++  const bool localReleasePassed = (wParam & deskflow::win32::kLocalKeyReleasePassed) != 0;
++  // 来源标记只服务本机释放确认，不能进入热键或 AltGr 的键值映射。
++  wParam &= ~deskflow::win32::kLocalKeyReleasePassed;
+ 
+   LOG_DEBUG1(
+       "event: Key char=%d, vk=0x%02x, nagr=%d, lParam=0x%08x", (wParam & 0xffffu), (wParam >> 16) & 0xffu,
+@@ -1099,7 +1102,9 @@ bool MSWindowsScreen::onKey(WPARAM wParam, LPARAM lParam)
+ 
+   // 真实事件先更新待补发状态；新的物理按下必须在热键或 mark 提前返回之前取消旧重试。
+   if (m_isPrimary) {
+-    m_primaryKeyReleases.onKey(button, down, [this](KeyButton key) { return releaseLocalKey(key); });
++    m_primaryKeyReleases.onKey(button, down, [this, localReleasePassed](KeyButton key) {
++      return localReleasePassed || releaseLocalKey(key);
++    });
+   }
+ 
+   // windows doesn't tell us the modifier key state on mouse or key
+diff --git a/tools/test-key-handoff.cpp b/tools/test-key-handoff.cpp
+new file mode 100644
+index 0000000..fedd5f7
+--- /dev/null
++++ b/tools/test-key-handoff.cpp
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "platform/MSWindowsLocalKeyRelease.h"
++#include <cstdio>
++#include <cstdlib>
++
++// 编译当前生产 onKey 方法体；仅模拟其平台边界，不安装键盘钩子或发送真实输入。
++using KeyButton = uint16_t;
++using KeyID = uint32_t;
++using KeyModifierMask = uint32_t;
++constexpr KeyModifierMask KeyModifierControl = 2, KeyModifierAlt = 4;
++constexpr KeyID kKeyNone = 0, kKeyDelete = 0xffff;
++#define LOG_DEBUG(...) ((void)0)
++#define LOG_DEBUG1(...) ((void)0)
++
++namespace {
++int checks = 0;
++int syntheticReleases = 0;
++int forwardedUps = 0;
++bool releaseSucceeded = true;
++bool hotkey = false;
++WPARAM mappedKey = 0;
++WPARAM hotkeyKey = 0;
++void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
++}
++struct KeyState {
++  bool down = false;
++  bool testAutoRepeat(bool, bool, KeyButton) { return false; }
++  KeyButton virtualKeyToButton(UINT) { return 0x1e; }
++  void onKey(KeyButton, bool press, KeyModifierMask) { down = press; }
++  KeyID mapKeyFromEvent(WPARAM key, LPARAM, KeyModifierMask *mask) { mappedKey = key; *mask = 0; return 'a'; }
++  void sendKeyEvent(void *, bool press, bool, KeyID, KeyModifierMask, int32_t, KeyButton)
++  {
++    if (!press) ++forwardedUps;
++  }
++};
++}
++
++class MSWindowsScreen {
++public:
++  bool m_isPrimary = true;
++  bool ignored = false;
++  KeyState *m_keyState;
++  deskflow::win32::LocalKeyReleaseState m_primaryKeyReleases;
++  bool onKey(WPARAM wParam, LPARAM lParam);
++  bool isKeyDown(KeyButton) const { return m_keyState->down; }
++  KeyModifierMask pollActiveModifiers() const { return 0; }
++  bool onHotKey(WPARAM key, LPARAM) const { hotkeyKey = key; return hotkey; }
++  bool isModifierRepeat(KeyModifierMask, KeyModifierMask, WPARAM) const { return false; }
++  bool ignore() const { return ignored; }
++  void *getEventTarget() { return this; }
++  bool releaseLocalKey(KeyButton) const { ++syntheticReleases; return releaseSucceeded; }
++};
++
++// 由脚本从当前生产源提取，禁止手工维护待测逻辑副本。
++#include "key-handoff-production.inc"
++
++int main()
++{
++  KeyState keys;
++  MSWindowsScreen screen;
++  screen.m_keyState = &keys;
++  const WPARAM ordinaryKey = static_cast<WPARAM>('A') << 16;
++  const LPARAM down = 1 | (0x1e << 16);
++  const LPARAM up = down | static_cast<LPARAM>(0x80000000u);
++
++  for (bool ignored : {false, true}) {
++    for (bool consumedByHotkey : {false, true}) {
++      screen.ignored = ignored; hotkey = consumedByHotkey;
++      screen.m_primaryKeyReleases.capture(0x1e);
++      const int releasesBefore = syntheticReleases, upsBefore = forwardedUps;
++      screen.onKey(ordinaryKey | deskflow::win32::kLocalKeyReleasePassed, up);
++      check(!keys.down, "real key-up updates internal state across mark and hotkey boundaries");
++      check(syntheticReleases == releasesBefore, "already passed physical key-up is never synthesized again");
++      screen.m_primaryKeyReleases.retry([&](uint16_t) { ++syntheticReleases; return true; });
++      check(syntheticReleases == releasesBefore, "native key-up clears any fallback retry exactly once");
++      check(forwardedUps == upsBefore + (!ignored && !consumedByHotkey ? 1 : 0),
++            "remote routing preserves existing mark and hotkey behavior");
++    }
++  }
++
++  screen.ignored = true; hotkey = true;
++  screen.m_primaryKeyReleases.capture(0x1e);
++  releaseSucceeded = false;
++  const int failedBefore = syntheticReleases;
++  screen.onKey(ordinaryKey, up);
++  check(syntheticReleases == failedBefore + 1, "legacy missed native release still uses exact fallback repair");
++  screen.onKey(ordinaryKey | deskflow::win32::kLocalKeyReleasePassed, up);
++  screen.m_primaryKeyReleases.retry([&](uint16_t) { ++syntheticReleases; return true; });
++  check(syntheticReleases == failedBefore + 1, "later native key-up cancels a failed fallback without another injection");
++
++  releaseSucceeded = true; screen.ignored = false; hotkey = false;
++  screen.m_primaryKeyReleases.capture(0x1e);
++  const int heldBefore = syntheticReleases;
++  screen.onKey(ordinaryKey, down);
++  screen.m_primaryKeyReleases.retry([&](uint16_t) { ++syntheticReleases; return true; });
++  check(keys.down && syntheticReleases == heldBefore, "crossing with a held key does not force it up");
++  screen.onKey(ordinaryKey | deskflow::win32::kLocalKeyReleasePassed, up);
++  check(!keys.down && syntheticReleases == heldBefore, "physical release ends the held key without an extra key press");
++  check(mappedKey == ordinaryKey && hotkeyKey == ordinaryKey,
++        "native release metadata never enters hotkey or AltGr key mapping");
++  const WPARAM noAltGr = ordinaryKey | 0x01000000u;
++  screen.onKey(noAltGr | deskflow::win32::kLocalKeyReleasePassed, up);
++  check(mappedKey == noAltGr && hotkeyKey == noAltGr,
++        "removing native release metadata preserves the original no-AltGr flag");
++
++  std::printf("PASS: %d extracted production key handoff checks; no desktop input injected.\n", checks);
++}
+diff --git a/tools/test-key-handoff.ps1 b/tools/test-key-handoff.ps1
+new file mode 100644
+index 0000000..c8bfd8b
+--- /dev/null
++++ b/tools/test-key-handoff.ps1
+@@ -0,0 +1,31 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：独立离线测试目录，不安装钩子或注入桌面输入。
++    [string]$BuildDir = "$env:TEMP\moonlight-key-handoff-tests"
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++
++$source = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\platform\MSWindowsScreen.cpp')).Replace("`r`n", "`n")
++$start = $source.IndexOf('bool MSWindowsScreen::onKey(WPARAM wParam, LPARAM lParam)', [StringComparison]::Ordinal)
++$end = $source.IndexOf('bool MSWindowsScreen::onHotKey(', $start, [StringComparison]::Ordinal)
++if ($start -lt 0 -or $end -lt 0) { throw 'Production keyboard handler not found.' }
++[IO.File]::WriteAllText((Join-Path $BuildDir 'key-handoff-production.inc'), $source.Substring($start, $end - $start), [Text.UTF8Encoding]::new($false))
++
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /permissive- /MD `
++    "/I$sourceRoot\src\lib" "/I$BuildDir" "$PSScriptRoot\test-key-handoff.cpp" `
++    "/Fe:$BuildDir\test-key-handoff.exe" "/Fo:$BuildDir\test-key-handoff.obj"
++if ($LASTEXITCODE -ne 0) { throw 'Key handoff tests did not compile.' }
++& "$BuildDir\test-key-handoff.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Key handoff tests failed.' }
+diff --git a/tools/test-local-key-release.cpp b/tools/test-local-key-release.cpp
+index 1362906..80a5396 100644
+--- a/tools/test-local-key-release.cpp
++++ b/tools/test-local-key-release.cpp
+@@ -106,5 +106,19 @@ int main()
+   state.onKey(0x2a, false, accept);
+   check(sent.size() == 8, "a still held key returned to primary follows normal physical release");
+ 
++  LocalKeyOwnership ownership;
++  ownership.capture(0x1e, 'A');
++  ownership.capture(0x138, VK_RMENU);
++  check(ownership.release(0x1e, 'A'), "release an ordinary key that actually reached the primary OS");
++  check(!ownership.release(0x1e, 'A'), "the same primary ownership cannot be consumed twice");
++  check(!ownership.release(0x38, VK_LMENU), "right Alt ownership cannot release left Alt");
++  check(ownership.release(0x138, VK_RMENU), "extended keys retain independent ownership");
++  ownership.capture(0, 'A');
++  check(!ownership.release(0x1e, 'A'), "missing scan code uses an independent virtual-key slot");
++  check(ownership.release(0, 'A'), "zero scan code can still return the exact physical key-up");
++  ownership.capture(0x1d, VK_LCONTROL);
++  ownership.clear();
++  check(!ownership.release(0x1d, VK_LCONTROL), "a new hook lifetime cannot inherit old key ownership");
++
+   std::printf("PASS: %d local key release checks; no desktop input injected\n", checks);
+ }
+diff --git a/tools/test-modifier-reconcile.cpp b/tools/test-modifier-reconcile.cpp
+index 62e5446..4468a4a 100644
+--- a/tools/test-modifier-reconcile.cpp
++++ b/tools/test-modifier-reconcile.cpp
+@@ -28,6 +28,8 @@ public:
+     if (desired & KeyModifierAlt) active.emplace(KeyModifierAlt, modifier(kKeyAlt_L, 0x38, KeyModifierAlt));
+     if (desired & KeyModifierControl) active.emplace(KeyModifierControl, modifier(kKeyControl_L, 0x1d, KeyModifierControl));
+     if (desired & KeyModifierAltGr) active.emplace(KeyModifierAltGr, modifier(kKeyAltGr, 0x138, KeyModifierAltGr));
++    if (desired & KeyModifierShift) active.emplace(KeyModifierShift, modifier(kKeyShift_L, 0x2a, KeyModifierShift));
++    if (desired & KeyModifierSuper) active.emplace(KeyModifierSuper, modifier(kKeySuper_L, 0x15b, KeyModifierSuper));
+     current = desired;
+     m_key = modifier(id, 0x1e, 0);
+     return &m_key;
+@@ -115,5 +117,18 @@ int main()
+   check(altgr.released.size() == 1 && altgr.isKeyDown(0x1d), "ordinary and lock-key releases never clear unrelated modifiers");
+   check(!deskflow::shouldReleaseImplicitModifier(kKeyAlt_L, 0, KeyModifierAlt, true, true), "locking key is excluded even with matching generated bit");
+ 
++  FixtureState returnFromRemote(map);
++  returnFromRemote.fakeKeyDown('a', KeyModifierAlt | KeyModifierControl | KeyModifierShift | KeyModifierSuper, 0x1e, "en");
++  check(returnFromRemote.isKeyDown(0x38) && returnFromRemote.isKeyDown(0x1d) &&
++        returnFromRemote.isKeyDown(0x2a) && returnFromRemote.isKeyDown(0x15b),
++        "receiver fixture holds all four shortcut modifier classes before leaving its screen");
++  returnFromRemote.fakeAllKeysUp();
++  check(!returnFromRemote.isKeyDown(0x38) && !returnFromRemote.isKeyDown(0x1d) &&
++        !returnFromRemote.isKeyDown(0x2a) && !returnFromRemote.isKeyDown(0x15b) && !returnFromRemote.isKeyDown(0x1e),
++        "existing remote screen leave releases its owned shortcut state when crossing back to the primary");
++  const auto leaveReleaseCount = returnFromRemote.released.size();
++  check(!returnFromRemote.fakeKeyUp(0x1e), "a later source key-up cannot replay the remote key released on leave");
++  check(returnFromRemote.released.size() == leaveReleaseCount, "remote leave cleanup emits no duplicate delayed release");
++
+   std::printf("PASS: %d real KeyState reconciliation checks; no desktop input injected\n", checks);
+ }
+diff --git a/tools/test-mouse-handoff.cpp b/tools/test-mouse-handoff.cpp
+index d69a855..b42dd03 100644
+--- a/tools/test-mouse-handoff.cpp
++++ b/tools/test-mouse-handoff.cpp
+@@ -291,5 +291,87 @@ int main() {
+   check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 3 && destination.y == 100,
+         "reverse hardware movement after an edge clamp starts at the actual cursor position");
+   reentrantDelta = {7, -3};
++
++  struct HeldKey { DWORD vk; DWORD scan; DWORD flags; };
++  const HeldKey heldKeys[] = {
++      {'A', 0x1e, 0}, {VK_SPACE, 0x39, 0}, {VK_LEFT, 0x4b, LLKHF_EXTENDED},
++      {VK_LCONTROL, 0x1d, 0}, {VK_RCONTROL, 0x1d, LLKHF_EXTENDED},
++      {VK_LMENU, 0x38, 0}, {VK_RMENU, 0x38, LLKHF_EXTENDED},
++      {VK_LSHIFT, 0x2a, 0}, {VK_RSHIFT, 0x36, LLKHF_EXTENDED},
++      {VK_LWIN, 0x5b, LLKHF_EXTENDED}, {VK_RWIN, 0x5c, LLKHF_EXTENDED},
++      {'B', 0, 0}};
++  const auto dispatchKey = [](KBDLLHOOKSTRUCT &event) {
++    return keyboardLLHook(HC_ACTION, (event.flags & LLKHF_UP) ? WM_KEYUP : WM_KEYDOWN,
++                          reinterpret_cast<LPARAM>(&event));
++  };
++  const auto lastKeyMessage = []() {
++    const auto message = std::find_if(posted.rbegin(), posted.rend(), [](const auto &entry) {
++      return entry.message == DESKFLOW_MSG_KEY;
++    });
++    check(message != posted.rend(), "physical key event is still reported to the main event queue");
++    return message->w;
++  };
++  for (const auto &held : heldKeys) {
++    hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    KBDLLHOOKSTRUCT event{};
++    event.vkCode = held.vk; event.scanCode = held.scan; event.flags = held.flags;
++    check(dispatchKey(event) == 0, "primary key-down reaches its original OS");
++    hook.beginMouseHandoff();
++    hook.setMode(kHOOK_RELAY_EVENTS);
++    check(dispatchKey(event) == 1, "held-key repeat remains relayed after crossing screens");
++    posted.clear();
++    event.flags |= LLKHF_UP;
++    check(dispatchKey(event) == 0, "physical key-up also reaches the primary that received its down");
++    check((lastKeyMessage() & deskflow::win32::kLocalKeyReleasePassed) != 0,
++          "source release is reported so the main thread avoids a duplicate synthetic key-up");
++    posted.clear();
++    check(dispatchKey(event) == 1, "a second remote key-up cannot borrow consumed primary ownership");
++    check((lastKeyMessage() & deskflow::win32::kLocalKeyReleasePassed) == 0,
++          "ordinary remote releases are not marked as already delivered to the source OS");
++    hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    event.flags = held.flags;
++    dispatchKey(event);
++    hook.setMode(kHOOK_RELAY_EVENTS);
++    hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    event.flags |= LLKHF_UP;
++    check(dispatchKey(event) == 0, "returning to the primary while still holding a key preserves its normal release");
++    check((lastKeyMessage() & deskflow::win32::kLocalKeyReleasePassed) != 0,
++          "primary ownership survives an entire round trip without forcing a key-up during the crossing");
++  }
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  KBDLLHOOKSTRUCT control{};
++  control.vkCode = VK_LCONTROL; control.scanCode = 0x1d;
++  KBDLLHOOKSTRUCT shift{};
++  shift.vkCode = VK_RSHIFT; shift.scanCode = 0x36;
++  dispatchKey(control); dispatchKey(shift);
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  control.flags = LLKHF_UP;
++  check(dispatchKey(control) == 0, "releasing Ctrl after crossing does not release a still held Shift");
++  shift.flags = LLKHF_UP;
++  check(dispatchKey(shift) == 0, "the companion Shift remains owned until its own physical key-up");
++  check(dispatchKey(shift) == 1, "the companion release is returned to the primary exactly once");
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  KBDLLHOOKSTRUCT remoteOnly{};
++  remoteOnly.vkCode = 'C'; remoteOnly.scanCode = 0x2e;
++  check(dispatchKey(remoteOnly) == 1, "a key first pressed on the remote computer is relayed");
++  remoteOnly.flags = LLKHF_UP;
++  check(dispatchKey(remoteOnly) == 1, "remote-owned key-up cannot leak into the primary OS");
++
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  KBDLLHOOKSTRUCT lifetime{};
++  lifetime.vkCode = 'D'; lifetime.scanCode = 0x20;
++  dispatchKey(lifetime);
++  hook.uninstall();
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  lifetime.flags = LLKHF_UP;
++  check(dispatchKey(lifetime) == 0, "reinstalling hooks cannot forget an outstanding source key release");
++
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  KBDLLHOOKSTRUCT injectedKey{};
++  injectedKey.vkCode = 'E'; injectedKey.scanCode = 0x12; injectedKey.flags = LLKHF_INJECTED;
++  dispatchKey(injectedKey);
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  injectedKey.flags |= LLKHF_UP;
++  check(dispatchKey(injectedKey) == 1, "arbitrary injected key-up does not gain a source ownership bypass");
+   std::printf("PASS: %d production mouse-handoff callback checks; no hooks or input injected.\n", checks);
+ }
