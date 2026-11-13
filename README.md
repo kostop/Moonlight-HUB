@@ -25,6 +25,7 @@
 * **守护**：虚拟屏丢失自动重建、实例掉线自动重启、睡眠唤醒/显示变更后复核。
 * **无中断更新**：`tools/update-hub.ps1` 热替换正在运行的 Hub，虚拟屏与串流会话不断。
 * **内置跨电脑键鼠共享**：Deskflow 作为 Hub 随附组件，由 Hub 统一配置、启动和守护；无需另装或维护 Deskflow。定制核心、鼠标切回与按键交接修复统一保存在本仓库，见 [构建说明](deskflow-patches/README.md)。
+* **拖动时锁定当前电脑**：任意鼠标按键保持按下时暂停跨电脑切换，松开后需新的移动再穿透；同一电脑内的多屏拖动不受影响。跨屏失败或对端断开时优先恢复到离开前的本机位置。
 * **命令行**：`MoonlightHub.exe --cli status|displays|apply <方案>|instances|pair <id> <PIN>|clients|unpair|adapter [restart|install]|takeover|restore|autostart on|off|shutdown …`
 
 ## 运行要求

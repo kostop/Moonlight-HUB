@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using MoonlightHub.Core;
 
 namespace MoonlightHub.Tests;
@@ -11,6 +12,11 @@ internal static class DeskflowRuntimeTests
     private static readonly MethodInfo ResolveBridgeMethod = typeof(DeskflowManager).Assembly
         .GetType("MoonlightHub.Core.DeskflowRuntimeLocator")?.GetMethod("ResolveBridge", BindingFlags.Static | BindingFlags.NonPublic)
         ?? throw new InvalidOperationException("找不到 Hub 随附触摸桥解析方法");
+    private static readonly MethodInfo UsesSelectedCoreMethod = typeof(DeskflowManager).Assembly
+        .GetType("MoonlightHub.Core.DeskflowRuntimeLocator")?.GetMethod("UsesSelectedCore", BindingFlags.Static | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("找不到 Hub 随附核心映像校验方法");
+    private static readonly MethodInfo IsHealthyMethod = typeof(DeskflowManager).GetMethod("IsHealthy", BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new InvalidOperationException("找不到 Hub 键鼠核心健康检查方法");
 
     // 参数 tests：接收只使用内存文件快照的组件选择回归，不读取真实安装目录或启动核心。
     internal static void AddTo(List<(string Name, Action Run)> tests)
@@ -27,11 +33,25 @@ internal static class DeskflowRuntimeTests
         tests.Add(("不同目录的 Deskflow 文件不能拼凑成完整组件", SplitRuntimeRejected));
         tests.Add(("触摸桥优先使用当前随附组件中的新版本", BundledBridgeWins));
         tests.Add(("旧版 Hub 组件没有触摸桥时兼容 tools 副本", LegacyBridgeFallsBack));
+        tests.Add(("运行核心来自当前 Hub 随附目录时允许保持", () => ExpectCore(true, CurrentCore, [CurrentCore], true)));
+        tests.Add(("核心路径大小写及等价点目录不误触发迁移", () => ExpectCore(true, CurrentCore, [Path.Combine(ExeDir.ToLowerInvariant(), "deskflow", "native", ".", "deskflow-core.exe")], true)));
+        tests.Add(("独立安装的 SYSTEM 客户端仍须迁移", () => ExpectCore(true, CurrentCore, [@"C:\Program Files\Deskflow\deskflow-core.exe"], false)));
+        tests.Add(("暂存 Hub 不沿用安装目录旧核心", () => ExpectCore(true, @"C:\Update\staging\deskflow\native\deskflow-core.exe", [CurrentCore], false)));
+        tests.Add(("读取不到核心映像路径时保守触发迁移", () => ExpectCore(true, CurrentCore, [null], false)));
+        tests.Add(("相对核心路径不能被当作已确认映像", () => ExpectCore(true, CurrentCore, ["deskflow-core.exe"], false)));
+        tests.Add(("没有原生核心时不把包装器当作健康核心", () => ExpectCore(true, CurrentCore, [], false)));
+        tests.Add(("多个核心混入旧目录时触发迁移", () => ExpectCore(true, CurrentCore, [CurrentCore, @"C:\OldHub\deskflow-core.exe"], false)));
+        tests.Add(("无效核心路径不抛异常且触发迁移", () => ExpectCore(true, CurrentCore, ["invalid\0path"], false)));
+        tests.Add(("Linux 核心不要求 Windows 随附映像路径", () => ExpectCore(false, null, ["/app/bin/deskflow-core"], null)));
+        tests.Add(("客户端健康检查拒绝旧目录 SYSTEM 核心", () => ExpectClientHealthy(false, true, false)));
+        tests.Add(("客户端健康检查允许当前目录 SYSTEM 核心", () => ExpectClientHealthy(true, true, true)));
+        tests.Add(("当前目录客户端仍保留 SYSTEM 身份要求", () => ExpectClientHealthy(true, false, false)));
     }
 
     private const string ExeDir = @"C:\Hub";
     private const string BridgeRoot = @"C:\User\MoonlightDeskflowBridge";
     private static string Bundled => Path.Combine(ExeDir, "deskflow");
+    private static string CurrentCore => Path.Combine(Bundled, "native", "deskflow-core.exe");
     private static string Legacy(string version) => Path.Combine(BridgeRoot, version);
 
     // 参数 roots：需要构造为完整运行时的目录；返回独立的内存文件集合。
@@ -122,5 +142,24 @@ internal static class DeskflowRuntimeTests
         var expected = Path.Combine(ExeDir, "tools", "moonlight-touch-bridge.exe");
         Program.Assert((string?)ResolveBridgeMethod.Invoke(null, [Legacy("v25"), ExeDir, exists]) == expected,
             "旧版组件没有触摸桥时应沿用 Hub tools 副本");
+    }
+
+    // 参数 required：是否要求 Windows 路径；expected/paths：选定和运行映像；result：预期判断，null 表示平台无需判断。
+    private static void ExpectCore(bool required, string? expected, string?[] paths, bool? result)
+    {
+        Program.Assert((bool?)UsesSelectedCoreMethod.Invoke(null, [required, expected, paths]) == result,
+            "核心映像路径的迁移判断与预期不符");
+    }
+
+    // 参数 selected：映像是否来自当前组件；asSystem：原有 SYSTEM 判断；expected：客户端是否健康。
+    private static void ExpectClientHealthy(bool selected, bool asSystem, bool expected)
+    {
+        // 不执行构造函数，不读取设置、不启动计时器或平台接口；客户端分支不访问主机实例。
+        var manager = (DeskflowManager)RuntimeHelpers.GetUninitializedObject(typeof(DeskflowManager));
+        var settings = new DeskflowSettings { Role = DeskflowRole.Client };
+        var status = new DeskflowStatus { RunningRole = DeskflowRole.Client, MainCores = 1,
+            CoreAsSystem = asSystem, CoreInSelectedRuntime = selected };
+        Program.Assert((bool)IsHealthyMethod.Invoke(manager, [settings, status])! == expected,
+            "客户端健康检查未同时保留映像路径与 SYSTEM 要求");
     }
 }

@@ -249,6 +249,16 @@ if ($Test) {
     if (!$?) { throw 'Mouse handoff regression failed.' }
     & (Join-Path $PreparedSource 'tools\test-modifier-reconcile.ps1') -QtRoot $QtRoot -CoreBuildDir $BuildDir
     if (!$?) { throw 'Key reconciliation regression failed.' }
+    & (Join-Path $PreparedSource 'tools\test-key-refresh.ps1') -QtRoot $QtRoot -CoreBuildDir $BuildDir
+    if (!$?) { throw 'Receiver key ownership refresh regression failed.' }
+    & (Join-Path $PreparedSource 'tools\test-mouse-held.ps1') -QtRoot $QtRoot
+    if (!$?) { throw 'Held mouse screen-switch regression failed.' }
+    & (Join-Path $PreparedSource 'tools\test-mouse-recovery.ps1') -QtRoot $QtRoot
+    if (!$?) { throw 'Failed screen-switch recovery regression failed.' }
+    & (Join-Path $PreparedSource 'tools\test-menu-handoff.ps1') -QtRoot $QtRoot -CoreBuildDir $BuildDir
+    if (!$?) { throw 'Source menu handoff regression failed.' }
+    & (Join-Path $PreparedSource 'tools\test-receiver-menu.ps1') -QtRoot $QtRoot -CoreBuildDir $BuildDir
+    if (!$?) { throw 'Receiver menu handoff regression failed.' }
 }
 $patchHashes = @{}
 Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.patch' -File | ForEach-Object {

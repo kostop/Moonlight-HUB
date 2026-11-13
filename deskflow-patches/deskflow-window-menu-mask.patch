@@ -1,0 +1,1322 @@
+diff --git a/src/lib/deskflow/KeyState.cpp b/src/lib/deskflow/KeyState.cpp
+--- a/src/lib/deskflow/KeyState.cpp
++++ b/src/lib/deskflow/KeyState.cpp
+@@ -1034,6 +1034,19 @@
+   fakeKeys(keys, 1);
+ }
+ 
++bool KeyState::hasRelayMenuModifier() const
++{
++  constexpr auto menuMask = KeyModifierAlt | KeyModifierAltGr | KeyModifierMeta | KeyModifierSuper;
++  for (const auto &[generated, key] : m_activeModifiers) {
++    const KeyButton button = key.m_button & kButtonMask;
++    if ((generated & menuMask) != 0 && !key.m_lock && button != 0 &&
++        m_relayOwnedKeys[button] && m_syntheticKeys[button] > 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ void KeyState::fakeAllKeysUp()
+ {
+   Keystrokes keys;
+diff --git a/src/lib/deskflow/KeyState.h b/src/lib/deskflow/KeyState.h
+--- a/src/lib/deskflow/KeyState.h
++++ b/src/lib/deskflow/KeyState.h
+@@ -63,6 +63,8 @@
+   bool fakeKeyUp(KeyButton button) override;
+   void reconcileKeyRelease(KeyID id, KeyModifierMask mask) override;
+   void fakeAllKeysUp() override;
++  // 返回是否仍持有本核心接力合成的非锁定 Alt/AltGr/Meta/Win，实体接管的键不计入。
++  bool hasRelayMenuModifier() const;
+   bool fakeMediaKey(KeyID id) override;
+ 
+   bool isKeyDown(KeyButton) const override;
+diff --git a/src/lib/platform/MSWindowsHook.cpp b/src/lib/platform/MSWindowsHook.cpp
+--- a/src/lib/platform/MSWindowsHook.cpp
++++ b/src/lib/platform/MSWindowsHook.cpp
+@@ -8,6 +8,7 @@
+ #include "platform/MSWindowsHook.h"
+ #include "platform/MSWindowsCursorWarp.h"
+ #include "platform/MSWindowsLocalKeyRelease.h"
++#include "platform/MSWindowsMenuMask.h"
+ #include "base/DirectionTypes.h"
+ #include "base/Log.h"
+ #include "deskflow/ScreenException.h"
+@@ -30,6 +31,90 @@
+ static std::atomic<EHookMode> g_mode{kHOOK_DISABLE};
+ static std::atomic<bool> g_mouseHandoff{false};
+ static deskflow::win32::LocalKeyOwnership g_localKeyOwnership;
++struct MenuKeyOwnership
++{
++  enum Origin : uint64_t { Unknown = 0, Local = 1, Remote = 2 };
++  struct Release
++  {
++    Origin origin = Unknown;
++    bool crossed = false;
++  };
++  static constexpr uint64_t kOriginMask = 3, kResyncDown = 4;
++  std::array<std::atomic<uint64_t>, 4> keys{};
++  std::atomic<uint32_t> epoch{0};
++
++  // 参数 virtualKey/button：只识别左右 Alt/Win；通用 Alt 使用扫描码扩展位区分。
++  static int index(UINT virtualKey, uint16_t button)
++  {
++    switch (virtualKey) {
++    case VK_MENU: return (button & 0x100u) ? 1 : 0;
++    case VK_LMENU: return 0;
++    case VK_RMENU: return 1;
++    case VK_LWIN: return 2;
++    case VK_RWIN: return 3;
++    default: return -1;
++    }
++  }
++
++  void clear()
++  {
++    for (auto &key : keys) key = 0;
++    epoch = 0;
++  }
++
++  // 参数 virtualKey/button：本次物理按下；local：本次确实会放行本机；started：回调起始代数。
++  void capture(UINT virtualKey, uint16_t button, bool local, uint32_t started)
++  {
++    const int slot = index(virtualKey, button);
++    if (slot < 0) return;
++    auto old = keys[slot].load();
++    const uint64_t fresh = (static_cast<uint64_t>(started) << 3) | (local ? Local : Remote);
++    uint64_t next = old;
++    if (old == 0 || ((old & kResyncDown) != 0 && (GetAsyncKeyState(virtualKey) & 0x8000) == 0)) {
++      next = fresh;
++    } else {
++      next &= ~kResyncDown;
++      // 远端起源的重复按下返回本机后若被放行，须接管其 native up，但保留已经跨屏的代数。
++      if (local) next = (next & ~kOriginMask) | Local;
++    }
++    keys[slot].compare_exchange_strong(old, next);
++  }
++
++  // 参数 virtualKey/button：物理松开；奇数代数表示切换发布中，保守视作跨屏，不等待主线程。
++  Release release(UINT virtualKey, uint16_t button)
++  {
++    const int slot = index(virtualKey, button);
++    if (slot < 0) return {};
++    const auto held = keys[slot].exchange(0);
++    const auto started = static_cast<uint32_t>(held >> 3);
++    return {static_cast<Origin>(held & kOriginMask), (started & 1u) != 0 || started != epoch.load()};
++  }
++
++  void uninstall()
++  {
++    for (auto &key : keys) {
++      auto held = key.load();
++      // 本机仍可能实际按住的键保留；仅远端所有权失去观察后，不能冒领下一次新的本机按下。
++      const auto next = (held & kOriginMask) == Local ? held | kResyncDown : uint64_t{0};
++      key.compare_exchange_strong(held, next);
++    }
++  }
++};
++static MenuKeyOwnership g_menuKeyOwnership;
++
++// 参数 virtualKey/button：仅替换这一次本机 Alt/Win 松开；E8 严格带专用标签且不转发远端。
++static bool sendMenuMaskedRelease(WORD virtualKey, uint16_t button)
++{
++  INPUT inputs[3]{deskflow::win32::makeMenuMaskKey(true), deskflow::win32::makeMenuMaskKey(false),
++                  deskflow::win32::makeLocalKeyRelease(virtualKey, button)};
++  const UINT inserted = SendInput(3, inputs, sizeof(INPUT));
++  if (inserted == 3) return true;
++  if (inserted == 1) {
++    // 前缀只插入 E8 down 时补其 up；无论补发成败，真实 Alt/Win up 都继续到达本机。
++    SendInput(1, &inputs[1], sizeof(INPUT));
++  }
++  return false;
++}
+ struct MouseMotionState
+ {
+   std::mutex mutex;
+@@ -131,6 +216,7 @@
+   g_mouseHandoff = false;
+   resetMouseMotion();
+   g_localKeyOwnership.clear();
++  g_menuKeyOwnership.clear();
+   g_zoneSides = 0;
+   g_zoneSize = 0;
+   g_xScreen = 0;
+@@ -146,6 +232,7 @@
+   g_mouseHandoff = false;
+   resetMouseMotion();
+   g_localKeyOwnership.clear();
++  g_menuKeyOwnership.clear();
+   if (g_processID == GetCurrentProcessId()) {
+     g_threadID = 0;
+   }
+@@ -174,8 +261,14 @@
+ 
+ void MSWindowsHook::setMode(EHookMode mode)
+ {
++  const auto previous = g_mode.load();
++  const bool crossing = g_isPrimary && previous != mode &&
++      (previous == kHOOK_WATCH_JUMP_ZONE || previous == kHOOK_RELAY_EVENTS) &&
++      (mode == kHOOK_WATCH_JUMP_ZONE || mode == kHOOK_RELAY_EVENTS);
++  if (crossing) ++g_menuKeyOwnership.epoch;
+   // 先发布正式模式再结束临时接管，避免两次写入之间重新放行真实移动。
+   g_mode = mode;
++  if (crossing) ++g_menuKeyOwnership.epoch;
+   g_mouseMotion.local = false;
+   // 即使模式不变也结束临时接管，确保回本机、停用和清理路径不会残留。
+   g_mouseHandoff = false;
+@@ -183,7 +276,9 @@
+ 
+ void MSWindowsHook::beginMouseHandoff()
+ {
+-  g_mouseHandoff = g_isPrimary && g_mode == kHOOK_WATCH_JUMP_ZONE && g_mouseLL != nullptr;
++  const bool handoff = g_isPrimary && g_mode == kHOOK_WATCH_JUMP_ZONE && g_mouseLL != nullptr;
++  if (handoff) g_menuKeyOwnership.epoch += 2;
++  g_mouseHandoff = handoff;
+ }
+ 
+ uint64_t MSWindowsHook::nextMouseMotionToken()
+@@ -371,8 +466,8 @@
+   }
+ }
+ 
+-// 参数 wParam/lParam：原键盘事件；localRelease：该真实松开还会放行给原本机。
+-static bool keyboardHookHandler(WPARAM wParam, LPARAM lParam, bool localRelease = false)
++// 参数 wParam/lParam：原键盘事件；localHandled：本机释放已处理；injected：低级钩子明确报告的注入来源。
++static bool keyboardHookHandler(WPARAM wParam, LPARAM lParam, bool localHandled = false, bool injected = false)
+ {
+   DWORD vkCode = static_cast<DWORD>(wParam);
+   bool kf_up = (lParam & (KF_UP << 16)) != 0;
+@@ -562,8 +657,11 @@
+   // XXX -- with hot keys for actions we may only need to do this when
+   // forwarding.
+   if (charAndVirtKey != 0) {
+-    if (localRelease) {
++    if (localHandled) {
+       charAndVirtKey |= deskflow::win32::kLocalKeyReleasePassed;
++    }
++    if (injected) {
++      charAndVirtKey |= deskflow::win32::kInjectedKeyEvent;
+     }
+     PostThreadMessage(g_threadID, DESKFLOW_MSG_DEBUG, charAndVirtKey | 0x07000000, lParam);
+     PostThreadMessage(g_threadID, DESKFLOW_MSG_KEY, charAndVirtKey, lParam);
+@@ -604,6 +702,10 @@
+     // decode the message
+     KBDLLHOOKSTRUCT *info = reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
+ 
++    if (deskflow::win32::isTaggedMenuMask(*info)) {
++      return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
++    }
++
+     // 本机遗留按键的精确释放直接到达 Windows，不重新当成远端用户输入。
+     if (deskflow::win32::isLocalKeyRelease(*info)) {
+       return CallNextHookEx(g_keyboardLL, code, wParam, lParam);
+@@ -635,11 +737,23 @@
+         (((info->flags & LLKHF_EXTENDED) != 0 && info->vkCode != VK_RSHIFT) ? 0x100u : 0));
+     const bool down = (info->flags & LLKHF_UP) == 0;
+     const bool physicalPrimary = g_isPrimary && !injected;
++    const auto menuEpoch = g_menuKeyOwnership.epoch.load();
+     const bool localRelease = physicalPrimary && !down &&
+         g_localKeyOwnership.release(button, static_cast<uint16_t>(info->vkCode));
+-    const bool suppress = keyboardHookHandler(wParam, lParam, localRelease);
++    const auto menuRelease = physicalPrimary && !down
++        ? g_menuKeyOwnership.release(static_cast<UINT>(info->vkCode), button) : MenuKeyOwnership::Release{};
++    const bool remoteMenuRelease = menuRelease.origin == MenuKeyOwnership::Remote;
++    const bool suppress = keyboardHookHandler(wParam, lParam, localRelease || remoteMenuRelease, injected);
+     if (physicalPrimary && down && !suppress) {
+       g_localKeyOwnership.capture(button, static_cast<uint16_t>(info->vkCode));
++    }
++    if (physicalPrimary && down) {
++      g_menuKeyOwnership.capture(static_cast<UINT>(info->vkCode), button, !suppress, menuEpoch);
++    }
++    if (remoteMenuRelease) return 1;
++    if (localRelease && menuRelease.origin == MenuKeyOwnership::Local && menuRelease.crossed &&
++        sendMenuMaskedRelease(static_cast<WORD>(info->vkCode), button)) {
++      return 1;
+     }
+     if (suppress && !localRelease) {
+       return 1;
+@@ -885,6 +999,7 @@
+ 
+ int MSWindowsHook::uninstall()
+ {
++  g_menuKeyOwnership.uninstall();
+   g_mouseHandoff = false;
+   g_mouseMotion.local = false;
+   g_mouseMotion.returning = false;
+diff --git a/src/lib/platform/MSWindowsScreen.cpp b/src/lib/platform/MSWindowsScreen.cpp
+--- a/src/lib/platform/MSWindowsScreen.cpp
++++ b/src/lib/platform/MSWindowsScreen.cpp
+@@ -795,6 +795,10 @@
+ 
+ void MSWindowsScreen::fakeAllKeysUp()
+ {
++  if (!m_isPrimary && m_keyState->hasRelayMenuModifier()) {
++    // 接收端离屏会提前释放仍按住的接力 Alt/Win，不能让它变成一次菜单单击。
++    m_desks->maskMenuActivation();
++  }
+   PlatformScreen::fakeAllKeysUp();
+   updateMouseKeys();
+ }
+@@ -1065,9 +1069,10 @@
+ bool MSWindowsScreen::onKey(WPARAM wParam, LPARAM lParam)
+ {
+   static const KeyModifierMask s_ctrlAlt = KeyModifierControl | KeyModifierAlt;
+-  const bool localReleasePassed = (wParam & deskflow::win32::kLocalKeyReleasePassed) != 0;
++  const bool localReleaseHandled = (wParam & deskflow::win32::kLocalKeyReleasePassed) != 0;
++  const bool injected = (wParam & deskflow::win32::kInjectedKeyEvent) != 0;
+   // 来源标记只服务本机释放确认，不能进入热键或 AltGr 的键值映射。
+-  wParam &= ~deskflow::win32::kLocalKeyReleasePassed;
++  wParam &= ~(deskflow::win32::kLocalKeyReleasePassed | deskflow::win32::kInjectedKeyEvent);
+ 
+   LOG_DEBUG1(
+       "event: Key char=%d, vk=0x%02x, nagr=%d, lParam=0x%08x", (wParam & 0xffffu), (wParam >> 16) & 0xffu,
+@@ -1110,8 +1115,8 @@
+ 
+   // 真实事件先更新待补发状态；新的物理按下必须在热键或 mark 提前返回之前取消旧重试。
+   if (m_isPrimary) {
+-    m_primaryKeyReleases.onKey(button, down, [this, localReleasePassed](KeyButton key) {
+-      return localReleasePassed || releaseLocalKey(key);
++    m_primaryKeyReleases.onKey(button, down, [this, localReleaseHandled](KeyButton key) {
++      return localReleaseHandled || releaseLocalKey(key);
+     });
+   }
+ 
+@@ -1138,8 +1143,8 @@
+ 
+   // 只记录修饰键首次按下和全部松开，避免记录普通字符或重复按下。
+   if (modifierKey && (!down || !wasDown)) {
+-    LOG_INFO("modifier source vk=0x%02x scan=0x%03x down=%d mask=0x%04x->0x%04x mark=%u/%u onScreen=%d nativeUp=%d",
+-             virtualKey, button, down, oldState, state, m_mark, m_markReceived, m_isOnScreen, localReleasePassed);
++    LOG_INFO("modifier source vk=0x%02x scan=0x%03x down=%d mask=0x%04x->0x%04x mark=%u/%u onScreen=%d localHandled=%d injected=%d",
++             virtualKey, button, down, oldState, state, m_mark, m_markReceived, m_isOnScreen, localReleaseHandled, injected);
+   }
+ 
+   // check for hot keys
+diff --git a/src/lib/platform/MSWindowsDesks.cpp b/src/lib/platform/MSWindowsDesks.cpp
+--- a/src/lib/platform/MSWindowsDesks.cpp
++++ b/src/lib/platform/MSWindowsDesks.cpp
+@@ -19,6 +19,7 @@
+ #include "mt/Lock.h"
+ #include "mt/Thread.h"
+ #include "platform/MSWindowsHook.h"
++#include "platform/MSWindowsMenuMask.h"
+ #include "platform/MSWindowsScreen.h"
+ 
+ #include <malloc.h>
+@@ -80,6 +81,8 @@
+ #define DESKFLOW_MSG_FAKE_REL_MOVE DESKFLOW_HOOK_LAST_MSG + 11
+ // enable; <unused>
+ #define DESKFLOW_MSG_FAKE_INPUT DESKFLOW_HOOK_LAST_MSG + 12
++// <unused>; <unused>
++#define DESKFLOW_MSG_MENU_MASK DESKFLOW_HOOK_LAST_MSG + 13
+ 
+ // 参数 wVk/wScan/dwFlags：虚拟键、扫描码与注入标志；仅为失败的修饰键记录诊断。
+ static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
+@@ -256,6 +259,11 @@
+ void MSWindowsDesks::fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool /*isAutoRepeat*/) const
+ {
+   sendMessage(DESKFLOW_MSG_FAKE_KEY, flags, MAKELPARAM(scanCode, virtualKey));
++}
++
++void MSWindowsDesks::maskMenuActivation() const
++{
++  sendMessage(DESKFLOW_MSG_MENU_MASK, 0, 0);
+ }
+ 
+ void MSWindowsDesks::fakeMouseButton(ButtonID button, bool press)
+@@ -761,6 +769,22 @@
+       }
+       break;
+ 
++    case DESKFLOW_MSG_MENU_MASK: {
++      // 使用未分配的 E8，不借用 Ctrl/Esc；标签使源端钩子不会再次转发该掩码。
++      INPUT input[2]{};
++      input[0] = deskflow::win32::makeMenuMaskKey(true);
++      input[1] = deskflow::win32::makeMenuMaskKey(false);
++      SetLastError(ERROR_SUCCESS);
++      const auto inserted = SendInput(2, input, sizeof(INPUT));
++      if (inserted != 2) {
++        LOG_WARN("receiver menu mask injection rejected inserted=%u error=%lu", inserted, GetLastError());
++        if (inserted == 1 && SendInput(1, &input[1], sizeof(INPUT)) != 1) {
++          LOG_WARN("receiver menu mask cleanup release rejected error=%lu", GetLastError());
++        }
++      }
++      break;
++    }
++
+     case DESKFLOW_MSG_FAKE_INPUT:
+       send_keyboard_input(
+           DESKFLOW_HOOK_FAKE_INPUT_VIRTUAL_KEY, DESKFLOW_HOOK_FAKE_INPUT_SCANCODE, msg.wParam ? 0 : KEYEVENTF_KEYUP
+diff --git a/src/lib/platform/MSWindowsDesks.h b/src/lib/platform/MSWindowsDesks.h
+--- a/src/lib/platform/MSWindowsDesks.h
++++ b/src/lib/platform/MSWindowsDesks.h
+@@ -152,6 +152,9 @@
+   Synthesize a press or release of key \c button.
+   */
+   void fakeKeyEvent(WORD virtualKey, WORD scanCode, DWORD flags, bool isAutoRepeat) const;
++
++  // 在当前输入桌面为接力 Alt/Win 的离屏释放投递中性菜单掩码，不改其它按键状态。
++  void maskMenuActivation() const;
+ 
+   //! Fake mouse press/release
+   /*!
+diff --git a/src/lib/platform/MSWindowsKeyState.cpp b/src/lib/platform/MSWindowsKeyState.cpp
+--- a/src/lib/platform/MSWindowsKeyState.cpp
++++ b/src/lib/platform/MSWindowsKeyState.cpp
+@@ -13,6 +13,21 @@
+ #include "common/Constants.h"
+ #include "platform/MSWindowsDesks.h"
+ #include "platform/MSWindowsHandle.h"
++
++namespace {
++thread_local unsigned g_menuReleaseMaskDepth = 0;
++
++class MenuReleaseMaskScope
++{
++public:
++  MenuReleaseMaskScope() : m_previousDepth(g_menuReleaseMaskDepth) { ++g_menuReleaseMaskDepth; }
++  ~MenuReleaseMaskScope() { g_menuReleaseMaskDepth = m_previousDepth; }
++  MenuReleaseMaskScope(const MenuReleaseMaskScope &) = delete;
++  MenuReleaseMaskScope &operator=(const MenuReleaseMaskScope &) = delete;
++private:
++  unsigned m_previousDepth;
++};
++}
+ 
+ // extended mouse buttons
+ #if !defined(VK_XBUTTON1)
+@@ -739,6 +754,7 @@
+ 
+ void MSWindowsKeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang)
+ {
++  const MenuReleaseMaskScope menuMask;
+   KeyState::fakeKeyDown(id, mask, button, lang);
+ }
+ 
+@@ -746,7 +762,14 @@
+     KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang
+ )
+ {
++  const MenuReleaseMaskScope menuMask;
+   return KeyState::fakeKeyRepeat(id, mask, count, button, lang);
++}
++
++void MSWindowsKeyState::reconcileKeyRelease(KeyID id, KeyModifierMask mask)
++{
++  const MenuReleaseMaskScope menuMask;
++  KeyState::reconcileKeyRelease(id, mask);
+ }
+ 
+ // We must use SendSAS (Secure Attention Sequence) to simulate Ctrl+Alt+Del (since Windows Vista).
+@@ -1192,6 +1215,11 @@
+ 
+     // vk,sc,flags,keystroke.m_data.m_button.m_repeat
+ 
++    if (g_menuReleaseMaskDepth != 0 && (flags & KEYEVENTF_KEYUP) != 0 &&
++        (vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU || vk == VK_LWIN || vk == VK_RWIN)) {
++      // 模拟按键可能临时放开 Alt/Win 再恢复；不能把这段内部调整解释成菜单单击。
++      m_desks->maskMenuActivation();
++    }
+     m_desks->fakeKeyEvent(vk, scanCode, flags, keystroke.m_data.m_button.m_repeat);
+ 
+     // synthesize event
+diff --git a/src/lib/platform/MSWindowsKeyState.h b/src/lib/platform/MSWindowsKeyState.h
+--- a/src/lib/platform/MSWindowsKeyState.h
++++ b/src/lib/platform/MSWindowsKeyState.h
+@@ -133,6 +133,8 @@
+   // IKeyState overrides
+   void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang) override;
+   bool fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang) override;
++  // 参数 id/mask：来源明确松开及之后的修饰状态；仅抑制隐式清理造成的菜单误触。
++  void reconcileKeyRelease(KeyID id, KeyModifierMask mask) override;
+   bool fakeCtrlAltDel() override;
+   KeyModifierMask pollActiveModifiers() const override;
+   int32_t pollActiveGroup() const override;
+diff --git a/src/lib/platform/MSWindowsLocalKeyRelease.h b/src/lib/platform/MSWindowsLocalKeyRelease.h
+--- a/src/lib/platform/MSWindowsLocalKeyRelease.h
++++ b/src/lib/platform/MSWindowsLocalKeyRelease.h
+@@ -22,6 +22,8 @@
+ inline constexpr ULONG_PTR kLocalKeyReleaseTag = 0x4d484c55u;
+ // 线程消息内的来源标记，不属于发送给 Windows 的虚拟键或扫描码。
+ inline constexpr WPARAM kLocalKeyReleasePassed = 0x02000000u;
++// 仅用于主线程诊断的输入来源，映射热键和 AltGr 前必须剥离。
++inline constexpr WPARAM kInjectedKeyEvent = 0x04000000u;
+ 
+ class LocalKeyOwnership
+ {
+diff --git a/src/lib/platform/MSWindowsMenuMask.h b/src/lib/platform/MSWindowsMenuMask.h
+new file mode 100644
+--- /dev/null
++++ b/src/lib/platform/MSWindowsMenuMask.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#pragma once
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <Windows.h>
++
++namespace deskflow::win32 {
++
++inline constexpr WORD kMenuMaskVirtualKey = 0xe8;
++inline constexpr ULONG_PTR kMenuMaskTag = 0x4d484d4bu;
++
++// 参数 down：仅生成本核心的菜单抑制键，不使用 Ctrl、Esc 或普通字符。
++inline INPUT makeMenuMaskKey(bool down)
++{
++  INPUT input{};
++  input.type = INPUT_KEYBOARD;
++  input.ki.wVk = kMenuMaskVirtualKey;
++  input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
++  input.ki.dwExtraInfo = kMenuMaskTag;
++  return input;
++}
++
++// 参数 event：低级钩子原始事件；只放行本核心带标签、无扫描码的 E8 注入。
++inline bool isTaggedMenuMask(const KBDLLHOOKSTRUCT &event)
++{
++  return event.vkCode == kMenuMaskVirtualKey && event.scanCode == 0 &&
++         event.dwExtraInfo == kMenuMaskTag && (event.flags & LLKHF_INJECTED) != 0;
++}
++
++} // namespace deskflow::win32
+diff --git a/tools/test-key-refresh.cpp b/tools/test-key-refresh.cpp
+--- a/tools/test-key-refresh.cpp
++++ b/tools/test-key-refresh.cpp
+@@ -111,13 +111,19 @@
+     RefreshState state(map);
+     state.fakeKeyDown(modifier.id, modifier.mask, source, "en");
+     check(state.systemDown.contains(modifier.button), "real KeyMap emits the expected modifier down");
++    const bool menuModifier = (modifier.mask & (KeyModifierAlt | KeyModifierAltGr | KeyModifierSuper)) != 0;
++    check(state.hasRelayMenuModifier() == menuModifier,
++          "menu handoff detection includes owned Alt/Win and excludes Ctrl/Shift");
+     const auto eventsBefore = state.emitted.size();
+     state.updateKeyState();
+     check(state.emitted.size() == eventsBefore && state.systemDown.contains(modifier.button),
+           "refresh preserves a held remote key without injecting a release or another down");
++    check(state.hasRelayMenuModifier() == menuModifier,
++          "refresh preserves the owned menu handoff classification");
+     check(state.fakeKeyUp(source), "source mapping survives refresh and accepts its explicit key-up");
+     check(!state.systemDown.contains(modifier.button) && !state.isKeyDown(modifier.button),
+           "explicit key-up clears both OS boundary and shadow state");
++    check(!state.hasRelayMenuModifier(), "explicit key-up removes outstanding menu handoff ownership");
+     check(state.upCount(modifier.button) == 1 && state.emitted.back().m_client == modifier.client,
+           "refresh preserves release metadata and emits exactly one up");
+     check(!state.fakeKeyUp(source) && state.upCount(modifier.button) == 1,
+@@ -146,6 +152,7 @@
+     RefreshState takeover(map);
+     takeover.fakeKeyDown(modifier.id, modifier.mask, source, "en");
+     takeover.physical(modifier.button, true);
++    check(!takeover.hasRelayMenuModifier(), "physical takeover is excluded from menu handoff masking");
+     const auto takeoverBefore = takeover.emitted.size();
+     takeover.updateKeyState();
+     check(takeover.isKeyDown(modifier.button) && !takeover.fakeKeyUp(source),
+diff --git a/tools/test-key-handoff.cpp b/tools/test-key-handoff.cpp
+--- a/tools/test-key-handoff.cpp
++++ b/tools/test-key-handoff.cpp
+@@ -119,6 +119,12 @@
+   screen.onKey(noAltGr | deskflow::win32::kLocalKeyReleasePassed, up);
+   check(mappedKey == noAltGr && hotkeyKey == noAltGr,
+         "removing native release metadata preserves the original no-AltGr flag");
++  screen.onKey(ordinaryKey | deskflow::win32::kInjectedKeyEvent, up);
++  check(mappedKey == ordinaryKey && hotkeyKey == ordinaryKey,
++        "injected provenance metadata never enters hotkey or AltGr key mapping");
++  screen.onKey(noAltGr | deskflow::win32::kInjectedKeyEvent | deskflow::win32::kLocalKeyReleasePassed, up);
++  check(mappedKey == noAltGr && hotkeyKey == noAltGr,
++        "stripping combined injected and handled metadata preserves the original no-AltGr flag");
+   check(modifierLogs == 0, "ordinary key down and up never enter modifier INFO diagnostics");
+ 
+   struct ModifierCase { UINT virtualKey; KeyButton scan; KeyModifierMask mask; };
+diff --git a/tools/test-menu-handoff.cpp b/tools/test-menu-handoff.cpp
+new file mode 100644
+--- /dev/null
++++ b/tools/test-menu-handoff.cpp
+@@ -0,0 +1,254 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "platform/MSWindowsHook.h"
++#include "platform/MSWindowsMenuMask.h"
++#include "platform/MSWindowsLocalKeyRelease.h"
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++namespace {
++struct Posted { UINT message; WPARAM w; LPARAM l; };
++struct NativeKey { WORD vk, scan; bool down, extended; ULONG_PTR tag; };
++std::array<bool, 256> nativeDown{}, menuUsed{};
++std::vector<Posted> posted;
++std::vector<NativeKey> nativeKeys;
++std::vector<std::vector<INPUT>> attempts;
++std::vector<UINT> acceptedPlan;
++size_t acceptedIndex = 0;
++int menuActivations = 0, checks = 0;
++LRESULT deliverInjected(const INPUT &input);
++bool menuKey(WORD key) { return key == VK_LMENU || key == VK_RMENU || key == VK_LWIN || key == VK_RWIN; }
++void receive(WORD vk, WORD scan, bool down, bool extended, ULONG_PTR tag) {
++  nativeKeys.push_back({vk, scan, down, extended, tag});
++  if (down) {
++    if (menuKey(vk) && !nativeDown[vk]) menuUsed[vk] = false;
++    if (!menuKey(vk)) {
++      for (int key : {VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN}) if (nativeDown[key]) menuUsed[key] = true;
++    }
++  } else if (menuKey(vk) && nativeDown[vk] && !menuUsed[vk]) {
++    ++menuActivations;
++  }
++  nativeDown[vk] = down;
++}
++BOOL WINAPI post(DWORD, UINT message, WPARAM w, LPARAM l) { posted.push_back({message,w,l}); return TRUE; }
++LRESULT WINAPI pass(HHOOK, int, WPARAM, LPARAM) { return 0; }
++SHORT WINAPI keyState(int vk) { return nativeDown[static_cast<unsigned>(vk) & 255u] ? SHORT{static_cast<SHORT>(0x8000u)} : 0; }
++int WINAPI translate(UINT, UINT, const BYTE *, LPWSTR, int, UINT) { return 0; }
++BOOL WINAPI unhook(HHOOK) { return TRUE; }
++DWORD WINAPI threadId() { return 7; }
++UINT WINAPI sendInputs(UINT count, LPINPUT input, int size) {
++  if (size != sizeof(INPUT)) return 0;
++  attempts.emplace_back(input, input + count);
++  const UINT accepted = acceptedIndex < acceptedPlan.size() ? acceptedPlan[acceptedIndex++] : count;
++  for (UINT index = 0; index < accepted && index < count; ++index) deliverInjected(input[index]);
++  return accepted;
++}
++void check(bool success, const char *message) {
++  ++checks;
++  if (!success) { std::fprintf(stderr,"FAIL: %s\n",message); std::exit(1); }
++}
++}
++
++#undef PostThreadMessage
++#define PostThreadMessage post
++#define CallNextHookEx pass
++#define GetAsyncKeyState keyState
++#define ToUnicode translate
++#define UnhookWindowsHookEx unhook
++#define GetCurrentThreadId threadId
++#define SendInput sendInputs
++#pragma warning(push)
++#pragma warning(disable: 4457)
++#pragma warning(disable: 4702) // 未调用的加载错误路径在本测试的 abort 日志边界后不可达。
++#include "../src/lib/platform/MSWindowsHook.cpp"
++#pragma warning(pop)
++
++namespace {
++LRESULT deliverInjected(const INPUT &input) {
++  check(input.type == INPUT_KEYBOARD, "source menu masking injects keyboard events only");
++  KBDLLHOOKSTRUCT key{};
++  key.vkCode=input.ki.wVk; key.scanCode=input.ki.wScan; key.dwExtraInfo=input.ki.dwExtraInfo;
++  key.flags=LLKHF_INJECTED | ((input.ki.dwFlags & KEYEVENTF_KEYUP) ? LLKHF_UP : 0) |
++      ((input.ki.dwFlags & KEYEVENTF_EXTENDEDKEY) ? LLKHF_EXTENDED : 0);
++  const auto result=keyboardLLHook(HC_ACTION, (key.flags & LLKHF_UP) ? WM_KEYUP : WM_KEYDOWN,
++                                  reinterpret_cast<LPARAM>(&key));
++  if (result == 0) receive(input.ki.wVk,input.ki.wScan,(key.flags & LLKHF_UP)==0,
++                           (key.flags & LLKHF_EXTENDED)!=0,input.ki.dwExtraInfo);
++  return result;
++}
++LRESULT physical(WORD vk, uint16_t scan, bool down) {
++  KBDLLHOOKSTRUCT key{};
++  key.vkCode=vk; key.scanCode=scan & 255u;
++  key.flags=(down ? 0 : LLKHF_UP) | ((scan & 0x100u) ? LLKHF_EXTENDED : 0);
++  const auto result=keyboardLLHook(HC_ACTION,down ? WM_KEYDOWN : WM_KEYUP,reinterpret_cast<LPARAM>(&key));
++  if (result == 0) receive(vk,static_cast<WORD>(key.scanCode),down,(key.flags & LLKHF_EXTENDED)!=0,0);
++  return result;
++}
++void reset(MSWindowsHook &hook, EHookMode mode) {
++  hook.init(7); g_isPrimary=TRUE; g_hookThread=7;
++  g_keyboardLL=reinterpret_cast<HHOOK>(1); g_mouseLL=reinterpret_cast<HHOOK>(1);
++  hook.setMode(mode); nativeDown={};menuUsed={};posted.clear();nativeKeys.clear();attempts.clear();
++  acceptedPlan.clear();acceptedIndex=0;menuActivations=0;
++}
++size_t nativeUps(WORD vk) {
++  size_t count=0;for(const auto &key:nativeKeys) if(key.vk==vk && !key.down) ++count; return count;
++}
++size_t postedUps(WORD vk, bool handled) {
++  size_t count=0;
++  for(const auto &entry:posted) if(entry.message==DESKFLOW_MSG_KEY && ((entry.w>>16)&255u)==vk &&
++      (entry.l & static_cast<LPARAM>(0x80000000u))!=0 &&
++      ((entry.w & deskflow::win32::kLocalKeyReleasePassed)!=0)==handled) ++count;
++  return count;
++}
++}
++Log *Log::getInstance() { std::abort(); }
++void Log::print(const char *,int,const char *,...) { std::abort(); }
++BaseException::BaseException():std::runtime_error("") {}
++const char *BaseException::what() const noexcept { std::abort(); }
++std::string BaseException::format(const char *,const char *,...) const noexcept { std::abort(); }
++std::string ScreenOpenFailureException::getWhat() const noexcept { std::abort(); }
++
++int main() {
++  MSWindowsHook hook;
++  struct Case {WORD vk;uint16_t scan;};
++  const Case keys[]={{VK_LMENU,0x38},{VK_RMENU,0x138},{VK_LWIN,0x15b},{VK_RWIN,0x15c}};
++  for(const auto &key:keys) {
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    check(physical(key.vk,key.scan,true)==0 && physical(key.vk,key.scan,false)==0,
++          "normal same-screen Alt/Win tap remains native");
++    check(attempts.empty() && menuActivations==1 && nativeUps(key.vk)==1,
++          "normal tap activates its native menu without an E8 mask");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);physical(VK_TAB,0x0f,true);physical(VK_TAB,0x0f,false);physical(key.vk,key.scan,false);
++    check(attempts.empty() && menuActivations==0 && nativeUps(key.vk)==1,
++          "normal same-screen Alt/Win combination is not intercepted or masked");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    check(physical(key.vk,key.scan,false)==0 && attempts.empty() && menuActivations==1,
++          "resetting the same local mode never turns a normal Alt tap into a cross-screen mask");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);++g_menuKeyOwnership.epoch;
++    check(physical(key.vk,key.scan,false)==1 && menuActivations==0 && nativeUps(key.vk)==1,
++          "an in-progress odd epoch is handled conservatively without waiting for the main thread");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    ++g_menuKeyOwnership.epoch;physical(key.vk,key.scan,true);
++    check(physical(key.vk,key.scan,false)==1 && nativeUps(key.vk)==1,
++          "a down first observed during mode publication retains its conservative crossing mark");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);hook.beginMouseHandoff();
++    check(physical(key.vk,key.scan,false)==1 && nativeUps(key.vk)==1 && menuActivations==0,
++          "mouse handoff marks Alt held before the formal keyboard relay mode changes");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);hook.beginMouseHandoff();hook.setMode(kHOOK_RELAY_EVENTS);
++    check(physical(key.vk,key.scan,false)==1,"cross-screen local-owned up consumes only the replaced physical event");
++    check(attempts.size()==1 && attempts[0].size()==3 && nativeUps(key.vk)==1 && !nativeDown[key.vk] && menuActivations==0,
++          "masked local return emits E8 pair then exactly one real native modifier up");
++    check(postedUps(key.vk,true)==1 && postedUps(deskflow::win32::kMenuMaskVirtualKey,false)==0,
++          "the physical up still reaches Main once and E8 never becomes relayed input");
++    check(nativeKeys.back().scan==(key.scan & 255u) && nativeKeys.back().extended==((key.scan & 0x100u)!=0) &&
++          nativeKeys.back().tag==deskflow::win32::kLocalKeyReleaseTag,
++          "masked modifier release preserves its side, extended scan and exact native release tag");
++
++    reset(hook,kHOOK_RELAY_EVENTS);
++    check(physical(key.vk,key.scan,true)==1,"remote-origin down never reaches the local OS");
++    hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    check(physical(key.vk,key.scan,false)==1 && nativeUps(key.vk)==0 && attempts.empty() && postedUps(key.vk,true)==1,
++          "a remote-origin up returning home is routed but cannot become an unmatched native menu up");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);hook.setMode(kHOOK_RELAY_EVENTS);hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);
++    check(physical(key.vk,key.scan,false)==1 && attempts.size()==1 && nativeUps(key.vk)==1 && menuActivations==0,
++          "local-origin roundtrip and repeat retain the crossing mark until native up");
++
++    reset(hook,kHOOK_RELAY_EVENTS);
++    physical(key.vk,key.scan,true);hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    check(physical(key.vk,key.scan,true)==0,"a repeated down returned home is still passed according to the original mode");
++    check(physical(key.vk,key.scan,false)==1 && attempts.size()==1 && nativeUps(key.vk)==1 && !nativeDown[key.vk],
++          "returned remote repeat upgrades actual native ownership without losing the crossing mark");
++
++    for(UINT accepted:{0u,1u,2u}) {
++      reset(hook,kHOOK_WATCH_JUMP_ZONE);
++      physical(key.vk,key.scan,true);hook.setMode(kHOOK_RELAY_EVENTS);acceptedPlan={accepted};
++      check(physical(key.vk,key.scan,false)==0 && nativeUps(key.vk)==1 && !nativeDown[key.vk],
++            "partial or failed replacement always falls through the real modifier up exactly once");
++      check(!nativeDown[deskflow::win32::kMenuMaskVirtualKey],"a partial E8 down is paired with cleanup up");
++      check(attempts.size()==(accepted==1 ? 2u:1u) && postedUps(key.vk,true)==1,
++            "partial replacement retries only E8 cleanup and preserves the normal Main release");
++    }
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);hook.setMode(kHOOK_RELAY_EVENTS);acceptedPlan={1,0};
++    check(physical(key.vk,key.scan,false)==0 && nativeUps(key.vk)==1 && !nativeDown[key.vk],
++          "failure of the E8 cleanup request still cannot consume the real modifier up");
++    check(attempts.size()==2 && attempts[1].size()==1 && attempts[1][0].ki.wVk==deskflow::win32::kMenuMaskVirtualKey &&
++          attempts[1][0].ki.dwExtraInfo==deskflow::win32::kMenuMaskTag && (attempts[1][0].ki.dwFlags&KEYEVENTF_KEYUP)!=0,
++          "partial cleanup attempts only the tagged E8 up and never releases unrelated modifiers");
++
++    reset(hook,kHOOK_RELAY_EVENTS);
++    physical(key.vk,key.scan,true);hook.uninstall();hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    g_keyboardLL=reinterpret_cast<HHOOK>(1);g_mouseLL=reinterpret_cast<HHOOK>(1);
++    physical(key.vk,key.scan,true);
++    check(physical(key.vk,key.scan,false)==0 && attempts.empty() && menuActivations==1 && !nativeDown[key.vk],
++          "an unobserved remote up across uninstall cannot capture a new normal local tap forever");
++
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);hook.setMode(kHOOK_RELAY_EVENTS);hook.uninstall();hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    g_keyboardLL=reinterpret_cast<HHOOK>(1);g_mouseLL=reinterpret_cast<HHOOK>(1);
++    physical(key.vk,key.scan,true);
++    check(physical(key.vk,key.scan,false)==1 && nativeUps(key.vk)==1 && menuActivations==0,
++          "a native modifier still held across reinstall keeps its crossing repair after a repeat");
++  }
++
++  for(EHookMode mode:{kHOOK_WATCH_JUMP_ZONE,kHOOK_RELAY_EVENTS}) {
++    reset(hook,mode);
++    check(physical(VK_LMENU,0x38,false)==(mode==kHOOK_RELAY_EVENTS?1:0) && attempts.empty(),
++          "unknown modifier up preserves the original local or relay behavior");
++  }
++  for(const auto &key:keys) {
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    INPUT injection{};injection.type=INPUT_KEYBOARD;injection.ki.wVk=key.vk;
++    injection.ki.wScan=static_cast<WORD>(key.scan&255u);
++    deliverInjected(injection);
++    check(g_menuKeyOwnership.release(key.vk,key.scan).origin==MenuKeyOwnership::Unknown,
++          "injected down cannot claim physical menu ownership");
++
++    reset(hook,kHOOK_RELAY_EVENTS);
++    physical(key.vk,key.scan,true);injection.ki.dwFlags=KEYEVENTF_KEYUP;
++    deliverInjected(injection);hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++    check(physical(key.vk,key.scan,false)==1 && nativeUps(key.vk)==0,
++          "an injected up cannot consume the original physical remote-down ownership");
++  }
++  for(const Case key:std::vector<Case>{{VK_LCONTROL,0x1d},{VK_RCONTROL,0x11d},{VK_LSHIFT,0x2a},{VK_RSHIFT,0x36}}) {
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);hook.setMode(kHOOK_RELAY_EVENTS);
++    check(physical(key.vk,key.scan,false)==0 && nativeUps(key.vk)==1 && attempts.empty(),
++          "menu masking does not alter Ctrl or Shift handoff release behavior");
++  }
++  reset(hook,kHOOK_RELAY_EVENTS);
++  for(bool down:{false,true}) {
++    auto input=deskflow::win32::makeMenuMaskKey(down);
++    const auto before=posted.size();
++    check(deliverInjected(input)==0 && posted.size()==before,"only exact own E8 injection bypasses relay without posting a key");
++  }
++  for(int variant:{0,1,2,3}) {
++    KBDLLHOOKSTRUCT event{};event.vkCode=deskflow::win32::kMenuMaskVirtualKey;
++    event.dwExtraInfo=deskflow::win32::kMenuMaskTag;event.flags=LLKHF_INJECTED;
++    if(variant==0) event.vkCode=VK_LMENU;
++    if(variant==1) event.scanCode=1;
++    if(variant==2) event.flags=0;
++    if(variant==3) event.dwExtraInfo=0;
++    check(!deskflow::win32::isTaggedMenuMask(event),"menu mask recognition rejects other keys, scans, hardware and ordinary injections");
++    const auto before=posted.size();
++    check(keyboardLLHook(HC_ACTION,WM_KEYDOWN,reinterpret_cast<LPARAM>(&event))==1 && posted.size()>before,
++          "invalid mask tags actually follow production relay instead of bypassing the hook");
++  }
++  std::printf("PASS: %d production source menu-handoff checks; no real hooks or desktop input.\n",checks);
++}
+diff --git a/tools/test-menu-handoff.ps1 b/tools/test-menu-handoff.ps1
+new file mode 100644
+--- /dev/null
++++ b/tools/test-menu-handoff.ps1
+@@ -0,0 +1,30 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：仅写入离线测试产物，不安装钩子或发送桌面输入。
++    [string]$BuildDir = "$env:TEMP\moonlight-menu-handoff-tests",
++    # QtRoot：与随附核心匹配的 MSVC Qt SDK。
++    [string]$QtRoot = 'D:\tmp\codex-deskflow-sdk\Qt\6.10.1\msvc2022_64',
++    # CoreBuildDir：已经生成配置头文件的随附核心构建目录。
++    [string]$CoreBuildDir = 'D:\tmp\codex-deskflow-sdk\build-modifiers-msvc'
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$msvc = (Get-ChildItem -LiteralPath 'C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC' -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdk = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object {Test-Path -LiteralPath "$($_.FullName)\um\Windows.h"} |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvc -or !$sdk) {throw 'MSVC or Windows SDK is missing.'}
++$env:INCLUDE = "$msvc\include;$sdkRoot\Include\$sdk\ucrt;$sdkRoot\Include\$sdk\shared;$sdkRoot\Include\$sdk\um"
++$env:LIB = "$msvc\lib\x64;$sdkRoot\Lib\$sdk\ucrt\x64;$sdkRoot\Lib\$sdk\um\x64"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++& "$msvc\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD /O2 /Gy `
++    /DUNICODE /D_UNICODE /DSYSAPI_WIN32 /DWINAPI_MSWINDOWS /DHAVE_FORMAT /DQT_NO_KEYWORDS `
++    /DQT_NO_VERSION_TAGGING /D_CRT_SECURE_NO_WARNINGS /DNDEBUG `
++    "/I$sourceRoot\src\lib" "/I$CoreBuildDir\src\lib" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" `
++    "$PSScriptRoot\test-menu-handoff.cpp" "/Fe:$BuildDir\test-menu-handoff.exe" "/Fo:$BuildDir\test-menu-handoff.obj" `
++    /link /OPT:REF user32.lib
++if ($LASTEXITCODE -ne 0) {throw 'Source menu-handoff tests did not compile.'}
++& "$BuildDir\test-menu-handoff.exe"
++if ($LASTEXITCODE -ne 0) {throw 'Source menu-handoff tests failed.'}
+diff --git a/tools/test-receiver-menu.cpp b/tools/test-receiver-menu.cpp
+new file mode 100644
+--- /dev/null
++++ b/tools/test-receiver-menu.cpp
+@@ -0,0 +1,413 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include "deskflow/KeyState.h"
++#include "base/Log.h"
++#include "platform/MSWindowsHook.h"
++#include "platform/MSWindowsMenuMask.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <stdexcept>
++#include <thread>
++#include <vector>
++
++namespace {
++struct Modifier { KeyID id; KeyButton button; KeyModifierMask mask; WORD virtualKey = 0; };
++constexpr std::array menuModifiers{
++    Modifier{kKeyAlt_L, 0x38, KeyModifierAlt, VK_LMENU},
++    Modifier{kKeyAlt_R, 0x138, KeyModifierAlt | KeyModifierAltGr, VK_RMENU},
++    Modifier{kKeyAltGr, 0x139, KeyModifierAltGr, VK_RMENU},
++    Modifier{kKeySuper_L, 0x15b, KeyModifierSuper, VK_LWIN},
++    Modifier{kKeySuper_R, 0x15c, KeyModifierSuper, VK_RWIN},
++    Modifier{kKeyMeta_L, 0x160, KeyModifierMeta, VK_LWIN},
++    Modifier{kKeyMeta_R, 0x161, KeyModifierMeta, VK_RWIN},
++};
++}
++#include "menu-emulation-scope.inc"
++namespace {
++struct NativeKey
++{
++  WORD vk;
++  WORD scan;
++  DWORD flags;
++  bool repeat;
++  bool operator==(const NativeKey &) const = default;
++};
++struct Trace
++{
++  bool mask;
++  WORD vk;
++  DWORD flags;
++};
++struct Boundary
++{
++  UINT inserted = 2;
++  UINT cleanupInserted = 1;
++  int warnings = 0;
++  int masks = 0;
++  int cleanups = 0;
++  int updates = 0;
++  unsigned maxDepth = 0;
++  bool desktopThread = false;
++  bool throwMask = false;
++  std::vector<std::string> order;
++  std::vector<INPUT> input;
++  std::vector<NativeKey> keys;
++  std::vector<Trace> trace;
++} boundary;
++int checks = 0;
++
++// 参数 success：断言结果；message：失败行为描述。
++void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
++}
++
++// 参数 count/input/size：实际桌面分支要注入的批次；仅记录，不调用 Windows 输入。
++UINT WINAPI recordInput(UINT count, LPINPUT input, int size)
++{
++  if (count == 1) {
++    ++boundary.cleanups;
++    boundary.order.emplace_back("cleanup");
++    check(boundary.desktopThread && size == sizeof(INPUT) && input[0].type == INPUT_KEYBOARD &&
++          input[0].ki.wVk == deskflow::win32::kMenuMaskVirtualKey && input[0].ki.wScan == 0 &&
++          input[0].ki.dwFlags == KEYEVENTF_KEYUP && input[0].ki.dwExtraInfo == deskflow::win32::kMenuMaskTag,
++          "partial mask cleanup retries only the same tagged E8 release");
++    return boundary.cleanupInserted;
++  }
++  check(boundary.desktopThread && count == 2 && size == sizeof(INPUT),
++        "receiver mask is one paired batch in the active desktop dispatch");
++  ++boundary.masks;
++  boundary.maxDepth = std::max(boundary.maxDepth, g_menuReleaseMaskDepth);
++  if (boundary.throwMask) throw std::runtime_error("simulated mask boundary failure");
++  boundary.order.emplace_back("mask");
++  boundary.trace.push_back({true, deskflow::win32::kMenuMaskVirtualKey, 0});
++  boundary.input.assign(input, input + count);
++  for (UINT i = 0; i < count; ++i) {
++    check(input[i].type == INPUT_KEYBOARD && input[i].ki.wVk == deskflow::win32::kMenuMaskVirtualKey &&
++          input[i].ki.wScan == 0 && input[i].ki.time == 0 &&
++          input[i].ki.dwExtraInfo == deskflow::win32::kMenuMaskTag &&
++          input[i].ki.dwFlags == (i == 0 ? 0u : KEYEVENTF_KEYUP),
++          "receiver sends only zero-initialized E8 down/up with the dedicated tag");
++  }
++  return boundary.inserted;
++}
++void WINAPI recordError(DWORD) {}
++DWORD WINAPI readError() { return ERROR_ACCESS_DENIED; }
++
++// 参数 map：真实键盘映射，不替换生产 KeyMap::mapKey。
++void populateMap(deskflow::KeyMap &map)
++{
++  for (const auto &modifier : menuModifiers) {
++    deskflow::KeyMap::KeyItem item{};
++    item.m_id = modifier.id; item.m_button = modifier.button;
++    item.m_generates = modifier.mask; item.m_client = modifier.virtualKey;
++    map.addKeyEntry(item);
++  }
++  for (const auto &modifier : std::array{
++      Modifier{kKeyControl_L, 0x1d, KeyModifierControl, VK_LCONTROL},
++      Modifier{kKeyShift_L, 0x2a, KeyModifierShift, VK_LSHIFT}}) {
++    deskflow::KeyMap::KeyItem item{};
++    item.m_id = modifier.id; item.m_button = modifier.button;
++    item.m_generates = modifier.mask; item.m_client = modifier.virtualKey;
++    map.addKeyEntry(item);
++  }
++  for (const auto &ordinary : std::array{Modifier{kKeyTab, 0x0f, 0, VK_TAB}, Modifier{'f', 0x21, 0, 'F'}}) {
++    deskflow::KeyMap::KeyItem item{};
++    item.m_id = ordinary.id; item.m_button = ordinary.button; item.m_client = ordinary.virtualKey;
++    map.addKeyEntry(item);
++  }
++  map.finish();
++}
++
++class ReceiverState : public KeyState
++{
++public:
++  explicit ReceiverState(deskflow::KeyMap &map) : KeyState(nullptr, map, {"en"}, false) {}
++  KeyButtonSet systemDown;
++  int released = 0;
++  int32_t pollActiveGroup() const override { return 0; }
++  KeyModifierMask pollActiveModifiers() const override
++  {
++    KeyModifierMask mask = 0;
++    for (const auto &modifier : menuModifiers) {
++      if (getKeyState(modifier.button) > 0) mask |= modifier.mask;
++    }
++    if (getKeyState(0x1d) > 0) mask |= KeyModifierControl;
++    if (getKeyState(0x2a) > 0) mask |= KeyModifierShift;
++    return mask;
++  }
++  bool fakeCtrlAltDel() override { return false; }
++  void pollPressedKeys(KeyButtonSet &keys) const override { keys = systemDown; }
++  void physical(KeyButton button)
++  {
++    systemDown.insert(button);
++    onKey(button, true, pollActiveModifiers());
++  }
++protected:
++  void getKeyMap(deskflow::KeyMap &) override {}
++  void fakeKey(const Keystroke &key) override
++  {
++    if (key.m_type != Keystroke::KeyType::Button) return;
++    if (key.m_data.m_button.m_press) systemDown.insert(key.m_data.m_button.m_button);
++    else { systemDown.erase(key.m_data.m_button.m_button); ++released; boundary.order.emplace_back("up"); }
++  }
++};
++}
++
++class MSWindowsDesks
++{
++public:
++  void maskMenuActivation() const;
++  void sendMessage(UINT message, WPARAM w, LPARAM l) const;
++  void fakeKeyEvent(WORD vk, WORD scan, DWORD flags, bool repeat) const
++  {
++    boundary.maxDepth = std::max(boundary.maxDepth, g_menuReleaseMaskDepth);
++    boundary.keys.push_back({vk, scan, flags, repeat});
++    boundary.trace.push_back({false, vk, flags});
++  }
++};
++class MSWindowsKeyState : public KeyState
++{
++public:
++  MSWindowsKeyState(deskflow::KeyMap &map, MSWindowsDesks &desks) : KeyState(nullptr, map, {"en"}, false), m_desks(&desks) {}
++  void fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang) override;
++  bool fakeKeyRepeat(KeyID id, KeyModifierMask mask, int32_t count, KeyButton button, const std::string &lang) override;
++  void reconcileKeyRelease(KeyID id, KeyModifierMask mask) override;
++  bool fakeCtrlAltDel() override { return false; }
++  int32_t pollActiveGroup() const override { return 0; }
++  KeyModifierMask pollActiveModifiers() const override { return getActiveModifiers(); }
++  void pollPressedKeys(KeyButtonSet &) const override {}
++protected:
++  void getKeyMap(deskflow::KeyMap &) override {}
++  void fakeKey(const Keystroke &keystroke) override;
++private:
++  void setWindowGroup(int32_t) {}
++  MSWindowsDesks *m_desks;
++};
++class PlatformScreen
++{
++public:
++  KeyState *m_keyState;
++  void fakeAllKeysUp() { boundary.order.emplace_back("release"); m_keyState->fakeAllKeysUp(); }
++  bool fakeKeyUp(KeyButton button) { return m_keyState->fakeKeyUp(button); }
++};
++class MSWindowsScreen : public PlatformScreen
++{
++public:
++  bool m_isPrimary = false;
++  MSWindowsDesks *m_desks;
++  void fakeAllKeysUp();
++  bool fakeKeyUp(KeyButton button);
++  void updateMouseKeys() { ++boundary.updates; }
++};
++
++// 提取生产方法和实际桌面消息分支，仅替换其操作系统边界。
++#undef LOG_WARN
++#define LOG_WARN(...) (++boundary.warnings)
++#undef LOG
++#define LOG(...) ((void)0)
++#undef LOG_DEBUG1
++#define LOG_DEBUG1(...) ((void)0)
++#define SendInput recordInput
++#define SetLastError recordError
++#define GetLastError readError
++#include "receiver-menu-production.inc"
++
++int main()
++{
++  Log log;
++  deskflow::KeyMap map;
++  populateMap(map);
++  MSWindowsDesks desks;
++  for (const auto &modifier : menuModifiers) {
++    for (UINT result : {0u, 1u, 2u}) {
++      boundary = {}; boundary.inserted = result;
++      ReceiverState state(map);
++      state.fakeKeyDown(modifier.id, modifier.mask, 0x70, "en");
++      check(state.hasRelayMenuModifier(), "owned nonlocking menu modifier requires receiver handoff masking");
++      boundary.order.clear();
++      MSWindowsScreen screen; screen.m_keyState = &state; screen.m_desks = &desks;
++      screen.fakeAllKeysUp();
++      const auto release = std::find(boundary.order.begin(), boundary.order.end(), "release");
++      check(boundary.masks == 1 && boundary.order[0] == "mask" && release != boundary.order.end() &&
++            release + 1 != boundary.order.end() && *(release + 1) == "up",
++            "receiver masks before releasing its modifier, including failed or partial injection");
++      check(state.released == 1 && !state.systemDown.contains(modifier.button) && !state.hasRelayMenuModifier(),
++            "normal release proceeds after every mask attempt and clears relay menu ownership");
++      check(boundary.warnings == (result == 2 ? 0 : 1), "mask failure is reported without abandoning modifier cleanup");
++      check(boundary.cleanups == (result == 1 ? 1 : 0), "only a partial mask batch needs neutral-key release cleanup");
++      screen.fakeAllKeysUp();
++      check(boundary.masks == 1 && state.released == 1, "duplicate receiver cleanup cannot repeat mask or key-up");
++    }
++
++    boundary = {};
++    ReceiverState normal(map);
++    normal.fakeKeyDown(modifier.id, modifier.mask, 0x70, "en");
++    MSWindowsScreen normalScreen; normalScreen.m_keyState = &normal; normalScreen.m_desks = &desks;
++    check(normalScreen.fakeKeyUp(0x70) && boundary.masks == 0,
++          "same-screen Alt or Win tap uses the original release path and is not masked");
++
++    boundary = {};
++    ReceiverState primary(map);
++    primary.fakeKeyDown(modifier.id, modifier.mask, 0x70, "en");
++    MSWindowsScreen primaryScreen; primaryScreen.m_keyState = &primary; primaryScreen.m_desks = &desks;
++    primaryScreen.m_isPrimary = true;
++    primaryScreen.fakeAllKeysUp();
++    check(boundary.masks == 0 && primary.released == 1, "primary cleanup cannot activate the receiver mask path");
++
++    ReceiverState physical(map);
++    physical.fakeKeyDown(modifier.id, modifier.mask, 0x70, "en");
++    physical.physical(modifier.button);
++    check(!physical.hasRelayMenuModifier(), "observed physical takeover never requires a relay menu mask");
++
++    ReceiverState refreshed(map);
++    refreshed.fakeKeyDown(modifier.id, modifier.mask, 0x70, "en");
++    refreshed.updateKeyState();
++    check(refreshed.hasRelayMenuModifier(), "ownership refresh retains an outstanding receiver menu modifier");
++  }
++  for (const auto &modifier : std::array{
++      Modifier{kKeyControl_L, 0x1d, KeyModifierControl}, Modifier{kKeyShift_L, 0x2a, KeyModifierShift}}) {
++    boundary = {};
++    ReceiverState ordinary(map);
++    ordinary.fakeKeyDown(modifier.id, modifier.mask, 0x70, "en");
++    MSWindowsScreen screen; screen.m_keyState = &ordinary; screen.m_desks = &desks;
++    screen.fakeAllKeysUp();
++    check(boundary.masks == 0 && ordinary.released == 1, "Ctrl-only or Shift-only cleanup is not menu masking");
++  }
++
++  deskflow::KeyMap lockedMap;
++  deskflow::KeyMap::KeyItem lock{};
++  lock.m_id = kKeyAlt_L; lock.m_button = 0x38; lock.m_generates = KeyModifierAlt;
++  lock.m_lock = true; lock.m_client = 0x38;
++  lockedMap.addKeyEntry(lock); lockedMap.finish();
++  ReceiverState locked(lockedMap);
++  locked.fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++  check(locked.systemDown.contains(0x38) && locked.isKeyDown(0x38),
++        "locking modifier fixture still establishes a mapped relay key-down");
++  check(!locked.hasRelayMenuModifier(), "a locking modifier is excluded even when it generates the Alt bit");
++
++  ReceiverState alreadyPhysical(map);
++  alreadyPhysical.physical(0x38);
++  alreadyPhysical.fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++  check(!alreadyPhysical.hasRelayMenuModifier(),
++        "a remote shortcut cannot gain menu masking ownership of an already physical Alt");
++
++  boundary = {}; boundary.inserted = 1; boundary.cleanupInserted = 0;
++  ReceiverState failedCleanup(map);
++  failedCleanup.fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++  MSWindowsScreen failureScreen; failureScreen.m_keyState = &failedCleanup; failureScreen.m_desks = &desks;
++  failureScreen.fakeAllKeysUp();
++  check(boundary.cleanups == 1 && boundary.warnings == 2 && failedCleanup.released == 1,
++        "failed partial-batch neutral cleanup is logged and cannot swallow the real modifier release");
++
++  // 下列场景执行真实 KeyMap 及提取的 Windows wrappers/fakeKey，不复制转换算法。
++  boundary = {};
++  {
++    MSWindowsKeyState unmasked(map, desks);
++    unmasked.KeyState::fakeKeyDown(kKeyControl_L, 0, 0x70, "en");
++    unmasked.KeyState::fakeKeyDown(kKeyShift_L, KeyModifierAlt | KeyModifierShift, 0x71, "en");
++  }
++  const auto originalShiftSequence = boundary.keys;
++  check(std::any_of(originalShiftSequence.begin(), originalShiftSequence.end(), [](const auto &key) {
++          return key.vk == VK_LMENU && (key.flags & KEYEVENTF_KEYUP) != 0;
++        }), "real KeyMap Shift-with-Alt mapping contains the temporary Alt release reported in the field");
++  boundary = {};
++  {
++    MSWindowsKeyState scoped(map, desks);
++    scoped.fakeKeyDown(kKeyControl_L, 0, 0x70, "en");
++    scoped.fakeKeyDown(kKeyShift_L, KeyModifierAlt | KeyModifierShift, 0x71, "en");
++  }
++  check(boundary.keys == originalShiftSequence, "temporary masking preserves the complete generated native key sequence");
++  int temporaryUps = 0;
++  for (size_t i = 0; i < boundary.trace.size(); ++i) {
++    const auto &event = boundary.trace[i];
++    if (!event.mask && event.vk == VK_LMENU && (event.flags & KEYEVENTF_KEYUP) != 0) {
++      ++temporaryUps;
++      check(i != 0 && boundary.trace[i - 1].mask, "every internally generated Alt-up is immediately preceded by neutral masking");
++    }
++  }
++  check(temporaryUps > 0 && boundary.masks == temporaryUps && g_menuReleaseMaskDepth == 0,
++        "only temporary Alt releases are masked and the wrapper scope is restored");
++
++  boundary = {};
++  MSWindowsKeyState repeated(map, desks);
++  repeated.fakeKeyDown(kKeyShift_L, KeyModifierAlt | KeyModifierShift, 0x70, "en");
++  const int beforeRepeat = boundary.masks;
++  check(repeated.fakeKeyRepeat(kKeyShift_L, KeyModifierAlt | KeyModifierShift, 2, 0x70, "en"),
++        "Windows repeat wrapper keeps the real repeat mapping");
++  check(boundary.masks > beforeRepeat && g_menuReleaseMaskDepth == 0,
++        "repeat-generated temporary Alt-up is masked without leaving its scope active");
++  boundary.maxDepth = 0;
++  repeated.fakeKeyDown(kKeyShift_L, KeyModifierAlt | KeyModifierShift, 0x70, "en");
++  check(boundary.maxDepth >= 2 && g_menuReleaseMaskDepth == 0,
++        "duplicate down can nest through the virtual repeat wrapper and still restores scope depth");
++
++  boundary = {};
++  MSWindowsKeyState implicit(map, desks);
++  implicit.fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++  boundary.keys.clear(); boundary.trace.clear();
++  implicit.reconcileKeyRelease(kKeyAlt_L, 0);
++  check(boundary.masks == 1 && !boundary.keys.empty() && boundary.keys.back().vk == VK_LMENU &&
++        (boundary.keys.back().flags & KEYEVENTF_KEYUP) != 0 && g_menuReleaseMaskDepth == 0,
++        "implicit modifier reconciliation masks its synthesized Alt release");
++
++  for (const auto &modifier : menuModifiers) {
++    boundary = {};
++    MSWindowsKeyState tap(map, desks);
++    tap.fakeKeyDown(modifier.id, modifier.mask, 0x70, "en");
++    check(tap.fakeKeyUp(0x70) && boundary.masks == 0,
++          "explicit same-screen Windows Alt or Win tap is never within the temporary-release scope");
++    tap.reconcileKeyRelease(modifier.id, 0);
++    check(boundary.masks == 0, "reconciliation after an explicit tap does not add a second menu mask");
++  }
++
++  for (const auto &shortcut : std::array{Modifier{kKeyTab, 0x0f, 0, VK_TAB}, Modifier{'f', 0x21, 0, 'F'}}) {
++    boundary = {};
++    {
++      MSWindowsKeyState baseline(map, desks);
++      baseline.KeyState::fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++      baseline.KeyState::fakeKeyDown(shortcut.id, KeyModifierAlt, 0x71, "en");
++      baseline.fakeKeyUp(0x71); baseline.fakeKeyUp(0x70);
++    }
++    const auto original = boundary.keys;
++    boundary = {};
++    {
++      MSWindowsKeyState scoped(map, desks);
++      scoped.fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++      scoped.fakeKeyDown(shortcut.id, KeyModifierAlt, 0x71, "en");
++      scoped.fakeKeyUp(0x71); scoped.fakeKeyUp(0x70);
++    }
++    check(boundary.keys == original, "Alt-Tab and Alt-F retain the exact original generated key sequence");
++    check(boundary.masks == 0, "a real held-Alt shortcut is not treated as an artificial Alt release");
++  }
++
++  boundary = {}; boundary.throwMask = true;
++  bool threw = false;
++  try {
++    MSWindowsKeyState interrupted(map, desks);
++    interrupted.fakeKeyDown(kKeyShift_L, KeyModifierAlt | KeyModifierShift, 0x70, "en");
++  } catch (const std::runtime_error &) { threw = true; }
++  check(threw && g_menuReleaseMaskDepth == 0, "an exception at the desktop boundary unwinds the temporary menu scope");
++  boundary = {};
++  MSWindowsKeyState afterException(map, desks);
++  afterException.fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++  afterException.fakeKeyUp(0x70);
++  check(boundary.masks == 0, "an earlier failed emulation cannot mask a later ordinary Alt tap");
++  unsigned otherThreadDepth = 99;
++  {
++    MenuReleaseMaskScope outer;
++    std::thread other([&] { otherThreadDepth = g_menuReleaseMaskDepth; });
++    other.join();
++    check(otherThreadDepth == 0 && g_menuReleaseMaskDepth == 1,
++          "menu emulation depth is isolated per thread");
++  }
++  check(g_menuReleaseMaskDepth == 0, "the outer test scope restores its original depth");
++  std::printf("PASS: %d receiver menu handoff checks with real KeyMap/KeyState; no desktop input injected.\n", checks);
++}
+diff --git a/tools/test-receiver-menu.ps1 b/tools/test-receiver-menu.ps1
+new file mode 100644
+--- /dev/null
++++ b/tools/test-receiver-menu.ps1
+@@ -0,0 +1,73 @@
++﻿[CmdletBinding()]
++param(
++    # QtRoot：核心所用的 MSVC x64 Qt SDK。
++    [Parameter(Mandatory = $true)][string]$QtRoot,
++    # CoreBuildDir：未改动的日志等静态依赖目录。
++    [Parameter(Mandatory = $true)][string]$CoreBuildDir,
++    # BuildDir：仅保存离线测试产物，不安装钩子或注入真实输入。
++    [string]$BuildDir = "$env:TEMP\moonlight-receiver-menu-tests"
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory | Where-Object {Test-Path -LiteralPath "$($_.FullName)\um\Windows.h"} | Sort-Object Name -Descending | Select-Object -First 1).Name
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++$env:PATH = "$QtRoot\bin;$env:PATH"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++
++# Text/Signature：当前生产源码与精确函数声明，提取完整方法体而非维护逻辑副本。
++function Get-ProductionMethod([string]$Text, [string]$Signature) {
++    $offset = $Text.IndexOf($Signature + "`n{", [StringComparison]::Ordinal)
++    if ($offset -lt 0) { throw "Production method not found: $Signature" }
++    $brace = $Text.IndexOf('{', $offset); $depth = 0
++    for ($i = $brace; $i -lt $Text.Length; ++$i) {
++        if ($Text[$i] -eq '{') { ++$depth }
++        elseif ($Text[$i] -eq '}') { --$depth; if ($depth -eq 0) {return $Text.Substring($offset, $i - $offset + 1)} }
++    }
++    throw "Unclosed production method: $Signature"
++}
++$screen = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\platform\MSWindowsScreen.cpp')).Replace("`r`n", "`n")
++$desks = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\platform\MSWindowsDesks.cpp')).Replace("`r`n", "`n")
++$windows = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\platform\MSWindowsKeyState.cpp')).Replace("`r`n", "`n")
++$scope = [regex]::Match($windows, '(?s)namespace \{\s*thread_local unsigned g_menuReleaseMaskDepth.*?\n\}(?=\n)').Value
++if (!$scope) { throw 'Production menu release scope not found.' }
++[IO.File]::WriteAllText((Join-Path $BuildDir 'menu-emulation-scope.inc'), $scope, [Text.UTF8Encoding]::new($false))
++$repeat = [regex]::Match($windows, '(?s)bool MSWindowsKeyState::fakeKeyRepeat\(.*?\n\)').Value
++if (!$repeat) { throw 'Production Windows repeat wrapper not found.' }
++$methods = @(
++    Get-ProductionMethod $screen 'void MSWindowsScreen::fakeAllKeysUp()'
++    Get-ProductionMethod $screen 'bool MSWindowsScreen::fakeKeyUp(KeyButton button)'
++    Get-ProductionMethod $desks 'void MSWindowsDesks::maskMenuActivation() const'
++    Get-ProductionMethod $windows 'void MSWindowsKeyState::fakeKeyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang)'
++    Get-ProductionMethod $windows $repeat
++    Get-ProductionMethod $windows 'void MSWindowsKeyState::reconcileKeyRelease(KeyID id, KeyModifierMask mask)'
++    Get-ProductionMethod $windows 'void MSWindowsKeyState::fakeKey(const Keystroke &keystroke)'
++)
++$define = [regex]::Match($desks, '(?m)^#define DESKFLOW_MSG_MENU_MASK .+$').Value
++$case = [regex]::Match($desks, '(?s)    case DESKFLOW_MSG_MENU_MASK:.*?(?=    case DESKFLOW_MSG_FAKE_INPUT:)').Value
++if (!$define -or !$case) { throw 'Production menu mask desktop dispatch not found.' }
++$methods += @"
++void MSWindowsDesks::sendMessage(UINT message, WPARAM, LPARAM) const
++{
++  boundary.desktopThread = true;
++  switch (message) {
++$case
++  default: std::abort();
++  }
++  boundary.desktopThread = false;
++}
++"@
++[IO.File]::WriteAllText((Join-Path $BuildDir 'receiver-menu-production.inc'), $define + "`n" + ($methods -join "`n`n"), [Text.UTF8Encoding]::new($false))
++$support = Get-ChildItem -LiteralPath "$CoreBuildDir\src\lib" -Filter '*.lib' -Recurse | Select-Object -ExpandProperty FullName
++$sources = @('KeyState.cpp', 'KeyMap.cpp', 'IKeyState.cpp', 'KeyTypes.cpp') | ForEach-Object {"$sourceRoot\src\lib\deskflow\$_"}
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD /O2 /DNDEBUG `
++    "/I$sourceRoot\src\lib" "/I$BuildDir" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" "/I$QtRoot\include\QtNetwork" `
++    "$PSScriptRoot\test-receiver-menu.cpp" @sources "/Fe:$BuildDir\test-receiver-menu.exe" "/Fo:$BuildDir\\" `
++    /link @support "/LIBPATH:$QtRoot\lib" Qt6Core.lib Qt6Gui.lib Qt6Network.lib `
++    user32.lib advapi32.lib ws2_32.lib wtsapi32.lib iphlpapi.lib shell32.lib userenv.lib version.lib
++if ($LASTEXITCODE -ne 0) { throw 'Receiver menu mask tests did not compile.' }
++& "$BuildDir\test-receiver-menu.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Receiver menu mask tests failed.' }

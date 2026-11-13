@@ -117,6 +117,8 @@ public sealed class DeskflowStatus
     public bool? FilterHealthy { get; init; }
     /// <summary>Windows client: the core runs as SYSTEM and so also reaches the lock screen (null = not required / unknown).</summary>
     public bool? CoreAsSystem { get; init; }
+    /// <summary>Windows: every native core uses the runtime selected by this Hub; unknown image paths are false. Linux: null.</summary>
+    public bool? CoreInSelectedRuntime { get; init; }
     public bool F24Rule { get; init; }
     public bool Listening { get; init; }
     /// <summary>Server mode: connected clients; client mode: the server this computer is connected to.</summary>
@@ -651,6 +653,7 @@ public sealed class DeskflowManager : IDisposable
 
     private bool IsHealthy(DeskflowSettings s, DeskflowStatus st)
     {
+        if (s.Role != DeskflowRole.Off && OperatingSystem.IsWindows() && st.CoreInSelectedRuntime != true) return false;
         switch (s.Role)
         {
             case DeskflowRole.Off:
@@ -670,6 +673,8 @@ public sealed class DeskflowManager : IDisposable
         var parts = new List<string>();
         if (st.RunningRole != s.Role) parts.Add($"运行中={RoleName(st.RunningRole)} 期望={RoleName(s.Role)}");
         if (st.MainCores > 1) parts.Add($"有 {st.MainCores} 个 core 同时运行");
+        if (s.Role != DeskflowRole.Off && OperatingSystem.IsWindows() && st.CoreInSelectedRuntime != true)
+            parts.Add("核心路径待迁移到当前 Hub 随附组件");
         if (s.Role != DeskflowRole.Off && !st.SecurityOff) parts.Add("TLS / 指纹校验尚未关闭");
         else if (!ConfMatches(s, st)) parts.Add($"配置 coreMode={RoleName(st.ConfiguredRole)}{(s.Role == DeskflowRole.Client ? " remoteHost=" + st.RemoteHost : string.Empty)}");
         if (s.Role == DeskflowRole.Client && st.CoreAsSystem == false) parts.Add("客户端 core 未以 SYSTEM 运行，锁屏时无法输入");
@@ -709,6 +714,7 @@ public sealed class DeskflowManager : IDisposable
         }
 
         var filtered = wrappers.Count > 0;
+        var windowsHost = _host as DeskflowWindowsHost;
         var st = new DeskflowStatus
         {
             Installed = _host.Installed,
@@ -719,6 +725,8 @@ public sealed class DeskflowManager : IDisposable
             Filtered = filtered,
             FilterHealthy = role == DeskflowRole.Server && filtered ? _host.CheckFilter(cores) : null,
             CoreAsSystem = (_host as DeskflowWindowsHost)?.ClientCoreAsSystem(role, main?.Pid),
+            CoreInSelectedRuntime = DeskflowRuntimeLocator.UsesSelectedCore(windowsHost != null, windowsHost?.CoreExe,
+                cores.Where(c => !c.IsWrapper).Select(c => c.Path)),
             F24Rule = _host.F24RulePresent(),
             Listening = listening,
             Peers = peers,

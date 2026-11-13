@@ -1,0 +1,983 @@
+diff --git a/src/lib/deskflow/KeyState.cpp b/src/lib/deskflow/KeyState.cpp
+--- a/src/lib/deskflow/KeyState.cpp
++++ b/src/lib/deskflow/KeyState.cpp
+@@ -10,6 +10,7 @@
+ #include "base/Log.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstring>
+ #include <iterator>
+ #include <list>
+@@ -749,6 +750,23 @@
+ 
+ void KeyState::updateKeyState()
+ {
++  struct RelaySnapshot
++  {
++    int32_t down = 0;
++    int32_t synthetic = 0;
++    uint32_t client = 0;
++    KeyButton serverKey = 0;
++  };
++  std::array<RelaySnapshot, s_numButtons> relay{};
++  for (KeyButton button = 0; button < s_numButtons; ++button) {
++    relay[button].serverKey = m_serverKeys[button];
++    if (m_relayOwnedKeys[button] && m_syntheticKeys[button] > 0) {
++      relay[button].down = m_keys[button];
++      relay[button].synthetic = m_syntheticKeys[button];
++      relay[button].client = m_keyClientData[button];
++    }
++  }
++
+   // reset our state
+   memset(&m_keys, 0, sizeof(m_keys));
+   memset(&m_syntheticKeys, 0, sizeof(m_syntheticKeys));
+@@ -764,6 +782,25 @@
+     m_keys[key] = 1;
+   }
+ 
++  // 系统快照也包含本核心注入的按下，不能把它们重新归为实体键并丢掉释放映射。
++  // 只保留仍然按下且未被实体事件接管的接力键，不复活系统已报告松开的键。
++  uint32_t restored = 0;
++  for (KeyButton button = 0; button < s_numButtons; ++button) {
++    if (m_keys[button] != 0 && relay[button].synthetic > 0) {
++      m_keys[button] = relay[button].down;
++      m_syntheticKeys[button] = relay[button].synthetic;
++      m_keyClientData[button] = relay[button].client;
++      m_relayOwnedKeys[button] = true;
++      ++restored;
++    }
++  }
++  for (KeyButton button = 0; button < s_numButtons; ++button) {
++    const KeyButton local = relay[button].serverKey;
++    if (local != 0 && m_relayOwnedKeys[local]) {
++      m_serverKeys[button] = local;
++    }
++  }
++
+   // get the current modifier state
+   clearStaleModifiers();
+   m_mask = pollActiveModifiers();
+@@ -772,6 +809,9 @@
+   AddActiveModifierContext addModifierContext(pollActiveGroup(), m_mask, m_activeModifiers);
+   m_keyMap.foreachKey(&KeyState::addActiveModifierCB, &addModifierContext);
+ 
++  if (restored != 0) {
++    LOG_INFO("keyboard refresh retained %u relay-owned keys, modifiers=0x%04x", restored, m_mask);
++  }
+   LOG_DEBUG1("modifiers on update: 0x%04x", m_mask);
+ }
+ 
+diff --git a/src/lib/deskflow/Screen.cpp b/src/lib/deskflow/Screen.cpp
+--- a/src/lib/deskflow/Screen.cpp
++++ b/src/lib/deskflow/Screen.cpp
+@@ -9,6 +9,7 @@
+ #include "base/IEventQueue.h"
+ #include "base/Log.h"
+ #include "deskflow/IPlatformScreen.h"
++#include "deskflow/ModifierKeyRelease.h"
+ 
+ namespace deskflow {
+ 
+@@ -184,6 +185,9 @@
+ 
+ void Screen::keyDown(KeyID id, KeyModifierMask mask, KeyButton button, const std::string &lang)
+ {
++  if (releasedModifierMask(id) != 0) {
++    LOG_INFO("modifier receiver down=1 id=0x%04x scan=0x%03x mask=0x%04x", id, button, mask);
++  }
+   // check for ctrl+alt+del emulation
+   if (id == kKeyDelete && (mask & (KeyModifierControl | KeyModifierAlt)) == (KeyModifierControl | KeyModifierAlt)) {
+     LOG_DEBUG("emulating ctrl+alt+del press");
+@@ -202,8 +206,12 @@
+ 
+ void Screen::keyUp(KeyID id, KeyModifierMask mask, KeyButton button)
+ {
+-  m_screen->fakeKeyUp(button);
++  const bool mapped = m_screen->fakeKeyUp(button);
+   m_screen->reconcileKeyRelease(id, mask);
++  if (releasedModifierMask(id) != 0) {
++    LOG_INFO("modifier receiver down=0 id=0x%04x scan=0x%03x sourceMask=0x%04x mapped=%d remaining=0x%04x",
++             id, button, mask, mapped, m_screen->getActiveModifiers());
++  }
+ }
+ 
+ void Screen::mouseDown(ButtonID button)
+diff --git a/src/lib/server/Server.cpp b/src/lib/server/Server.cpp
+--- a/src/lib/server/Server.cpp
++++ b/src/lib/server/Server.cpp
+@@ -329,6 +329,11 @@
+   return m_lockedToScreen;
+ }
+ 
++bool Server::isMouseButtonHeld() const
++{
++  return m_pressedMouseButtons.any() || m_primaryClient->isLockedToScreen();
++}
++
+ bool Server::isLockedToScreen() const
+ {
+   if (m_disableLockToScreen) {
+@@ -364,6 +369,12 @@
+ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forScreensaver)
+ {
+   assert(dst != nullptr);
++
++  // 按住期间所有普通跨电脑入口都受保护；屏保安全归位和本机内移动仍可执行。
++  if (dst != m_active && !forScreensaver && isMouseButtonHeld()) {
++    stopSwitch();
++    return;
++  }
+ 
+   int32_t dx;
+   int32_t dy;
+@@ -448,6 +459,9 @@
+       }
+     }
+ #endif
++
++    // 安全切换后的新屏幕不能继承可能被 mark 过滤的旧按钮事件。
++    m_pressedMouseButtons.reset();
+ 
+     // cut over
+     m_active = dst;
+@@ -758,6 +772,12 @@
+     // there's no neighbor.  we don't want to switch and we don't
+     // want to try to switch later.
+     LOG_DEBUG1("no neighbor %s", Config::dirName(dir));
++    stopSwitch();
++    return false;
++  }
++
++  // 仅限制鼠标边缘跨电脑；同一电脑内的多屏移动不受影响。
++  if (newScreen != m_active && isMouseButtonHeld()) {
+     stopSwitch();
+     return false;
+   }
+@@ -1273,7 +1293,8 @@
+ void Server::handleSwitchWaitTimeout()
+ {
+   // ignore if mouse is locked to screen
+-  if (isLockedToScreen()) {
++  if (m_switchScreen == nullptr ||
++      (m_switchScreen != m_active && isMouseButtonHeld()) || isLockedToScreen()) {
+     LOG_DEBUG1("locked to screen");
+     stopSwitch();
+     return;
+@@ -1479,6 +1500,10 @@
+   LOG_DEBUG("onScreenSaver %s", activated ? "activated" : "deactivated");
+ 
+   if (activated) {
++    // 安全桌面可能收不到旧拖动的松开；丢弃旧队列状态，实际按住仍由平台快照保护。
++    m_pressedMouseButtons.reset();
++    stopSwitch();
++
+     // save current screen and position
+     m_activeSaver = m_active;
+     m_xSaver = m_x;
+@@ -1606,6 +1631,11 @@
+   LOG_DEBUG1("onMouseDown id=%d", id);
+   assert(m_active != nullptr);
+ 
++  if (id > kButtonNone && id < NumButtonIDs) {
++    m_pressedMouseButtons.set(id);
++    stopSwitch();
++  }
++
+   // relay
+   m_active->mouseDown(id);
+ }
+@@ -1614,6 +1644,10 @@
+ {
+   LOG_DEBUG1("onMouseUp id=%d", id);
+   assert(m_active != nullptr);
++
++  if (id > kButtonNone && id < NumButtonIDs) {
++    m_pressedMouseButtons.reset(id);
++  }
+ 
+   // relay
+   m_active->mouseUp(id);
+@@ -1635,8 +1669,12 @@
+     if (destination) {
+       auto *client = m_clients.find(destination->owner)->second;
+       if (client == m_active) { m_x = destination->x; m_y = destination->y; client->mouseMove(m_x, m_y); return false; }
+-      switchScreen(client, destination->x, destination->y, false);
+-      return true;
++      if (!isMouseButtonHeld()) {
++        switchScreen(client, destination->x, destination->y, false);
++        return true;
++      }
++      // 继续走当前显示器的 clamp，不保留对端目标或延时切屏。
++      stopSwitch();
+     }
+     if (const auto position = m_monitorRouter.clamp({getName(m_active), m_x, m_y, x, y})) {
+       m_x = position->x;
+@@ -1731,6 +1769,15 @@
+     }
+   }
+ 
++  if (isMouseButtonHeld()) {
++    const int32_t clampedX = std::clamp(m_x, ax, ax + aw - 1);
++    const int32_t clampedY = std::clamp(m_y, ay, ay + ah - 1);
++    if (clampedX != m_x || clampedY != m_y) {
++      m_x = clampedX;
++      m_y = clampedY;
++      m_active->mouseMove(m_x, m_y);
++    }
++  }
+   return false;
+ }
+ 
+@@ -1777,9 +1824,17 @@
+     const auto destination = m_monitorRouter.route({getName(m_active), m_x, m_y, m_x + dx, m_y + dy}, [this](const auto &name) { return m_clients.contains(name); });
+     if (destination) {
+       auto *client = m_clients.find(destination->owner)->second;
+-      if (client == m_active) { m_x = destination->x; m_y = destination->y; client->mouseMove(m_x, m_y); }
+-      else switchScreen(client, destination->x, destination->y, false);
+-      return;
++      if (client == m_active) {
++        m_x = destination->x;
++        m_y = destination->y;
++        client->mouseMove(m_x, m_y);
++        return;
++      }
++      if (!isMouseButtonHeld()) {
++        switchScreen(client, destination->x, destination->y, false);
++        return;
++      }
++      stopSwitch();
+     }
+     if (const auto position = m_monitorRouter.clamp({getName(m_active), m_x, m_y, m_x + dx, m_y + dy})) {
+       m_x = position->x;
+@@ -2075,9 +2130,7 @@
+     m_primaryClient->getCursorCenter(m_x, m_y);
+ 
+     // stop waiting to switch to this client
+-    if (active == m_switchScreen) {
+-      stopSwitch();
+-    }
++    stopSwitch();
+ 
+     // don't notify active screen since it has probably already
+     // disconnected.
+@@ -2086,6 +2139,9 @@
+          m_x, m_y)
+     );
+ 
++    // 断开时归位不能把已失去接收端的按钮状态留成永久锁。
++    m_pressedMouseButtons.reset();
++
+     // cut over
+     m_active = m_primaryClient;
+ 
+diff --git a/src/lib/server/Server.h b/src/lib/server/Server.h
+--- a/src/lib/server/Server.h
++++ b/src/lib/server/Server.h
+@@ -18,6 +18,7 @@
+ #include "deskflow/MouseTypes.h"
+ #include "server/Config.h"
+ 
++#include <bitset>
+ #include <climits>
+ #include <map>
+ #include <set>
+@@ -257,6 +258,9 @@
+   // options like switch delay and tracking any state required to
+   // implement them.  returns true iff a switch is permitted.
+   bool isSwitchOkay(BaseClientProxy *dst, Direction, int32_t x, int32_t y, int32_t xActive, int32_t yActive);
++
++  // 按钮事件按服务端队列顺序计数；平台快照补足重启或切屏标记期间尚未派发的按下。
++  bool isMouseButtonHeld() const;
+ 
+   // update switch state due to a mouse move at \p x, \p y that
+   // doesn't switch screens.
+@@ -470,6 +474,9 @@
+   // screen locking (former scroll lock)
+   bool m_lockedToScreen = false;
+ 
++  // 主线程已派发的鼠标按钮，避免稍后的物理松开提前解锁仍在队列中的拖动。
++  std::bitset<NumButtonIDs> m_pressedMouseButtons;
++
+   bool m_defaultLockToScreenState = false;
+   bool m_disableLockToScreen = false;
+   bool m_enableClipboard = true;
+diff --git a/tools/test-key-refresh.cpp b/tools/test-key-refresh.cpp
+new file mode 100644
+--- /dev/null
++++ b/tools/test-key-refresh.cpp
+@@ -0,0 +1,199 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "deskflow/KeyState.h"
++#include "base/Log.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++namespace {
++struct Modifier
++{
++  KeyID id;
++  KeyButton button;
++  KeyModifierMask mask;
++  uint32_t client;
++};
++constexpr std::array modifiers{
++    Modifier{kKeyControl_L, 0x1d, KeyModifierControl, 0xa2},
++    Modifier{kKeyControl_R, 0x11d, KeyModifierControl, 0xa3},
++    Modifier{kKeyAlt_L, 0x38, KeyModifierAlt, 0xa4},
++    Modifier{kKeyAlt_R, 0x138, KeyModifierAlt | KeyModifierAltGr, 0xa5},
++    Modifier{kKeyShift_L, 0x2a, KeyModifierShift, 0xa0},
++    Modifier{kKeyShift_R, 0x36, KeyModifierShift, 0xa1},
++    Modifier{kKeySuper_L, 0x15b, KeyModifierSuper, 0x5b},
++    Modifier{kKeySuper_R, 0x15c, KeyModifierSuper, 0x5c},
++};
++int checks = 0;
++
++// 参数 success：断言结果；message：失败时输出的行为说明。
++void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) {
++    std::fprintf(stderr, "FAIL: %s\n", message);
++    std::exit(1);
++  }
++}
++
++// 使用实际 KeyMap 查找、修饰状态映射和事件生成，不覆盖 mapKey。
++// 参数 map：填入真实左右修饰键映射，供生产 KeyMap 直接执行。
++void populateMap(deskflow::KeyMap &map)
++{
++  for (const auto &modifier : modifiers) {
++    deskflow::KeyMap::KeyItem item{};
++    item.m_id = modifier.id;
++    item.m_button = modifier.button;
++    item.m_generates = modifier.mask;
++    item.m_client = modifier.client;
++    map.addKeyEntry(item);
++  }
++  map.finish();
++}
++
++class RefreshState : public KeyState
++{
++public:
++  explicit RefreshState(deskflow::KeyMap &map) : KeyState(nullptr, map, {"en"}, false) {}
++  KeyButtonSet systemDown;
++  std::vector<deskflow::KeyMap::Keystroke::Button> emitted;
++
++  int32_t pollActiveGroup() const override { return 0; }
++  KeyModifierMask pollActiveModifiers() const override
++  {
++    KeyModifierMask mask = 0;
++    for (const auto &modifier : modifiers) {
++      if (getKeyState(modifier.button) > 0) mask |= modifier.mask;
++    }
++    return mask;
++  }
++  bool fakeCtrlAltDel() override { return false; }
++  void pollPressedKeys(KeyButtonSet &keys) const override { keys = systemDown; }
++
++  // 参数 button/down：模拟已由操作系统接收的真实实体事件，不注入桌面。
++  void physical(KeyButton button, bool down)
++  {
++    if (down) systemDown.insert(button);
++    else systemDown.erase(button);
++    onKey(button, down, pollActiveModifiers());
++  }
++
++  // 参数 button：需要统计释放次数的本地扫描码。
++  size_t upCount(KeyButton button) const
++  {
++    return std::count_if(emitted.begin(), emitted.end(), [button](const auto &event) {
++      return event.m_button == button && !event.m_press;
++    });
++  }
++
++protected:
++  void getKeyMap(deskflow::KeyMap &) override {}
++  void fakeKey(const Keystroke &key) override
++  {
++    if (key.m_type != Keystroke::KeyType::Button) return;
++    emitted.push_back(key.m_data.m_button);
++    if (key.m_data.m_button.m_press) systemDown.insert(key.m_data.m_button.m_button);
++    else systemDown.erase(key.m_data.m_button.m_button);
++  }
++};
++}
++
++int main()
++{
++  Log log;
++  deskflow::KeyMap map;
++  populateMap(map);
++  for (const auto &modifier : modifiers) {
++    // 来源扫描码刻意不等于本地扫描码，验证映射按来源索引保留。
++    constexpr KeyButton source = 0x70;
++    RefreshState state(map);
++    state.fakeKeyDown(modifier.id, modifier.mask, source, "en");
++    check(state.systemDown.contains(modifier.button), "real KeyMap emits the expected modifier down");
++    const auto eventsBefore = state.emitted.size();
++    state.updateKeyState();
++    check(state.emitted.size() == eventsBefore && state.systemDown.contains(modifier.button),
++          "refresh preserves a held remote key without injecting a release or another down");
++    check(state.fakeKeyUp(source), "source mapping survives refresh and accepts its explicit key-up");
++    check(!state.systemDown.contains(modifier.button) && !state.isKeyDown(modifier.button),
++          "explicit key-up clears both OS boundary and shadow state");
++    check(state.upCount(modifier.button) == 1 && state.emitted.back().m_client == modifier.client,
++          "refresh preserves release metadata and emits exactly one up");
++    check(!state.fakeKeyUp(source) && state.upCount(modifier.button) == 1,
++          "duplicate source key-up cannot release the key a second time");
++
++    RefreshState leave(map);
++    leave.fakeKeyDown(modifier.id, modifier.mask, source, "en");
++    leave.updateKeyState();
++    leave.fakeAllKeysUp();
++    check(!leave.systemDown.contains(modifier.button) && leave.upCount(modifier.button) == 1,
++          "screen leave still releases the owned modifier after a refresh");
++    check(!leave.fakeKeyUp(source) && leave.upCount(modifier.button) == 1,
++          "late source release after leave cannot replay an up");
++
++    RefreshState released(map);
++    released.fakeKeyDown(modifier.id, modifier.mask, source, "en");
++    released.systemDown.erase(modifier.button);
++    const auto releasedBefore = released.emitted.size();
++    released.updateKeyState();
++    check(!released.isKeyDown(modifier.button) && !released.fakeKeyUp(source),
++          "a key reported up by the OS is not resurrected or remapped");
++    released.fakeAllKeysUp();
++    check(released.emitted.size() == releasedBefore,
++          "refresh does not inject for an already released key");
++
++    RefreshState takeover(map);
++    takeover.fakeKeyDown(modifier.id, modifier.mask, source, "en");
++    takeover.physical(modifier.button, true);
++    const auto takeoverBefore = takeover.emitted.size();
++    takeover.updateKeyState();
++    check(takeover.isKeyDown(modifier.button) && !takeover.fakeKeyUp(source),
++          "an observed physical takeover is not restored to relay ownership");
++    takeover.reconcileKeyRelease(modifier.id, 0);
++    takeover.fakeAllKeysUp();
++    check(takeover.systemDown.contains(modifier.button) && takeover.emitted.size() == takeoverBefore,
++          "remote release and leave preserve the refreshed physical key");
++  }
++
++  RefreshState pair(map);
++  pair.fakeKeyDown(kKeyControl_L, KeyModifierControl, 0x70, "en");
++  pair.physical(0x2a, true);
++  const auto shiftUps = pair.upCount(0x2a);
++  pair.updateKeyState();
++  check(pair.fakeKeyUp(0x70) && !pair.systemDown.contains(0x1d), "mapped Ctrl releases after refresh");
++  check(pair.systemDown.contains(0x2a) && pair.upCount(0x2a) == shiftUps,
++        "releasing remote Ctrl preserves a separately held physical Shift");
++
++  RefreshState repeated(map);
++  repeated.fakeKeyDown(kKeyAlt_L, KeyModifierAlt, 0x70, "en");
++  for (int i = 0; i < 4; ++i) repeated.updateKeyState();
++  check(repeated.fakeKeyUp(0x70) && repeated.upCount(0x38) == 1,
++        "successive refreshes retain one release rather than accumulating key-down counts");
++
++  RefreshState aliases(map);
++  aliases.fakeKeyDown(kKeyControl_L, KeyModifierControl, 0x70, "en");
++  aliases.fakeKeyDown(kKeyControl_R, KeyModifierControl, 0x170, "en");
++  aliases.updateKeyState();
++  check(aliases.fakeKeyUp(0x70) && !aliases.systemDown.contains(0x1d) && aliases.systemDown.contains(0x11d),
++        "left source alias releases only the left key and retains the right companion");
++  check(aliases.fakeKeyUp(0x170) && !aliases.systemDown.contains(0x11d) &&
++        aliases.upCount(0x1d) == 1 && aliases.upCount(0x11d) == 1,
++        "both independent source aliases survive refresh and release once");
++  check(!aliases.fakeKeyUp(0x70) && !aliases.fakeKeyUp(0x170),
++        "duplicate alias releases cannot replay either side");
++
++  RefreshState takeoverAfterRefresh(map);
++  takeoverAfterRefresh.fakeKeyDown(kKeyControl_L, KeyModifierControl, 0x70, "en");
++  takeoverAfterRefresh.updateKeyState();
++  takeoverAfterRefresh.physical(0x1d, true);
++  takeoverAfterRefresh.updateKeyState();
++  const auto afterTakeover = takeoverAfterRefresh.emitted.size();
++  check(!takeoverAfterRefresh.fakeKeyUp(0x70), "a later refresh also honors physical takeover of a previously restored key");
++  takeoverAfterRefresh.reconcileKeyRelease(kKeyControl_L, 0);
++  takeoverAfterRefresh.fakeAllKeysUp();
++  check(takeoverAfterRefresh.systemDown.contains(0x1d) && takeoverAfterRefresh.emitted.size() == afterTakeover,
++        "restoring a remote key once never permanently grants ownership over future physical events");
++
++  std::printf("PASS: %d real KeyMap/KeyState ownership refresh checks; no desktop input injected.\n", checks);
++}
+diff --git a/tools/test-key-refresh.ps1 b/tools/test-key-refresh.ps1
+new file mode 100644
+--- /dev/null
++++ b/tools/test-key-refresh.ps1
+@@ -0,0 +1,38 @@
++﻿[CmdletBinding()]
++param(
++    # QtRoot：构建核心所用的 MSVC x64 Qt SDK。
++    [Parameter(Mandatory = $true)][string]$QtRoot,
++    # CoreBuildDir：核心静态库目录，提供未改动的日志等依赖。
++    [Parameter(Mandatory = $true)][string]$CoreBuildDir,
++    # BuildDir：只接收离线测试产物，不安装钩子或注入按键。
++    [string]$BuildDir = "$env:TEMP\moonlight-key-refresh-tests",
++    # KeyStateSource：可选的待测实现，用于对旧实现做失败验证；默认编译当前生产文件。
++    [string]$KeyStateSource
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++$env:PATH = "$QtRoot\bin;$env:PATH"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++$support = Get-ChildItem -LiteralPath "$CoreBuildDir\src\lib" -Filter '*.lib' -Recurse | Select-Object -ExpandProperty FullName
++if (!$KeyStateSource) { $KeyStateSource = Join-Path $sourceRoot 'src\lib\deskflow\KeyState.cpp' }
++$sources = @($KeyStateSource) + @('KeyMap.cpp', 'IKeyState.cpp', 'KeyTypes.cpp' | ForEach-Object {
++    "$sourceRoot\src\lib\deskflow\$_"
++})
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD /O2 /DNDEBUG `
++    "/I$sourceRoot\src\lib" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" "/I$QtRoot\include\QtNetwork" `
++    "$PSScriptRoot\test-key-refresh.cpp" @sources "/Fe:$BuildDir\test-key-refresh.exe" "/Fo:$BuildDir\\" `
++    /link @support "/LIBPATH:$QtRoot\lib" Qt6Core.lib Qt6Gui.lib Qt6Network.lib `
++    user32.lib advapi32.lib ws2_32.lib wtsapi32.lib iphlpapi.lib shell32.lib userenv.lib version.lib
++if ($LASTEXITCODE -ne 0) { throw 'Key ownership refresh tests did not compile.' }
++& "$BuildDir\test-key-refresh.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Key ownership refresh tests failed.' }
+diff --git a/tools/test-mouse-held.cpp b/tools/test-mouse-held.cpp
+new file mode 100644
+--- /dev/null
++++ b/tools/test-mouse-held.cpp
+@@ -0,0 +1,358 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "server/MonitorTopologyRouter.h"
++#include "base/DirectionTypes.h"
++#include "deskflow/MouseTypes.h"
++#include "deskflow/KeyTypes.h"
++#include <QCoreApplication>
++#include <QTemporaryFile>
++#include <array>
++#include <bitset>
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <string>
++#include <vector>
++
++// 执行当前生产 Server 方法；只模拟客户端/配置/计时器边界，不安装钩子或注入输入。
++#define LOG_DEBUG1(...) ((void)0)
++#define LOG_DEBUG2(...) ((void)0)
++#define LOG_DEBUG(...) ((void)0)
++#define LOG_INFO(...) ((void)0)
++#define LOG_WARN(...) ((void)0)
++#define LOG_NOTE(...) ((void)0)
++#define LOG_ERR(...) std::fprintf(stderr, __VA_ARGS__)
++#define LOG(...) ((void)0)
++
++namespace {
++int checks = 0;
++using ClipboardID = uint8_t;
++void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
++}
++struct Point { int32_t x, y; };
++struct FakeClipboard { std::string marshall() const { return {}; } };
++struct BaseClientProxy {
++  std::string name;
++  std::vector<Point> positions;
++  std::vector<ButtonID> pressed, released;
++  int enters = 0;
++  bool leaveAllowed = true;
++  explicit BaseClientProxy(const char *value) : name(value) {}
++  const std::string &getName() const { return name; }
++  void getShape(int32_t &x, int32_t &y, int32_t &width, int32_t &height) const
++  { x = y = 0; width = 300; height = 100; }
++  void mouseDown(ButtonID button) { pressed.push_back(button); }
++  void mouseUp(ButtonID button) { released.push_back(button); }
++  void mouseMove(int32_t x, int32_t y) { positions.push_back({x, y}); }
++  void mouseRelativeMove(int32_t, int32_t) { std::abort(); }
++  bool leave() const { return leaveAllowed; }
++  void enter(int32_t x, int32_t y, uint32_t, KeyModifierMask, bool)
++  { ++enters; positions.push_back({x, y}); }
++  void setClipboard(int, const FakeClipboard *) {}
++  void screensaver(bool) {}
++};
++struct PrimaryClient : BaseClientProxy {
++  bool platformHeld = false;
++  PrimaryClient() : BaseClientProxy("A") {}
++  bool isLockedToScreen() const { return platformHeld; }
++  int32_t getJumpZoneSize() const { return 1; }
++  KeyModifierMask getToggleMask() const { return 0; }
++  void getCursorCenter(int32_t &x, int32_t &y) const { x = y = 50; }
++  void reconfigure(uint32_t) {}
++};
++struct Config {
++  using ScreenOptions = std::map<int, int>;
++  const ScreenOptions *getOptions(const std::string &) const { return nullptr; }
++};
++constexpr int kOptionScreenSwitchCorners = 1, kOptionScreenSwitchCornerSize = 2;
++constexpr int kClipboardEnd = 2;
++enum class EventTypes { ServerScreenSwitched };
++struct Event {
++  template<class T> Event(EventTypes, void *, T *info) { delete info; }
++};
++struct EventQueue { void addEvent(Event) {} };
++}
++
++class Server {
++public:
++  using ClientList = std::map<std::string, BaseClientProxy *>;
++  struct SwitchToScreenInfo { explicit SwitchToScreenInfo(const std::string &) {} };
++  struct ClipboardInfo { FakeClipboard m_clipboard; std::string m_clipboardOwner; uint32_t m_clipboardSeqNum = 0; };
++  PrimaryClient *m_primaryClient;
++  BaseClientProxy *m_active;
++  BaseClientProxy *m_activeSaver = nullptr;
++  BaseClientProxy *m_switchScreen = nullptr;
++  std::map<std::string, BaseClientProxy *> m_clients;
++  MonitorTopologyRouter m_monitorRouter;
++  std::bitset<NumButtonIDs> m_pressedMouseButtons;
++  Config config;
++  Config *m_config = &config;
++  EventQueue events;
++  EventQueue *m_events = &events;
++  bool m_lockedToScreen = false, m_disableLockToScreen = false, m_defaultLockToScreenState = false;
++  bool m_relativeMoves = false, m_enableClipboard = false;
++  bool m_switchNeedsShift = false, m_switchNeedsControl = false, m_switchNeedsAlt = false;
++  double m_switchTwoTapDelay = 0, m_switchWaitDelay = 0;
++  Direction m_switchDir = Direction::NoDirection;
++  bool timer = false;
++  int startedTimers = 0;
++  int32_t m_x = 50, m_y = 50, m_xDelta = 0, m_yDelta = 0, m_xDelta2 = 0, m_yDelta2 = 0;
++  int32_t m_switchWaitX = 0, m_switchWaitY = 0;
++  int32_t m_xSaver = 0, m_ySaver = 0;
++  uint32_t m_seqNum = 0;
++  int m_maximumClipboardSize = 1024;
++  ClipboardInfo m_clipboards[kClipboardEnd];
++
++  Server(PrimaryClient &primary, BaseClientProxy &remote) : m_primaryClient(&primary), m_active(&primary)
++  { m_clients.emplace(primary.name, &primary); m_clients.emplace(remote.name, &remote); }
++  std::string getName(const BaseClientProxy *client) const { return client->name; }
++  int32_t getJumpZoneSize(const BaseClientProxy *client) const { return client == m_primaryClient ? 1 : 0; }
++  int getCorner(const BaseClientProxy *, int32_t, int32_t, int32_t) const { return 0; }
++  uint32_t getActivePrimarySides() const { return 0; }
++  bool isSwitchTwoTapStarted() const { return false; }
++  bool shouldSwitchTwoTap() const { return false; }
++  void startSwitchTwoTap() {}
++  void stopSwitchTwoTap() {}
++  bool isSwitchWaitStarted() const { return timer; }
++  void startSwitchWait(int32_t x, int32_t y) { timer = true; ++startedTimers; m_switchWaitX = x; m_switchWaitY = y; }
++  void stopSwitchWait() { timer = false; }
++  void noSwitch(int32_t, int32_t) { stopSwitchWait(); }
++  void onClipboardChanged(const BaseClientProxy *, int, uint32_t) {}
++
++  // 参数 client/dir/x/y：只提供旧布局的相邻电脑，真实切屏守卫由生产方法执行。
++  BaseClientProxy *mapToNeighbor(BaseClientProxy *client, Direction dir, int32_t &x, int32_t &y)
++  {
++    (void)y;
++    const auto destination = client == m_primaryClient ? m_clients.find("B") : m_clients.find("A");
++    if (destination == m_clients.end()) return nullptr;
++    if (dir == Direction::Right) x -= 300;
++    else if (dir == Direction::Left) x += 300;
++    return destination->second;
++  }
++  bool isLockedToScreenServer() const;
++  bool isLockedToScreen() const;
++  bool isMouseButtonHeld() const;
++  bool isSwitchOkay(BaseClientProxy *, Direction, int32_t, int32_t, int32_t, int32_t);
++  void stopSwitch();
++  void handleSwitchWaitTimeout();
++  void onMouseDown(ButtonID);
++  void onMouseUp(ButtonID);
++  bool onMouseMovePrimary(int32_t, int32_t);
++  void onMouseMoveSecondary(int32_t, int32_t);
++  void switchScreen(BaseClientProxy *, int32_t, int32_t, bool);
++  void forceLeaveClient(const BaseClientProxy *);
++  void onScreensaver(bool);
++};
++
++// 脚本从当前源文件提取完整方法体，禁止手工维护待测逻辑副本。
++#include "mouse-held-production.inc"
++
++// 参数 owner/nativeX/canvasX：所属电脑、本机像素原点及共享画布原点。
++QJsonObject monitor(const char *owner, int nativeX, int canvasX)
++{
++  return {{"owner", owner}, {"id", QString::number(nativeX)}, {"nativeX", nativeX}, {"nativeY", 0},
++          {"x", canvasX}, {"y", 0}, {"width", 100}, {"height", 100},
++          {"canvasWidth", 100}, {"canvasHeight", 100}, {"active", true}};
++}
++
++int main(int argc, char **argv)
++{
++  QCoreApplication application(argc, argv);
++  QTemporaryFile layout;
++  check(layout.open(), "layout fixture opens");
++  const QJsonArray monitors{monitor("A", 0, 0), monitor("A", 200, 100),
++                            monitor("B", 0, 200), monitor("B", 200, 300)};
++  layout.write(QJsonDocument(QJsonObject{{"monitors", monitors}}).toJson()); layout.flush();
++  qputenv("DESKFLOW_MONITOR_TOPOLOGY", layout.fileName().toUtf8());
++
++  for (ButtonID button = kButtonLeft; button < NumButtonIDs; ++button) {
++    PrimaryClient primary; BaseClientProxy remote("B"); Server server(primary, remote);
++    server.m_x = 299; server.m_y = 50;
++    server.m_switchScreen = &remote; server.timer = true;
++    server.onMouseDown(button);
++    check(server.isMouseButtonHeld() && !server.timer && server.m_switchScreen == nullptr,
++          "each valid press cancels an older pending cross-screen timer");
++    // 平台已提前读到松开，队列中先前的拖动仍应由服务端 FIFO 按钮记录保护。
++    check(!primary.platformHeld, "fixture exercises FIFO ownership without a current platform press");
++    check(!server.onMouseMovePrimary(304, 50) && server.m_active == &primary && server.m_x == 299,
++          "held primary motion cannot cross and remains on the current monitor edge");
++    check(remote.enters == 0 && remote.pressed.empty(), "blocked primary crossing never enters or clicks the peer");
++    server.onMouseUp(button);
++    check(!server.isMouseButtonHeld() && server.m_active == &primary && !server.timer,
++          "release removes ownership without starting a delayed or automatic crossing");
++    server.handleSwitchWaitTimeout();
++    check(server.m_active == &primary, "a stale timer after release has no destination to switch to");
++    check(server.onMouseMovePrimary(304, 50) && server.m_active == &remote,
++          "a new primary movement after release crosses normally");
++    check(primary.pressed == std::vector<ButtonID>{button} && primary.released == std::vector<ButtonID>{button},
++          "press and release both stay on the original computer");
++
++    PrimaryClient source; BaseClientProxy target("B"); Server reverse(source, target);
++    reverse.m_active = &target; reverse.m_x = 0; reverse.m_y = 50;
++    reverse.onMouseDown(button);
++    reverse.onMouseMoveSecondary(-5, 0);
++    check(reverse.m_active == &target && reverse.m_x == 0 && source.enters == 0,
++          "held remote motion cannot return to the source or move beyond the current monitor edge");
++    reverse.onMouseUp(button);
++    check(reverse.m_active == &target, "remote release alone does not cross back");
++    reverse.onMouseMoveSecondary(-5, 0);
++    check(reverse.m_active == &source, "new remote movement after release can return normally");
++    check(target.pressed == std::vector<ButtonID>{button} && target.released == std::vector<ButtonID>{button},
++          "remote drag press and release are delivered to the same peer");
++  }
++
++  PrimaryClient primary; BaseClientProxy remote("B"); Server combined(primary, remote);
++  combined.m_x = 299;
++  combined.onMouseDown(kButtonLeft); combined.onMouseDown(kButtonRight); combined.onMouseDown(kButtonExtra1);
++  combined.onMouseDown(kButtonLeft); // 重复按下不增加需要松开的次数。
++  combined.onMouseUp(kButtonLeft); combined.onMouseUp(kButtonExtra1);
++  check(combined.isMouseButtonHeld() && !combined.onMouseMovePrimary(304, 50),
++        "combinations remain locked until every distinct held button is released");
++  combined.onMouseUp(kButtonRight);
++  check(!combined.isMouseButtonHeld() && combined.onMouseMovePrimary(304, 50),
++        "the last distinct release restores crossing and duplicate downs do not create a stuck count");
++
++  // 五个有效按钮的全部非空组合，覆盖两个跨电脑方向。
++  for (bool fromRemote : {false, true}) {
++    for (unsigned combination = 1; combination < (1u << (NumButtonIDs - 1)); ++combination) {
++      PrimaryClient source; BaseClientProxy target("B"); Server sequence(source, target);
++      BaseClientProxy *origin = fromRemote ? &target : &source;
++      sequence.m_active = origin; sequence.m_x = fromRemote ? 0 : 299; sequence.m_y = 50;
++      for (ButtonID button = kButtonLeft; button < NumButtonIDs; ++button) {
++        if (combination & (1u << (button - 1))) sequence.onMouseDown(button);
++      }
++      unsigned remaining = combination;
++      for (ButtonID button = kButtonLeft; button < NumButtonIDs; ++button) {
++        if (!(combination & (1u << (button - 1)))) continue;
++        if (fromRemote) sequence.onMouseMoveSecondary(-5, 0);
++        else sequence.onMouseMovePrimary(304, 50);
++        check(sequence.m_active == origin, "every nonempty button combination keeps edge motion on its original owner");
++        sequence.onMouseUp(button); remaining &= ~(1u << (button - 1));
++        check(sequence.isMouseButtonHeld() == (remaining != 0), "each distinct release clears only its own combination bit");
++        check(sequence.m_active == origin, "no combination release crosses without a subsequent motion");
++      }
++      if (fromRemote) sequence.onMouseMoveSecondary(-5, 0);
++      else sequence.onMouseMovePrimary(304, 50);
++      check(sequence.m_active != origin, "all combinations restore edge crossing after their final release and a fresh movement");
++    }
++  }
++
++  PrimaryClient same; BaseClientProxy peer("B"); Server localDisplays(same, peer);
++  localDisplays.m_x = 99; localDisplays.m_y = 50; localDisplays.onMouseDown(kButtonLeft);
++  check(!localDisplays.onMouseMovePrimary(104, 50) && localDisplays.m_active == &same && localDisplays.m_x == 204,
++        "holding a button still permits routing between monitors owned by the same source computer");
++  localDisplays.m_active = &peer; localDisplays.m_x = 99; localDisplays.m_y = 50;
++  localDisplays.onMouseMoveSecondary(5, 0);
++  check(localDisplays.m_active == &peer && localDisplays.m_x == 204,
++        "holding a button still permits routing between monitors owned by the same remote computer");
++
++  PrimaryClient snapshot; BaseClientProxy other("B"); Server rawSnapshot(snapshot, other);
++  snapshot.platformHeld = true; rawSnapshot.m_x = 299;
++  check(!rawSnapshot.onMouseMovePrimary(304, 50), "platform snapshot protects a press not yet dispatched to Server");
++  snapshot.platformHeld = false;
++  check(rawSnapshot.onMouseMovePrimary(304, 50), "platform-only hold clears on its real release without a stale FIFO latch");
++
++  PrimaryClient explicitSource; BaseClientProxy explicitPeer("B"); Server explicitJump(explicitSource, explicitPeer);
++  explicitJump.onMouseDown(kButtonLeft); explicitSource.platformHeld = true;
++  explicitJump.m_switchScreen = &explicitPeer; explicitJump.timer = true;
++  explicitJump.switchScreen(&explicitPeer, 50, 50, false);
++  check(explicitJump.m_active == &explicitSource && explicitJump.m_pressedMouseButtons.test(kButtonLeft) &&
++        explicitPeer.enters == 0 && explicitJump.m_switchScreen == nullptr && !explicitJump.timer,
++        "keyboard and F24 jumps cannot bypass a held button or retain an automatic jump target");
++  check(explicitJump.m_x == 50 && explicitJump.m_y == 50,
++        "blocked explicit jumps cannot change the current pointer coordinates");
++  explicitSource.platformHeld = false;
++  explicitJump.switchScreen(&explicitPeer, 60, 60, false);
++  check(explicitJump.m_active == &explicitSource && explicitJump.isMouseButtonHeld(),
++        "a later platform release cannot unlock an earlier queued held-button jump");
++  explicitJump.onMouseUp(kButtonLeft);
++  check(explicitJump.m_active == &explicitSource, "releasing a blocked explicit jump does not execute it automatically");
++  explicitJump.switchScreen(&explicitPeer, 60, 60, false);
++  check(explicitJump.m_active == &explicitPeer && !explicitJump.isMouseButtonHeld(),
++        "a newly requested keyboard jump works after all buttons are released");
++
++  PrimaryClient sameOwnerSource; BaseClientProxy sameOwnerPeer("B"); Server sameOwnerWarp(sameOwnerSource, sameOwnerPeer);
++  sameOwnerWarp.onMouseDown(kButtonRight);
++  sameOwnerWarp.switchScreen(&sameOwnerSource, 250, 50, false);
++  check(sameOwnerWarp.m_active == &sameOwnerSource && sameOwnerWarp.m_x == 250 &&
++        sameOwnerWarp.m_pressedMouseButtons.test(kButtonRight),
++        "same-owner explicit warps remain allowed without losing the held-button state");
++
++  PrimaryClient saverSource; BaseClientProxy saverPeer("B"); Server safetyReturn(saverSource, saverPeer);
++  safetyReturn.m_active = &saverPeer; safetyReturn.onMouseDown(kButtonLeft); saverSource.platformHeld = true;
++  safetyReturn.switchScreen(&saverSource, 50, 50, true);
++  check(safetyReturn.m_active == &saverSource && !safetyReturn.m_pressedMouseButtons.any(),
++        "forced screensaver safety returns can always reach the primary despite a held button");
++
++  PrimaryClient failedSource; BaseClientProxy failedPeer("B"); Server failedJump(failedSource, failedPeer);
++  failedJump.onMouseDown(kButtonLeft); failedSource.leaveAllowed = false;
++  failedJump.switchScreen(&failedPeer, 50, 50, false);
++  check(failedJump.m_active == &failedSource && failedJump.m_pressedMouseButtons.test(kButtonLeft),
++        "an explicit jump that cannot leave preserves the original drag owner");
++  failedJump.onMouseUp(kButtonLeft);
++  check(!failedJump.isMouseButtonHeld(), "the failed jump still allows its real mouse release to clear the guard");
++
++  PrimaryClient lockedSource; BaseClientProxy lockedPeer("B"); Server lockScreen(lockedSource, lockedPeer);
++  lockScreen.onMouseDown(kButtonLeft); lockedSource.platformHeld = true;
++  lockScreen.m_switchScreen = &lockedPeer; lockScreen.timer = true;
++  lockScreen.onScreensaver(true);
++  check(!lockScreen.m_pressedMouseButtons.any() && lockScreen.isMouseButtonHeld() && !lockScreen.timer,
++        "screen locking clears stale FIFO state and timers while a real platform hold stays protected");
++  lockedSource.platformHeld = false; // 安全桌面吞掉了 mouse-up，只留下正确的新平台快照。
++  lockScreen.onScreensaver(false);
++  check(!lockScreen.isMouseButtonHeld(), "unlocking cannot retain a drag whose mouse-up was lost on the secure desktop");
++
++  PrimaryClient disconnectedSource; BaseClientProxy disconnectedPeer("B"); Server disconnected(disconnectedSource, disconnectedPeer);
++  disconnected.m_active = &disconnectedPeer; disconnected.onMouseDown(kButtonRight);
++  disconnected.m_switchScreen = &disconnectedSource; disconnected.timer = true;
++  disconnected.m_clients.erase("B"); disconnected.forceLeaveClient(&disconnectedPeer);
++  check(disconnected.m_active == &disconnectedSource && !disconnected.isMouseButtonHeld() &&
++        disconnected.m_switchScreen == nullptr && !disconnected.timer,
++        "active disconnect forces a safe return without retaining a stale hold or pending switch");
++  disconnected.m_clients.emplace("B", &disconnectedPeer); disconnected.m_x = 299;
++  check(disconnected.onMouseMovePrimary(304, 50), "reconnection can cross normally after the lost remote drag owner is cleared");
++
++  PrimaryClient offlineSource; BaseClientProxy offlinePeer("B"); Server offline(offlineSource, offlinePeer);
++  offline.m_x = 299; offline.onMouseDown(kButtonMiddle); offline.m_clients.erase("B");
++  check(!offline.onMouseMovePrimary(304, 50) && offline.m_x == 299,
++        "an offline target never receives held motion or changes the source owner");
++  offline.forceLeaveClient(&offlinePeer);
++  check(offline.isMouseButtonHeld(), "disconnecting an inactive peer does not release the active computer's drag");
++  offline.onMouseUp(kButtonMiddle);
++
++  PrimaryClient invalidSource; BaseClientProxy invalidPeer("B"); Server invalid(invalidSource, invalidPeer);
++  invalid.onMouseDown(kButtonNone); invalid.onMouseDown(kX11ScrollWheelUp);
++  check(!invalid.isMouseButtonHeld(), "invalid and wheel identifiers never leave a held-button latch");
++  invalid.onMouseDown(kButtonLeft); invalid.onMouseUp(kButtonRight);
++  check(invalid.isMouseButtonHeld(), "an unrelated release cannot unlock a different held button");
++  invalid.onMouseUp(kButtonLeft);
++
++  // 无逻辑拓扑时，执行同一生产方法的原始边缘和等待计时路径。
++  qunsetenv("DESKFLOW_MONITOR_TOPOLOGY");
++  PrimaryClient legacySource; BaseClientProxy legacyPeer("B"); Server legacy(legacySource, legacyPeer);
++  legacy.m_x = 299; legacy.m_disableLockToScreen = true; legacy.m_switchWaitDelay = 1;
++  legacy.onMouseDown(kButtonLeft);
++  check(!legacy.onMouseMovePrimary(304, 50) && legacy.m_active == &legacySource && legacy.m_x == 299 &&
++        legacy.startedTimers == 0 && legacy.m_switchScreen == nullptr,
++        "legacy hold guard clamps coordinates before any delay, even if the old lock option is disabled");
++  legacy.onMouseUp(kButtonLeft); legacy.handleSwitchWaitTimeout();
++  check(legacy.m_active == &legacySource && !legacy.timer, "legacy release cannot revive a cancelled timer");
++  check(!legacy.onMouseMovePrimary(304, 50) && legacy.timer && legacy.startedTimers == 1,
++        "legacy delay starts only after release and a fresh movement");
++  legacy.handleSwitchWaitTimeout();
++  check(legacy.m_active == &legacyPeer, "legacy waiting behavior still works after a fresh unheld edge move");
++
++  PrimaryClient legacyReturn; BaseClientProxy legacyRemote("B"); Server legacyReverse(legacyReturn, legacyRemote);
++  legacyReverse.m_active = &legacyRemote; legacyReverse.m_x = 0; legacyReverse.m_y = 50;
++  legacyReverse.onMouseDown(kButtonRight); legacyReverse.onMouseMoveSecondary(-5, 0);
++  check(legacyReverse.m_active == &legacyRemote && legacyReverse.m_x == 0,
++        "legacy remote hold cannot escape its computer and remains at its border");
++  legacyReverse.onMouseUp(kButtonRight); legacyReverse.onMouseMoveSecondary(-5, 0);
++  check(legacyReverse.m_active == &legacyReturn, "legacy remote crossing resumes after release");
++
++  std::printf("PASS: %d extracted Server held-mouse checks; no hooks, desktop input or connection changes.\n", checks);
++}
+diff --git a/tools/test-mouse-held.ps1 b/tools/test-mouse-held.ps1
+new file mode 100644
+--- /dev/null
++++ b/tools/test-mouse-held.ps1
+@@ -0,0 +1,63 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：离线回归产物，不安装钩子或注入真实鼠标事件。
++    [string]$BuildDir = "$env:TEMP\moonlight-mouse-held-tests",
++    # QtRoot：核心使用的 MSVC x64 Qt SDK，仅链接纯拓扑算法需要的 QtCore。
++    [string]$QtRoot = 'D:\tmp\codex-deskflow-sdk\Qt\6.10.1\msvc2022_64'
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++$env:PATH = "$QtRoot\bin;$env:PATH"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++
++# 参数 Text/Signature：生产源代码和精确声明；提取完整方法体，不维护另一套守卫实现。
++function Get-ProductionMethod([string]$Text, [string]$Signature) {
++    $offset = $Text.IndexOf($Signature + "`n{", [StringComparison]::Ordinal)
++    if ($offset -lt 0) { throw "Production method not found: $Signature" }
++    $brace = $Text.IndexOf('{', $offset)
++    $depth = 0
++    for ($i = $brace; $i -lt $Text.Length; ++$i) {
++        if ($Text[$i] -eq '{') { ++$depth }
++        elseif ($Text[$i] -eq '}') {
++            --$depth
++            if ($depth -eq 0) { return $Text.Substring($offset, $i - $offset + 1) }
++        }
++    }
++    throw "Unclosed production method: $Signature"
++}
++$server = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\server\Server.cpp')).Replace("`r`n", "`n")
++$methods = @(
++    Get-ProductionMethod $server 'bool Server::isLockedToScreenServer() const'
++    Get-ProductionMethod $server 'bool Server::isLockedToScreen() const'
++    Get-ProductionMethod $server 'bool Server::isMouseButtonHeld() const'
++    Get-ProductionMethod $server 'void Server::stopSwitch()'
++    Get-ProductionMethod $server 'void Server::handleSwitchWaitTimeout()'
++    Get-ProductionMethod $server 'void Server::onMouseDown(ButtonID id)'
++    Get-ProductionMethod $server 'void Server::onMouseUp(ButtonID id)'
++    Get-ProductionMethod $server 'bool Server::onMouseMovePrimary(int32_t x, int32_t y)'
++    Get-ProductionMethod $server 'void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)'
++    Get-ProductionMethod $server 'void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forScreensaver)'
++    Get-ProductionMethod $server 'void Server::forceLeaveClient(const BaseClientProxy *client)'
++    Get-ProductionMethod $server 'void Server::onScreensaver(bool activated)'
++)
++$switchSignature = "bool Server::isSwitchOkay(`n    BaseClientProxy *newScreen, Direction dir, int32_t x, int32_t y, int32_t xActive, int32_t yActive`n)"
++$methods += Get-ProductionMethod $server $switchSignature
++[IO.File]::WriteAllText((Join-Path $BuildDir 'mouse-held-production.inc'), ($methods -join "`n`n"), [Text.UTF8Encoding]::new($false))
++
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD `
++    /DQT_NO_VERSION_TAGGING /DQT_NO_KEYWORDS /D_CRT_SECURE_NO_WARNINGS `
++    "/I$sourceRoot\src\lib" "/I$BuildDir" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" `
++    "$PSScriptRoot\test-mouse-held.cpp" "/Fe:$BuildDir\test-mouse-held.exe" "/Fo:$BuildDir\test-mouse-held.obj" `
++    /link "/LIBPATH:$QtRoot\lib" Qt6Core.lib
++if ($LASTEXITCODE -ne 0) { throw 'Held mouse tests did not compile.' }
++& "$BuildDir\test-mouse-held.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Held mouse tests failed.' }

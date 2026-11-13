@@ -10,6 +10,11 @@ Deskflow 仅作为 Moonlight Hub 的随附组件维护、构建和分发。日�
 按键归属；它只释放实际收到过按下的电脑，不在每次切屏时强制松开所有按键。
 `deskflow-modifier-release.patch` 继续修复修饰键松开被重复键、切屏 mark 或热键分支
 过滤的问题；包含原窗口焦点保护及仅修饰键的诊断日志，不记录普通字符。
+`deskflow-shared-input-state.patch` 保留接收端刷新前仍由接力拥有的合成按下与来源映射，
+并加入按住鼠标禁止跨电脑切换的守卫。`deskflow-switch-recovery.patch` 独立保存本机
+离开前的物理坐标，并在失败/断连时恢复到当前有效显示器位置；切换被拒绝时不提交
+对端坐标。`deskflow-window-menu-mask.patch` 防止交接和内部临时修饰键释放被识别为
+Alt/Win 单击而误激活菜单；普通同屏菜单用法保持原样。以上补丁按文件名顺序应用。
 
 上游下载仅是构建输入，位于被忽略的 `artifacts/`。触摸包装器、过滤器与键盘辅助程序
 源码在本仓库的 [native/deskflow-touch](../native/deskflow-touch/README.md)。
@@ -81,3 +86,27 @@ SHA-256 一致，且 qingxian 已重连。修饰键手感与真实窗口焦点�
 运行时日志中 `modifier source` 记录左右键、松开前后 mask 与切屏状态，
 `modifier route` 记录实际转发目标。它们只能验证新版本收到和转发的事件，不能还原
 旧版本未记录的卡键现场；当前本机系统修饰键与正常 Alt 按下/松开采样均已松开。
+
+## Hub 2.0.23 输入交接
+
+- 左、右、中、两个侧键及其全部组合保持按下时，边缘、普通快捷键和 F24 都不能
+  跨到另一台电脑；本机多屏移动保留。全部松开不会自动执行旧切换，需新移动或
+  新跳转请求。屏保和断连安全归位保留。
+- 接收端 `updateKeyState()` 不再把自己注入的按下误归为实体键，明确的松开及离屏
+  清理仍能找到原来源映射；已知实体事件接管和系统已报告松开的键不会恢复为接力拥有。
+- 失败切换保留原电脑坐标；断连优先返回最后实际离开本机的位置，并按当前逐屏
+  几何避开显示器空洞或已移除的屏幕。显式跳转书签单独保留；无可信历史时才使用安全回退。
+- 菜单保护仅作用于跨屏释放、合成清理及 Windows KeyMap 的临时修饰键释放。使用
+  带独立标签的 E8 掩码，不借用 Ctrl/Esc，不输入普通字符，不自动取消用户已经打开的菜单。
+  正常 Alt/Win 单击、Alt-Tab、Alt-F 的原按键序列保留；当前旧菜单状态可由用户按 Esc 退出。
+
+原理参考：[微软菜单键盘行为](https://learn.microsoft.com/en-us/windows/desktop/menurc/about-menus)、
+[AutoHotkey 官方菜单掩码说明](https://raw.githubusercontent.com/AutoHotkey/AutoHotkeyDocs/v2/docs/lib/A_MenuMaskKey.htm)。
+实现未复制 AutoHotkey 源码。
+
+最终离线回归包括 632 项长按守卫、114 项位置恢复、254 项源端菜单交接、280 项接收端
+菜单/真实 KeyMap、136 项刷新归属、588 项生产 onKey，以及原有 hook、路由和定位检查。
+Hub Windows 路径迁移回归为 123 项（native calls: 0），更新器另有 7 项只读快照检查。
+这些验证不向用户桌面注入测试按键。两台 Windows Hub 均已更新至 2.0.23，运行核心
+来自各自 Hub 的 `deskflow/native`，31 个组件文件均通过清单校验；qingxian 客户端在
+其交互会话内以 SYSTEM 运行，不再沿用独立旧核心。实际交接仍需结合用户操作与日志验收。

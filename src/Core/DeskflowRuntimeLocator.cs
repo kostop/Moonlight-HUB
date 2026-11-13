@@ -42,6 +42,29 @@ internal static class DeskflowRuntimeLocator
         return bundled != null && fileExists(bundled) ? bundled : Path.Combine(exeDir, "tools", "moonlight-touch-bridge.exe");
     }
 
+    // 参数 requireSelectedRuntime：仅 Windows 核心需要迁移；expectedCore：当前选定核心；corePaths：运行中的原生核心映像路径。
+    internal static bool? UsesSelectedCore(bool requireSelectedRuntime, string? expectedCore, IEnumerable<string?> corePaths)
+    {
+        if (!requireSelectedRuntime) return null;
+        if (string.IsNullOrWhiteSpace(expectedCore) || !Path.IsPathFullyQualified(expectedCore)) return false;
+        try
+        {
+            var expected = Path.GetFullPath(expectedCore);
+            var found = false;
+            foreach (var path in corePaths)
+            {
+                if (string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path) ||
+                    !Path.GetFullPath(path).Equals(expected, StringComparison.OrdinalIgnoreCase)) return false;
+                found = true;
+            }
+            return found;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     // 参数 path：旧版 Hub 管理的版本目录，只接受 v 后紧跟非负整数的名称。
     private static int VersionOf(string path)
     {

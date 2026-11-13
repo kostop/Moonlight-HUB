@@ -1,0 +1,733 @@
+diff --git a/src/lib/platform/MSWindowsDesks.cpp b/src/lib/platform/MSWindowsDesks.cpp
+--- a/src/lib/platform/MSWindowsDesks.cpp
++++ b/src/lib/platform/MSWindowsDesks.cpp
+@@ -81,16 +81,27 @@
+ // enable; <unused>
+ #define DESKFLOW_MSG_FAKE_INPUT DESKFLOW_HOOK_LAST_MSG + 12
+ 
++// 参数 wVk/wScan/dwFlags：虚拟键、扫描码与注入标志；仅为失败的修饰键记录诊断。
+ static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
+ {
+-  INPUT inp;
++  INPUT inp{};
+   inp.type = INPUT_KEYBOARD;
+   inp.ki.wVk = (dwFlags & KEYEVENTF_UNICODE) ? 0 : wVk; // 1..254 inclusive otherwise
+   inp.ki.wScan = wScan;
+   inp.ki.dwFlags = dwFlags & 0xF;
+   inp.ki.time = 0;
+   inp.ki.dwExtraInfo = 0;
+-  SendInput(1, &inp, sizeof(inp));
++  SetLastError(ERROR_SUCCESS);
++  const auto inserted = SendInput(1, &inp, sizeof(inp));
++  const auto error = GetLastError();
++  if (inserted != 1 &&
++      (wVk == VK_SHIFT || wVk == VK_LSHIFT || wVk == VK_RSHIFT ||
++       wVk == VK_CONTROL || wVk == VK_LCONTROL || wVk == VK_RCONTROL ||
++       wVk == VK_MENU || wVk == VK_LMENU || wVk == VK_RMENU ||
++       wVk == VK_LWIN || wVk == VK_RWIN)) {
++    LOG_WARN("modifier injection rejected vk=0x%02x scan=0x%03x flags=0x%04x error=%lu",
++             wVk, wScan, dwFlags, error);
++  }
+ }
+ 
+ static void send_mouse_input(DWORD dwFlags, DWORD dx, DWORD dy, DWORD dwData)
+diff --git a/src/lib/server/Server.cpp b/src/lib/server/Server.cpp
+--- a/src/lib/server/Server.cpp
++++ b/src/lib/server/Server.cpp
+@@ -418,14 +418,6 @@
+   // stop waiting to switch
+   stopSwitch();
+ 
+-  // record new position
+-  m_x = x;
+-  m_y = y;
+-  m_xDelta = 0;
+-  m_yDelta = 0;
+-  m_xDelta2 = 0;
+-  m_yDelta2 = 0;
+-
+   // wrapping means leaving the active screen and entering it again.
+   // since that's a waste of time we skip that and just warp the
+   // mouse.
+@@ -434,7 +426,26 @@
+     if (!m_active->leave()) {
+       // cannot leave screen
+       LOG_WARN("can't leave screen");
++      // 旧布局的等待计时器可能保留越界 raw 坐标；失败不能把这个影子位置留到下次移动。
++      if (m_active == m_primaryClient) {
++        if (const auto point = m_monitorRouter.nearestPosition(getName(m_primaryClient), m_x, m_y)) {
++          m_x = point->x;
++          m_y = point->y;
++        } else {
++          int32_t left, top, width, height;
++          m_primaryClient->getShape(left, top, width, height);
++          if (width > 0 && height > 0) {
++            m_x = std::clamp(m_x, left, left + width - 1);
++            m_y = std::clamp(m_y, top, top + height - 1);
++          }
++        }
++      }
+       return;
++    }
++
++    // 离屏会将实际光标停在中心；保存离屏前的 native 坐标，不能再从停车点反查。
++    if (m_active == m_primaryClient && m_activeSaver == nullptr) {
++      rememberPrimaryPosition(m_x, m_y);
+     }
+ 
+     // update the primary client's clipboards if we're leaving the
+@@ -466,6 +477,11 @@
+     // cut over
+     m_active = dst;
+ 
++    // 只有旧屏幕接受离开后才提交目标坐标，失败时仍属于原来的电脑。
++    m_x = x;
++    m_y = y;
++    m_xDelta = m_yDelta = m_xDelta2 = m_yDelta2 = 0;
++
+     // increment enter sequence number
+     ++m_seqNum;
+ 
+@@ -486,7 +502,46 @@
+     auto *info = new Server::SwitchToScreenInfo(m_active->getName());
+     m_events->addEvent(Event(EventTypes::ServerScreenSwitched, this, info));
+   } else {
++    m_x = x;
++    m_y = y;
++    m_xDelta = m_yDelta = m_xDelta2 = m_yDelta2 = 0;
+     m_active->mouseMove(x, y);
++  }
++}
++
++void Server::rememberPrimaryPosition(int32_t x, int32_t y)
++{
++  if (const auto point = m_monitorRouter.nearestPosition(getName(m_primaryClient), x, y)) {
++    x = point->x;
++    y = point->y;
++  } else {
++    int32_t left, top, width, height;
++    m_primaryClient->getShape(left, top, width, height);
++    if (width <= 0 || height <= 0) return;
++    x = std::clamp(x, left, left + width - 1);
++    y = std::clamp(y, top, top + height - 1);
++  }
++  m_primaryCursorPosition = {x, y, true};
++}
++
++void Server::getPrimaryRecoveryPosition(int32_t &x, int32_t &y)
++{
++  if (m_primaryCursorPosition.valid) {
++    x = m_primaryCursorPosition.x;
++    y = m_primaryCursorPosition.y;
++  } else {
++    m_primaryClient->getCursorCenter(x, y);
++  }
++  if (const auto point = m_monitorRouter.nearestPosition(getName(m_primaryClient), x, y)) {
++    x = point->x;
++    y = point->y;
++    return;
++  }
++  // 没有逐屏几何时只信任仍在当前桌面范围内的已知位置；失效历史退回主屏安全点。
++  int32_t left, top, width, height;
++  m_primaryClient->getShape(left, top, width, height);
++  if (width <= 0 || height <= 0 || x < left || y < top || x >= left + width || y >= top + height) {
++    m_primaryClient->getCursorCenter(x, y);
+   }
+ }
+ 
+@@ -1167,6 +1222,13 @@
+     if (client == m_active) {
+       onMouseMovePrimary(m_x, m_y);
+     } else {
++      // 拓扑可用时按当前有效显示器重投影；旧布局已不可验证时不要恢复到消失的屏幕。
++      if (m_primaryCursorPosition.valid) {
++        const auto point = m_monitorRouter.nearestPosition(getName(m_primaryClient),
++            m_primaryCursorPosition.x, m_primaryCursorPosition.y);
++        if (point) m_primaryCursorPosition = {point->x, point->y, true};
++        else m_primaryCursorPosition.valid = false;
++      }
+       onMouseMoveSecondary(0, 0);
+     }
+   }
+@@ -1671,7 +1733,7 @@
+       if (client == m_active) { m_x = destination->x; m_y = destination->y; client->mouseMove(m_x, m_y); return false; }
+       if (!isMouseButtonHeld()) {
+         switchScreen(client, destination->x, destination->y, false);
+-        return true;
++        if (m_active == client) return true;
+       }
+       // 继续走当前显示器的 clamp，不保留对端目标或延时切屏。
+       stopSwitch();
+@@ -1764,8 +1826,10 @@
+     // should we switch or not?
+     if (isSwitchOkay(newScreen, dir, x, y, xc, yc)) {
+       // switch screen
++      m_x = xc;
++      m_y = yc;
+       switchScreen(newScreen, x, y, false);
+-      return true;
++      return m_active != m_primaryClient;
+     }
+   }
+ 
+@@ -1947,6 +2011,9 @@
+     int32_t newX = m_x;
+     int32_t newY = m_y;
+ 
++    // mapToNeighbor 已把 m_x/m_y 改为目标坐标；切换前还原原屏幕位置，以便 leave 失败时回滚。
++    m_x = xOld;
++    m_y = yOld;
+     // switch screens
+     switchScreen(newScreen, newX, newY, false);
+   } else {
+@@ -2125,29 +2192,21 @@
+ 
+ void Server::forceLeaveClient(const BaseClientProxy *client)
+ {
+-  if (const auto *active = (m_activeSaver != nullptr) ? m_activeSaver : m_active; active == client) {
+-    // record new position (center of primary screen)
+-    m_primaryClient->getCursorCenter(m_x, m_y);
+-
++  if (m_switchScreen == client) stopSwitch();
++  if (m_active == client) {
+     // stop waiting to switch to this client
+     stopSwitch();
+ 
+-    // don't notify active screen since it has probably already
+-    // disconnected.
+-    LOG(
+-        (CLOG_INFO "jump from \"%s\" to \"%s\" at %d,%d", getName(active).c_str(), getName(m_primaryClient).c_str(),
+-         m_x, m_y)
+-    );
+-
+     // 断开时归位不能把已失去接收端的按钮状态留成永久锁。
+     m_pressedMouseButtons.reset();
+ 
+-    // cut over
+-    m_active = m_primaryClient;
+-
+-    // enter new screen (unless we already have because of the
+-    // screen saver)
+-    if (m_activeSaver == nullptr) {
++    // 屏保期间主机已经激活；此时断连不能用旧历史覆盖当前主机坐标。
++    if (m_active != m_primaryClient) {
++      getPrimaryRecoveryPosition(m_x, m_y);
++      LOG_INFO("recover from \"%s\" to \"%s\" at %d,%d", getName(client).c_str(),
++               getName(m_primaryClient).c_str(), m_x, m_y);
++      m_active = m_primaryClient;
++      m_xDelta = m_yDelta = m_xDelta2 = m_yDelta2 = 0;
+       m_primaryClient->enter(m_x, m_y, m_seqNum, m_primaryClient->getToggleMask(), false);
+     }
+   }
+diff --git a/src/lib/server/Server.h b/src/lib/server/Server.h
+--- a/src/lib/server/Server.h
++++ b/src/lib/server/Server.h
+@@ -223,6 +223,11 @@
+ 
+   // change the active screen
+   void switchScreen(BaseClientProxy *, int32_t x, int32_t y, bool forScreenSaver);
++
++  // 参数 x/y：最后有效的主机物理像素坐标；仅保存成功离屏前的位置，不复用跳转书签。
++  void rememberPrimaryPosition(int32_t x, int32_t y);
++  // 参数 x/y：输出适合当前主机显示布局的恢复位置，没有历史时使用安全中心。
++  void getPrimaryRecoveryPosition(int32_t &x, int32_t &y);
+ 
+   // jump to screen
+   void jumpToScreen(BaseClientProxy *);
+@@ -434,6 +439,14 @@
+   int32_t m_x;
+   int32_t m_y;
+ 
++  struct PrimaryCursorPosition
++  {
++    int32_t x = 0;
++    int32_t y = 0;
++    bool valid = false;
++  };
++  PrimaryCursorPosition m_primaryCursorPosition;
++
+   // last mouse deltas.  this is needed to smooth out double tap
+   // on win32 which reports bogus mouse motion at the edge of
+   // the screen when using low level hooks, synthesizing motion
+diff --git a/src/lib/server/MonitorTopologyRouter.h b/src/lib/server/MonitorTopologyRouter.h
+--- a/src/lib/server/MonitorTopologyRouter.h
++++ b/src/lib/server/MonitorTopologyRouter.h
+@@ -112,6 +112,26 @@
+     return std::nullopt;
+   }
+ 
++  // owner/x/y：要恢复的本机及物理像素位置；投影到最近的有效显示器，避开多屏空洞。
++  std::optional<Destination> nearestPosition(const std::string &owner, int32_t x, int32_t y)
++  {
++    refresh();
++    std::optional<Destination> nearest;
++    double distance = std::numeric_limits<double>::max();
++    for (const auto &monitor : m_monitors) {
++      if (monitor.owner != owner) continue;
++      const double px = std::clamp(static_cast<double>(x), monitor.nativeX, monitor.nativeX + monitor.w - 1);
++      const double py = std::clamp(static_cast<double>(y), monitor.nativeY, monitor.nativeY + monitor.h - 1);
++      const double dx = px - x, dy = py - y;
++      const double candidate = dx * dx + dy * dy;
++      if (candidate < distance) {
++        nearest = Destination{owner, static_cast<int32_t>(px), static_cast<int32_t>(py)};
++        distance = candidate;
++      }
++    }
++    return nearest;
++  }
++
+ private:
+   struct Monitor {
+     std::string owner;
+diff --git a/tools/test-mouse-held.cpp b/tools/test-mouse-held.cpp
+--- a/tools/test-mouse-held.cpp
++++ b/tools/test-mouse-held.cpp
+@@ -101,6 +101,8 @@
+   bool timer = false;
+   int startedTimers = 0;
+   int32_t m_x = 50, m_y = 50, m_xDelta = 0, m_yDelta = 0, m_xDelta2 = 0, m_yDelta2 = 0;
++  struct PrimaryCursorPosition { int32_t x = 0, y = 0; bool valid = false; };
++  PrimaryCursorPosition m_primaryCursorPosition;
+   int32_t m_switchWaitX = 0, m_switchWaitY = 0;
+   int32_t m_xSaver = 0, m_ySaver = 0;
+   uint32_t m_seqNum = 0;
+@@ -144,6 +146,8 @@
+   bool onMouseMovePrimary(int32_t, int32_t);
+   void onMouseMoveSecondary(int32_t, int32_t);
+   void switchScreen(BaseClientProxy *, int32_t, int32_t, bool);
++  void rememberPrimaryPosition(int32_t, int32_t);
++  void getPrimaryRecoveryPosition(int32_t &, int32_t &);
+   void forceLeaveClient(const BaseClientProxy *);
+   void onScreensaver(bool);
+ };
+diff --git a/tools/test-mouse-held.ps1 b/tools/test-mouse-held.ps1
+--- a/tools/test-mouse-held.ps1
++++ b/tools/test-mouse-held.ps1
+@@ -46,6 +46,8 @@
+     Get-ProductionMethod $server 'bool Server::onMouseMovePrimary(int32_t x, int32_t y)'
+     Get-ProductionMethod $server 'void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)'
+     Get-ProductionMethod $server 'void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forScreensaver)'
++    Get-ProductionMethod $server 'void Server::rememberPrimaryPosition(int32_t x, int32_t y)'
++    Get-ProductionMethod $server 'void Server::getPrimaryRecoveryPosition(int32_t &x, int32_t &y)'
+     Get-ProductionMethod $server 'void Server::forceLeaveClient(const BaseClientProxy *client)'
+     Get-ProductionMethod $server 'void Server::onScreensaver(bool activated)'
+ )
+diff --git a/tools/test-mouse-recovery.cpp b/tools/test-mouse-recovery.cpp
+new file mode 100644
+--- /dev/null
++++ b/tools/test-mouse-recovery.cpp
+@@ -0,0 +1,340 @@
++﻿/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#include "server/MonitorTopologyRouter.h"
++#include "base/DirectionTypes.h"
++#include "deskflow/MouseTypes.h"
++#include "deskflow/KeyTypes.h"
++#include <QCoreApplication>
++#include <QTemporaryFile>
++#include <array>
++#include <bitset>
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <string>
++#include <vector>
++
++// 执行当前生产 Server 方法；只模拟客户端/配置/计时器边界，不安装钩子或注入输入。
++#define LOG_DEBUG1(...) ((void)0)
++#define LOG_DEBUG2(...) ((void)0)
++#define LOG_DEBUG(...) ((void)0)
++#define LOG_INFO(...) ((void)0)
++#define LOG_WARN(...) ((void)0)
++#define LOG_NOTE(...) ((void)0)
++#define LOG_ERR(...) std::fprintf(stderr, __VA_ARGS__)
++#define LOG(...) ((void)0)
++
++namespace {
++int checks = 0;
++using ClipboardID = uint8_t;
++void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
++}
++struct Point { int32_t x, y; };
++struct FakeClipboard { std::string marshall() const { return {}; } };
++struct BaseClientProxy {
++  std::string name;
++  std::vector<Point> positions;
++  std::vector<ButtonID> pressed, released;
++  int enters = 0;
++  bool leaveAllowed = true;
++  mutable int leaves = 0;
++  int32_t left=0, top=0, shapeWidth=300, shapeHeight=100;
++  Point bookmark{70,40};
++  explicit BaseClientProxy(const char *value) : name(value) {}
++  const std::string &getName() const { return name; }
++  void getShape(int32_t &x, int32_t &y, int32_t &width, int32_t &height) const
++  { x = left; y = top; width = shapeWidth; height = shapeHeight; }
++  void mouseDown(ButtonID button) { pressed.push_back(button); }
++  void mouseUp(ButtonID button) { released.push_back(button); }
++  void mouseMove(int32_t x, int32_t y) { positions.push_back({x, y}); }
++  void mouseRelativeMove(int32_t, int32_t) { std::abort(); }
++  bool leave() const { ++leaves; return leaveAllowed; }
++  void setJumpCursorPos(int32_t x,int32_t y) {bookmark={x,y};}
++  void getJumpCursorPos(int32_t &x,int32_t &y) const {x=bookmark.x;y=bookmark.y;}
++  void enter(int32_t x, int32_t y, uint32_t, KeyModifierMask, bool)
++  { ++enters; positions.push_back({x, y}); }
++  void setClipboard(int, const FakeClipboard *) {}
++  void screensaver(bool) {}
++};
++struct PrimaryClient : BaseClientProxy {
++  bool platformHeld = false;
++  mutable int centers = 0;
++  PrimaryClient() : BaseClientProxy("A") {}
++  bool isLockedToScreen() const { return platformHeld; }
++  int32_t getJumpZoneSize() const { return 1; }
++  KeyModifierMask getToggleMask() const { return 0; }
++  void getCursorCenter(int32_t &x, int32_t &y) const { ++centers; x = y = 50; }
++  void reconfigure(uint32_t) {}
++};
++struct Config {
++  using ScreenOptions = std::map<int, int>;
++  const ScreenOptions *getOptions(const std::string &) const { return nullptr; }
++};
++constexpr int kOptionScreenSwitchCorners = 1, kOptionScreenSwitchCornerSize = 2;
++constexpr int kClipboardEnd = 2;
++enum class EventTypes { ServerScreenSwitched };
++struct Event {
++  template<class T> Event(EventTypes, void *, T *info) { delete info; }
++};
++struct EventQueue { void addEvent(Event) {} };
++}
++
++class Server {
++public:
++  using ClientList = std::map<std::string, BaseClientProxy *>;
++  struct SwitchToScreenInfo { explicit SwitchToScreenInfo(const std::string &) {} };
++  struct ClipboardInfo { FakeClipboard m_clipboard; std::string m_clipboardOwner; uint32_t m_clipboardSeqNum = 0; };
++  PrimaryClient *m_primaryClient;
++  BaseClientProxy *m_active;
++  BaseClientProxy *m_activeSaver = nullptr;
++  BaseClientProxy *m_switchScreen = nullptr;
++  std::map<std::string, BaseClientProxy *> m_clients;
++  MonitorTopologyRouter m_monitorRouter;
++  std::bitset<NumButtonIDs> m_pressedMouseButtons;
++  BaseClientProxy *legacyDestination = nullptr;
++  Config config;
++  Config *m_config = &config;
++  EventQueue events;
++  EventQueue *m_events = &events;
++  bool m_lockedToScreen = false, m_disableLockToScreen = false, m_defaultLockToScreenState = false;
++  bool m_relativeMoves = false, m_enableClipboard = false;
++  bool m_switchNeedsShift = false, m_switchNeedsControl = false, m_switchNeedsAlt = false;
++  double m_switchTwoTapDelay = 0, m_switchWaitDelay = 0;
++  Direction m_switchDir = Direction::NoDirection;
++  bool timer = false;
++  int startedTimers = 0;
++  int32_t m_x = 50, m_y = 50, m_xDelta = 0, m_yDelta = 0, m_xDelta2 = 0, m_yDelta2 = 0;
++  struct PrimaryCursorPosition { int32_t x = 0, y = 0; bool valid = false; };
++  PrimaryCursorPosition m_primaryCursorPosition;
++  int32_t m_switchWaitX = 0, m_switchWaitY = 0;
++  int32_t m_xSaver = 0, m_ySaver = 0;
++  uint32_t m_seqNum = 0;
++  int m_maximumClipboardSize = 1024;
++  ClipboardInfo m_clipboards[kClipboardEnd];
++
++  Server(PrimaryClient &primary, BaseClientProxy &remote) : m_primaryClient(&primary), m_active(&primary)
++  { m_clients.emplace(primary.name, &primary); m_clients.emplace(remote.name, &remote); }
++  std::string getName(const BaseClientProxy *client) const { return client->name; }
++  int32_t getJumpZoneSize(const BaseClientProxy *client) const { return client == m_primaryClient ? 1 : 0; }
++  int getCorner(const BaseClientProxy *, int32_t, int32_t, int32_t) const { return 0; }
++  uint32_t getActivePrimarySides() const { return 0; }
++  bool isSwitchTwoTapStarted() const { return false; }
++  bool shouldSwitchTwoTap() const { return false; }
++  void startSwitchTwoTap() {}
++  void stopSwitchTwoTap() {}
++  bool isSwitchWaitStarted() const { return timer; }
++  void startSwitchWait(int32_t x, int32_t y) { timer = true; ++startedTimers; m_switchWaitX = x; m_switchWaitY = y; }
++  void stopSwitchWait() { timer = false; }
++  void noSwitch(int32_t, int32_t) { stopSwitchWait(); }
++  void onClipboardChanged(const BaseClientProxy *, int, uint32_t) {}
++
++  // 参数 client/dir/x/y：只提供旧布局的相邻电脑，真实切屏守卫由生产方法执行。
++  BaseClientProxy *mapToNeighbor(BaseClientProxy *client, Direction dir, int32_t &x, int32_t &y)
++  {
++    (void)y;
++    if (legacyDestination != nullptr) { if(dir==Direction::Right) x-=300; else if(dir==Direction::Left) x+=300; return legacyDestination; }
++    const auto destination = client == m_primaryClient ? m_clients.find("B") : m_clients.find("A");
++    if (destination == m_clients.end()) return nullptr;
++    if (dir == Direction::Right) x -= 300;
++    else if (dir == Direction::Left) x += 300;
++    return destination->second;
++  }
++  bool isLockedToScreenServer() const;
++  bool isLockedToScreen() const;
++  bool isMouseButtonHeld() const;
++  bool isSwitchOkay(BaseClientProxy *, Direction, int32_t, int32_t, int32_t, int32_t);
++  void stopSwitch();
++  void handleSwitchWaitTimeout();
++  void onMouseDown(ButtonID);
++  void onMouseUp(ButtonID);
++  bool onMouseMovePrimary(int32_t, int32_t);
++  void onMouseMoveSecondary(int32_t, int32_t);
++  void switchScreen(BaseClientProxy *, int32_t, int32_t, bool);
++  void rememberPrimaryPosition(int32_t, int32_t);
++  void getPrimaryRecoveryPosition(int32_t &, int32_t &);
++  void forceLeaveClient(const BaseClientProxy *);
++  void jumpToScreen(BaseClientProxy *);
++  void onScreensaver(bool);
++};
++
++// 脚本从当前源文件提取完整方法体，禁止手工维护待测逻辑副本。
++#include "mouse-recovery-production.inc"
++
++// 参数 owner/nativeX/canvasX：所属电脑、本机像素原点及共享画布原点。
++QJsonObject monitor(const char *owner, int nativeX, int canvasX)
++{
++  return {{"owner", owner}, {"id", QString::number(nativeX)}, {"nativeX", nativeX}, {"nativeY", 0},
++          {"x", canvasX}, {"y", 0}, {"width", 100}, {"height", 100},
++          {"canvasWidth", 100}, {"canvasHeight", 100}, {"active", true}};
++}
++
++int main(int argc, char **argv)
++{
++  QCoreApplication application(argc, argv);
++  QTemporaryFile layout;
++  check(layout.open(), "recovery topology fixture opens");
++  const auto writeLayout = [&](const QJsonArray &monitors) {
++    layout.resize(0); layout.seek(0);
++    layout.write(QJsonDocument(QJsonObject{{"monitors",monitors}}).toJson()); layout.flush();
++  };
++  const QJsonArray original{monitor("A",0,0),monitor("A",200,100),monitor("B",0,200)};
++  writeLayout(original);
++  qputenv("DESKFLOW_MONITOR_TOPOLOGY",layout.fileName().toUtf8());
++
++  PrimaryClient primary; BaseClientProxy remote("B"); Server failedConnection(primary,remote);
++  failedConnection.m_x=299; failedConnection.m_y=63;
++  primary.bookmark={12,34};
++  check(failedConnection.onMouseMovePrimary(304,63) && failedConnection.m_active==&remote,
++        "primary edge may enter a connected peer before its asynchronous failure arrives");
++  check(failedConnection.m_primaryCursorPosition.valid && failedConnection.m_primaryCursorPosition.x==299 &&
++        failedConnection.m_primaryCursorPosition.y==63,
++        "successful departure records the primary native position before its parking warp");
++  check(primary.bookmark.x==12 && primary.bookmark.y==34, "ordinary edge crossing does not overwrite an explicit jump bookmark");
++  failedConnection.onMouseDown(kButtonLeft);
++  failedConnection.m_clients.erase("B");
++  failedConnection.forceLeaveClient(&remote);
++  check(failedConnection.m_active==&primary && failedConnection.m_x==299 && failedConnection.m_y==63,
++        "asynchronous peer failure returns to the departure edge rather than the primary center");
++  check(primary.enters==1 && primary.positions.back().x==299 && primary.positions.back().y==63 && primary.centers==0,
++        "failure recovery enters the remembered native point without querying the relay parking center");
++  check(!failedConnection.m_pressedMouseButtons.any(), "disconnect recovery clears the lost drag owner");
++  check(primary.bookmark.x==12 && primary.bookmark.y==34, "disconnect recovery leaves explicit jump bookmarks untouched");
++
++  for (const int32_t departureX : {0,1,50,99,200,250,298,299}) {
++    for (const int32_t departureY : {0,1,49,98,99}) {
++      PrimaryClient edgeSource;BaseClientProxy edgePeer("B");Server edge(edgeSource,edgePeer);
++      edge.m_x=departureX;edge.m_y=departureY;edge.switchScreen(&edgePeer,3,50,false);edge.forceLeaveClient(&edgePeer);
++      check(edge.m_active==&edgeSource && edge.m_x==departureX && edge.m_y==departureY,
++            "every sampled valid local corner and edge survives asynchronous connection failure");
++      check(edgeSource.centers==0 && edgeSource.positions.back().x==departureX && edgeSource.positions.back().y==departureY,
++            "edge recovery never replaces a valid physical departure with a synthetic center");
++    }
++  }
++
++  PrimaryClient chainSource;BaseClientProxy chainPeer("B"),chainThird("C");Server chain(chainSource,chainPeer);
++  chain.m_clients.emplace("C",&chainThird);chain.m_x=299;chain.m_y=68;
++  chain.switchScreen(&chainPeer,3,60,false);chain.switchScreen(&chainThird,20,30,false);chain.forceLeaveClient(&chainThird);
++  check(chain.m_x==299 && chain.m_y==68 && chainSource.centers==0,
++        "remote-to-remote movement cannot replace the original primary recovery point");
++
++  PrimaryClient denied; BaseClientProxy deniedPeer("B"); Server failedLeave(denied,deniedPeer);
++  failedLeave.m_x=299; failedLeave.m_y=64;
++  failedLeave.m_xDelta=7;failedLeave.m_yDelta=8;failedLeave.m_xDelta2=9;failedLeave.m_yDelta2=10;
++  failedLeave.m_primaryCursorPosition={205,65,true};
++  denied.leaveAllowed=false;
++  failedLeave.switchScreen(&deniedPeer,4,66,false);
++  check(failedLeave.m_active==&denied && failedLeave.m_x==299 && failedLeave.m_y==64,
++        "rejected leave cannot commit peer coordinates as primary coordinates");
++  check(failedLeave.m_xDelta==7 && failedLeave.m_yDelta==8 && failedLeave.m_xDelta2==9 && failedLeave.m_yDelta2==10,
++        "rejected leave does not reset the original movement history");
++  check(failedLeave.m_seqNum==0 && deniedPeer.enters==0 && denied.enters==0,
++        "rejected leave neither enters another screen nor warps back to a synthetic center");
++  check(failedLeave.m_primaryCursorPosition.x==205 && failedLeave.m_primaryCursorPosition.y==65,
++        "rejected leave does not replace successful recovery history");
++  check(!failedLeave.onMouseMovePrimary(304,64) && failedLeave.m_x==299 && failedLeave.m_y==64 && denied.centers==0,
++        "logical edge crossing reports failure and clamps on the original monitor when leave is denied");
++
++  PrimaryClient heldSource; BaseClientProxy heldPeer("B"); Server held(heldSource,heldPeer);
++  held.m_x=299;held.m_y=61;held.onMouseDown(kButtonRight);
++  held.switchScreen(&heldPeer,4,44,false);
++  check(held.m_active==&heldSource && held.m_x==299 && held.m_y==61 && heldSource.leaves==0,
++        "held-button rejection leaves the primary position and native screen untouched");
++  check(!held.m_primaryCursorPosition.valid && heldSource.centers==0,
++        "blocked drag crossing does not record a fake primary departure or center");
++  held.onMouseUp(kButtonRight);held.m_clients.erase("B");
++  check(!held.onMouseMovePrimary(304,61) && held.m_x==299 && held.m_y==61 && heldSource.leaves==0,
++        "an offline destination is clamped locally without leaving or centering");
++
++  PrimaryClient coldSource; BaseClientProxy coldPeer("B"); Server cold(coldSource,coldPeer);
++  cold.m_active=&coldPeer;cold.forceLeaveClient(&coldPeer);
++  check(cold.m_active==&coldSource && cold.m_x==50 && cold.m_y==50 && coldSource.centers==1,
++        "a cold recovery with no primary history still has a safe center fallback");
++
++  PrimaryClient gapSource; BaseClientProxy gapPeer("B"); Server gap(gapSource,gapPeer);
++  gap.rememberPrimaryPosition(150,50);
++  int32_t x=0,y=0;gap.getPrimaryRecoveryPosition(x,y);
++  check(x==200 && y==50 && gapSource.centers==0,
++        "recovery projects points in a desktop hole onto the nearest local monitor");
++  check(!gap.m_monitorRouter.nearestPosition("missing",150,50), "recovery cannot select a monitor belonging only to another owner");
++
++  PrimaryClient removedSource; BaseClientProxy removedPeer("B"); Server removed(removedSource,removedPeer);
++  removed.rememberPrimaryPosition(299,72);
++  writeLayout({monitor("A",0,0),monitor("B",0,100)});
++  removed.m_monitorRouter=MonitorTopologyRouter{};removedSource.shapeWidth=100;
++  removed.getPrimaryRecoveryPosition(x,y);
++  check(x==99 && y==72 && removedSource.centers==0,
++        "a removed departure monitor recovers to the closest still-active local monitor edge");
++  writeLayout(original);
++
++  PrimaryClient saverSource; BaseClientProxy saverPeer("B"); Server saver(saverSource,saverPeer);
++  saver.m_x=299;saver.m_y=74;saver.switchScreen(&saverPeer,2,74,false);
++  saver.onScreensaver(true);
++  check(saver.m_active==&saverSource && saver.m_primaryCursorPosition.x==299 && saver.m_primaryCursorPosition.y==74,
++        "screensaver safety entry keeps the real departure history");
++  saver.m_x=43;saver.m_y=23;
++  saver.onMouseDown(kButtonLeft);
++  const int saverEnters=saverSource.enters;
++  saver.forceLeaveClient(&saverPeer);
++  check(saver.m_x==43 && saver.m_y==23 && saverSource.enters==saverEnters && saver.m_activeSaver==nullptr,
++        "saved-peer disconnect cannot overwrite the already-active primary cursor");
++  check(saver.m_pressedMouseButtons.test(kButtonLeft),
++        "saved-peer disconnect cannot clear a newer primary drag owner");
++
++  PrimaryClient resumedSource; BaseClientProxy resumedPeer("B"); Server resumed(resumedSource,resumedPeer);
++  resumed.m_x=299;resumed.m_y=77;resumed.switchScreen(&resumedPeer,2,77,false);
++  resumed.onScreensaver(true);resumed.onScreensaver(false);
++  check(resumed.m_active==&resumedPeer && resumed.m_primaryCursorPosition.x==299 && resumed.m_primaryCursorPosition.y==77,
++        "screensaver deactivation never replaces history with its virtual primary coordinate zero");
++  resumed.forceLeaveClient(&resumedPeer);
++  check(resumed.m_x==299 && resumed.m_y==77, "failure after screensaver resume still returns to the real departure edge");
++
++  PrimaryClient normalSource;BaseClientProxy normalPeer("B");Server normal(normalSource,normalPeer);
++  normal.m_x=299;normal.m_y=56;normal.switchScreen(&normalPeer,2,56,false);
++  normal.switchScreen(&normalSource,215,57,false);
++  check(normal.m_x==215 && normal.m_y==57 && normalSource.positions.back().x==215,
++        "successful intentional return keeps its mapped destination rather than the failure recovery point");
++  normal.m_active=&normalPeer;normal.jumpToScreen(&normalSource);
++  check(normal.m_x==70 && normal.m_y==40, "explicit keyboard jump still uses its own primary bookmark");
++
++  // 125% Dell 的 native 物理像素必须保持，不能误用较小的共享画布坐标。
++  const QJsonObject dell{{"owner","A"},{"nativeX",0},{"nativeY",0},{"x",0},{"y",0},
++      {"width",2560},{"height",1440},{"canvasWidth",2048},{"canvasHeight",1152},{"active",true}};
++  writeLayout({dell,monitor("B",0,2048)});
++  PrimaryClient dpiSource;BaseClientProxy dpiPeer("B");Server dpi(dpiSource,dpiPeer);
++  dpiSource.shapeWidth=2560;dpiSource.shapeHeight=1440;dpi.m_x=2559;dpi.m_y=900;
++  dpi.switchScreen(&dpiPeer,2,60,false);dpi.forceLeaveClient(&dpiPeer);
++  check(dpi.m_x==2559 && dpi.m_y==900 && dpiSource.centers==0,
++        "mixed-DPI recovery preserves the original physical pixel point");
++
++  qunsetenv("DESKFLOW_MONITOR_TOPOLOGY");
++  PrimaryClient legacySource;BaseClientProxy legacyPeer("B");Server legacy(legacySource,legacyPeer);
++  legacy.m_x=299;legacy.m_y=67;legacySource.leaveAllowed=false;
++  check(!legacy.onMouseMovePrimary(304,67) && legacy.m_active==&legacySource && legacy.m_x==299 && legacy.m_y==67,
++        "legacy primary failed crossing remains at its original local edge");
++  legacy.m_x=304;legacy.m_y=67;legacy.m_switchScreen=&legacyPeer;legacy.m_switchWaitX=4;legacy.m_switchWaitY=67;
++  legacy.timer=true;legacy.handleSwitchWaitTimeout();
++  check(legacy.m_active==&legacySource && legacy.m_x==299 && legacy.m_y==67 && !legacy.timer && legacySource.centers==0,
++        "a denied delayed legacy crossing clamps its raw shadow position without centering or retrying");
++  PrimaryClient secondarySource;BaseClientProxy secondaryPeer("B"),third("C");Server secondary(secondarySource,secondaryPeer);
++  secondary.m_active=&secondaryPeer;secondary.m_clients.emplace("C",&third);secondary.legacyDestination=&third;
++  secondary.m_x=299;secondary.m_y=69;secondaryPeer.leaveAllowed=false;
++  secondary.onMouseMoveSecondary(5,0);
++  check(secondary.m_active==&secondaryPeer && secondary.m_x==299 && secondary.m_y==69 && third.enters==0,
++        "legacy secondary failure rolls back coordinates already translated for its third-screen target");
++  PrimaryClient legacyHistorySource;BaseClientProxy legacyHistoryPeer("B");Server legacyHistory(legacyHistorySource,legacyHistoryPeer);
++  legacyHistory.m_x=299;legacyHistory.m_y=82;legacyHistory.switchScreen(&legacyHistoryPeer,2,82,false);
++  legacyHistory.forceLeaveClient(&legacyHistoryPeer);
++  check(legacyHistory.m_x==299 && legacyHistory.m_y==82 && legacyHistorySource.centers==0,
++        "unchanged legacy geometry also retains a known departure position");
++  legacyHistory.m_active=&legacyHistoryPeer;legacyHistorySource.shapeWidth=100;
++  legacyHistory.forceLeaveClient(&legacyHistoryPeer);
++  check(legacyHistory.m_x==50 && legacyHistory.m_y==50 && legacyHistorySource.centers==1,
++        "unverifiable legacy history outside a changed desktop uses a safe primary fallback");
++
++  std::printf("PASS: %d extracted Server mouse recovery checks; no hooks, desktop input or connection changes.\n",checks);
++}
++
+diff --git a/tools/test-mouse-recovery.ps1 b/tools/test-mouse-recovery.ps1
+new file mode 100644
+--- /dev/null
++++ b/tools/test-mouse-recovery.ps1
+@@ -0,0 +1,69 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：离线回归产物，不安装钩子或注入真实鼠标事件。
++    [string]$BuildDir = "$env:TEMP\moonlight-mouse-recovery-tests",
++    # QtRoot：核心使用的 MSVC x64 Qt SDK，仅链接纯拓扑算法需要的 QtCore。
++    [string]$QtRoot = 'D:\tmp\codex-deskflow-sdk\Qt\6.10.1\msvc2022_64',
++    # ServerSource：可选的旧实现突变输入；默认始终提取当前生产文件。
++    [string]$ServerSource
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++$env:PATH = "$QtRoot\bin;$env:PATH"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++
++# 参数 Text/Signature：生产源代码和精确声明；提取完整方法体，不维护另一套守卫实现。
++function Get-ProductionMethod([string]$Text, [string]$Signature) {
++    $offset = $Text.IndexOf($Signature + "`n{", [StringComparison]::Ordinal)
++    if ($offset -lt 0) { throw "Production method not found: $Signature" }
++    $brace = $Text.IndexOf('{', $offset)
++    $depth = 0
++    for ($i = $brace; $i -lt $Text.Length; ++$i) {
++        if ($Text[$i] -eq '{') { ++$depth }
++        elseif ($Text[$i] -eq '}') {
++            --$depth
++            if ($depth -eq 0) { return $Text.Substring($offset, $i - $offset + 1) }
++        }
++    }
++    throw "Unclosed production method: $Signature"
++}
++$serverPath = if ($ServerSource) { (Get-Item -LiteralPath $ServerSource).FullName } else { Join-Path $sourceRoot 'src\lib\server\Server.cpp' }
++$server = [IO.File]::ReadAllText($serverPath).Replace("`r`n", "`n")
++$methods = @(
++    Get-ProductionMethod $server 'bool Server::isLockedToScreenServer() const'
++    Get-ProductionMethod $server 'bool Server::isLockedToScreen() const'
++    Get-ProductionMethod $server 'bool Server::isMouseButtonHeld() const'
++    Get-ProductionMethod $server 'void Server::stopSwitch()'
++    Get-ProductionMethod $server 'void Server::handleSwitchWaitTimeout()'
++    Get-ProductionMethod $server 'void Server::onMouseDown(ButtonID id)'
++    Get-ProductionMethod $server 'void Server::onMouseUp(ButtonID id)'
++    Get-ProductionMethod $server 'bool Server::onMouseMovePrimary(int32_t x, int32_t y)'
++    Get-ProductionMethod $server 'void Server::onMouseMoveSecondary(int32_t dx, int32_t dy)'
++    Get-ProductionMethod $server 'void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forScreensaver)'
++    Get-ProductionMethod $server 'void Server::rememberPrimaryPosition(int32_t x, int32_t y)'
++    Get-ProductionMethod $server 'void Server::getPrimaryRecoveryPosition(int32_t &x, int32_t &y)'
++    Get-ProductionMethod $server 'void Server::forceLeaveClient(const BaseClientProxy *client)'
++    Get-ProductionMethod $server 'void Server::jumpToScreen(BaseClientProxy *newScreen)'
++    Get-ProductionMethod $server 'void Server::onScreensaver(bool activated)'
++)
++$switchSignature = "bool Server::isSwitchOkay(`n    BaseClientProxy *newScreen, Direction dir, int32_t x, int32_t y, int32_t xActive, int32_t yActive`n)"
++$methods += Get-ProductionMethod $server $switchSignature
++[IO.File]::WriteAllText((Join-Path $BuildDir 'mouse-recovery-production.inc'), ($methods -join "`n`n"), [Text.UTF8Encoding]::new($false))
++
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /Zc:__cplusplus /permissive- /MD `
++    /DQT_NO_VERSION_TAGGING /DQT_NO_KEYWORDS /D_CRT_SECURE_NO_WARNINGS `
++    "/I$sourceRoot\src\lib" "/I$BuildDir" "/I$QtRoot\include" "/I$QtRoot\include\QtCore" `
++    "$PSScriptRoot\test-mouse-recovery.cpp" "/Fe:$BuildDir\test-mouse-recovery.exe" "/Fo:$BuildDir\test-mouse-recovery.obj" `
++    /link "/LIBPATH:$QtRoot\lib" Qt6Core.lib
++if ($LASTEXITCODE -ne 0) { throw 'Mouse recovery tests did not compile.' }
++& "$BuildDir\test-mouse-recovery.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Mouse recovery tests failed.' }
