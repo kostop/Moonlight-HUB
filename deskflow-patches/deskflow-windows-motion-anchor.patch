@@ -1,0 +1,568 @@
+diff --git a/src/lib/platform/MSWindowsHook.cpp b/src/lib/platform/MSWindowsHook.cpp
+--- a/src/lib/platform/MSWindowsHook.cpp
++++ b/src/lib/platform/MSWindowsHook.cpp
+@@ -125,10 +125,23 @@
+   uint64_t capturedCount = 0;
+   uint64_t receivedCount = 0;
+   uint64_t absorbedThrough = 0;
++  POINT cursorAnchor{};
++  uint64_t cursorVersion = 0;
++  DWORD cursorThread = 0;
++  bool cursorValid = false;
+   std::atomic<bool> local{false};
+   std::atomic<bool> returning{false};
+ };
+ static MouseMotionState g_mouseMotion;
++
++// 参数 thread：新钩子的所属线程；卸载时传零，不能沿用上一桌面的锚点。
++static void invalidateMouseAnchor(DWORD thread = 0)
++{
++  std::scoped_lock lock(g_mouseMotion.mutex);
++  g_mouseMotion.cursorValid = false;
++  g_mouseMotion.cursorThread = thread;
++  ++g_mouseMotion.cursorVersion;
++}
+ 
+ static void resetMouseMotion()
+ {
+@@ -138,6 +151,9 @@
+   g_mouseMotion.capturedCount = 0;
+   g_mouseMotion.receivedCount = 0;
+   g_mouseMotion.absorbedThrough = 0;
++  g_mouseMotion.cursorValid = false;
++  g_mouseMotion.cursorThread = 0;
++  ++g_mouseMotion.cursorVersion;
+   g_mouseMotion.local = false;
+   g_mouseMotion.returning = false;
+ }
+@@ -875,6 +891,68 @@
+   return false;
+ }
+ 
++// 参数 code/message/data：原始鼠标回调；只记录成功放行的位置，不覆盖重入回调更新的锚点。
++static LRESULT passMouseEvent(int code, WPARAM message, LPARAM data)
++{
++  if (code < 0 || !g_isPrimary || message != WM_MOUSEMOVE) {
++    return CallNextHookEx(g_mouseLL, code, message, data);
++  }
++  const POINT position = reinterpret_cast<const MSLLHOOKSTRUCT *>(data)->pt;
++  const DWORD thread = GetCurrentThreadId();
++  uint64_t version;
++  bool belongsToThread;
++  {
++    std::scoped_lock lock(g_mouseMotion.mutex);
++    version = g_mouseMotion.cursorVersion;
++    belongsToThread = g_mouseMotion.cursorThread == 0 || g_mouseMotion.cursorThread == thread;
++  }
++  const LRESULT result = CallNextHookEx(g_mouseLL, code, message, data);
++  if (result == 0 && belongsToThread) {
++    std::scoped_lock lock(g_mouseMotion.mutex);
++    if (version == g_mouseMotion.cursorVersion) {
++      g_mouseMotion.cursorAnchor = position;
++      g_mouseMotion.cursorValid = true;
++      ++g_mouseMotion.cursorVersion;
++    }
++  }
++  return result;
++}
++
++// 参数 position：返回最近放行的物理坐标；首次安装尚无回调时才查询系统位置。
++static bool readMouseAnchor(POINT &position)
++{
++  const DWORD thread = GetCurrentThreadId();
++  uint64_t version;
++  {
++    std::scoped_lock lock(g_mouseMotion.mutex);
++    if (g_mouseMotion.cursorThread != 0 && g_mouseMotion.cursorThread != thread) {
++      return false;
++    }
++    version = g_mouseMotion.cursorVersion;
++    if (g_mouseMotion.cursorValid) {
++      position = g_mouseMotion.cursorAnchor;
++      return true;
++    }
++  }
++  POINT actual{};
++  const auto dpiContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
++  const bool haveCursor = GetPhysicalCursorPos(&actual) != FALSE;
++  if (dpiContext != nullptr) {
++    SetThreadDpiAwarenessContext(dpiContext);
++  }
++  std::scoped_lock lock(g_mouseMotion.mutex);
++  if (g_mouseMotion.cursorThread != 0 && g_mouseMotion.cursorThread != thread) {
++    return false;
++  }
++  if (!g_mouseMotion.cursorValid && haveCursor && version == g_mouseMotion.cursorVersion) {
++    g_mouseMotion.cursorAnchor = actual;
++    g_mouseMotion.cursorValid = true;
++    ++g_mouseMotion.cursorVersion;
++  }
++  position = g_mouseMotion.cursorAnchor;
++  return g_mouseMotion.cursorValid;
++}
++
+ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
+ {
+   if (code >= 0) {
+@@ -884,7 +962,7 @@
+     // 本核心的回中和入屏定位只更新 Windows，不产生新的跨屏运动。
+     // 标记跟随事件，延迟到另一个 hook 模式后仍能精确识别。
+     if (deskflow::win32::isCursorWarp(wParam, *info)) {
+-      return CallNextHookEx(g_mouseLL, code, wParam, lParam);
++      return passMouseEvent(code, wParam, lParam);
+     }
+ 
+     bool const injected = info->flags & LLMHF_INJECTED;
+@@ -903,19 +981,15 @@
+     if (g_isPrimary && !mouseHandoff && mouseMode == kHOOK_WATCH_JUMP_ZONE && wParam == WM_MOUSEMOVE &&
+         std::getenv("DESKFLOW_MONITOR_TOPOLOGY") != nullptr) {
+       PostThreadMessage(g_threadID, DESKFLOW_MSG_MOUSE_MOVE, x, y);
+-      return CallNextHookEx(g_mouseLL, code, wParam, lParam);
++      return passMouseEvent(code, wParam, lParam);
+     }
+ 
+     // 在远端控制模式下，钩子会吞掉本机移动，实际光标仍停在原位。
+     // 在钩子中计算每条事件的位移，避免排队后回中消息丢弃真实移动。
+     if (g_isPrimary && (mouseMode == kHOOK_RELAY_EVENTS || mouseHandoff) && wParam == WM_MOUSEMOVE) {
+       POINT cursor;
+-      // 钩子坐标使用物理像素；明确查询线程的 DPI 上下文，避免缩放坐标混用。
+-      const auto dpiContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+-      const bool haveCursor = GetPhysicalCursorPos(&cursor);
+-      if (dpiContext != nullptr) {
+-        SetThreadDpiAwarenessContext(dpiContext);
+-      }
++      // 系统查询可能仍处于回中前的位置；按钩子观察到的放行顺序计算，不把回中当成硬件位移。
++      const bool haveCursor = readMouseAnchor(cursor);
+       if (haveCursor) {
+         const int32_t dx = x - cursor.x;
+         const int32_t dy = y - cursor.y;
+@@ -943,7 +1017,7 @@
+     }
+   }
+ 
+-  return CallNextHookEx(g_mouseLL, code, wParam, lParam);
++  return passMouseEvent(code, wParam, lParam);
+ }
+ 
+ EHookResult MSWindowsHook::install()
+@@ -963,6 +1037,7 @@
+   g_fakeServerInput = false;
+ 
+   // install low-level hooks.  we require that they both get installed.
++  invalidateMouseAnchor(GetCurrentThreadId());
+   g_mouseLL = SetWindowsHookEx(WH_MOUSE_LL, &mouseLLHook, nullptr, 0);
+ #if !NO_GRAB_KEYBOARD
+   g_keyboardLL = SetWindowsHookEx(WH_KEYBOARD_LL, &keyboardLLHook, nullptr, 0);
+@@ -1021,6 +1096,7 @@
+     g_getMessage = nullptr;
+   }
+ 
++  invalidateMouseAnchor();
+   return 1;
+ }
+ 
+diff --git a/tools/test-mouse-handoff.cpp b/tools/test-mouse-handoff.cpp
+--- a/tools/test-mouse-handoff.cpp
++++ b/tools/test-mouse-handoff.cpp
+@@ -3,6 +3,7 @@
+ #include "platform/MSWindowsCursorWarp.h"
+ #include <cstdio>
+ #include <cstdlib>
++#include <functional>
+ #include <vector>
+ 
+ namespace {
+@@ -19,9 +20,27 @@
+ int checks = 0;
+ std::vector<Posted> posted;
+ std::vector<INPUT> sentInputs;
++struct CursorDelivery {
++  bool commit = true;
++  bool blocked = false;
++  int afterWarpMoves = 0;
++  std::function<void()> onPass;
++  std::function<void()> onRead;
++  std::function<void()> onUnhook;
++} cursorDelivery;
+ LRESULT deliverWarp(const INPUT &input);
+ void deliverHardwareBeforeWarp();
+-BOOL WINAPI readCursor(LPPOINT p) { *p = physical; return cursorAvailable; }
++LRESULT deliverMouse(WPARAM message, MSLLHOOKSTRUCT &event);
++BOOL WINAPI readCursor(LPPOINT p) {
++  *p = physical;
++  const bool available = cursorAvailable;
++  if (cursorDelivery.onRead) {
++    auto callback = std::move(cursorDelivery.onRead);
++    cursorDelivery.onRead = nullptr;
++    callback();
++  }
++  return available;
++}
+ DPI_AWARENESS_CONTEXT WINAPI dpiScope(DPI_AWARENESS_CONTEXT) { return nullptr; }
+ BOOL WINAPI post(DWORD, UINT message, WPARAM w, LPARAM l) {
+   if (!postAvailable) { return FALSE; }
+@@ -41,15 +60,41 @@
+     --reentrantMoves;
+     deliverHardwareBeforeWarp();
+   }
+-  deliverWarp(*inputs);
+-  physical.x = inputs->mi.dx * 8192 / 65536;
+-  physical.y = inputs->mi.dy * 4096 / 65536;
++  if (cursorDelivery.afterWarpMoves > 0) {
++    --cursorDelivery.afterWarpMoves;
++    cursorDelivery.commit = false;
++    deliverWarp(*inputs);
++    MSLLHOOKSTRUCT hardware{};
++    hardware.pt = {inputs->mi.dx * 8192 / 65536 + reentrantDelta.x,
++                   inputs->mi.dy * 4096 / 65536 + reentrantDelta.y};
++    deliverMouse(WM_MOUSEMOVE, hardware);
++    cursorDelivery.commit = true;
++    physical = {inputs->mi.dx * 8192 / 65536, inputs->mi.dy * 4096 / 65536};
++  } else {
++    deliverWarp(*inputs);
++  }
+   return 1;
+ }
+-LRESULT WINAPI pass(HHOOK, int, WPARAM, LPARAM) { ++passed; return 0; }
++LRESULT WINAPI pass(HHOOK, int, WPARAM, LPARAM) {
++  ++passed;
++  if (cursorDelivery.onPass) {
++    auto callback = std::move(cursorDelivery.onPass);
++    cursorDelivery.onPass = nullptr;
++    callback();
++  }
++  return cursorDelivery.blocked ? 1 : 0;
++}
+ SHORT WINAPI keyState(int) { return 0; }
+ int WINAPI translate(UINT, UINT, const BYTE *, LPWSTR, int, UINT) { return 0; }
+-BOOL WINAPI unhook(HHOOK) { return TRUE; }
++BOOL WINAPI unhook(HHOOK) {
++  if (cursorDelivery.onUnhook) {
++    auto callback = std::move(cursorDelivery.onUnhook);
++    cursorDelivery.onUnhook = nullptr;
++    callback();
++  }
++  return TRUE;
++}
++HHOOK WINAPI installHook(int, HOOKPROC, HINSTANCE, DWORD) { return reinterpret_cast<HHOOK>(1); }
+ void check(bool success, const char *message) {
+   ++checks;
+   if (!success) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
+@@ -65,6 +110,8 @@
+ #define GetAsyncKeyState keyState
+ #define ToUnicode translate
+ #define UnhookWindowsHookEx unhook
++#undef SetWindowsHookEx
++#define SetWindowsHookEx installHook
+ #define GetCurrentThreadId threadId
+ #define GetSystemMetrics metrics
+ #define SendInput sendInputs
+@@ -74,16 +121,32 @@
+ #pragma warning(pop)
+ 
+ namespace {
++// 参数 message/event：先执行生产钩子，成功放行后才模拟 Windows 提交光标位置。
++LRESULT deliverMouse(WPARAM message, MSLLHOOKSTRUCT &event) {
++  const auto result = mouseLLHook(HC_ACTION, message, reinterpret_cast<LPARAM>(&event));
++  if (result == 0 && message == WM_MOUSEMOVE && cursorDelivery.commit) {
++    physical = event.pt;
++  }
++  return result;
++}
+ LRESULT deliverWarp(const INPUT &input) {
+   MSLLHOOKSTRUCT warp{};
++  warp.pt = {input.mi.dx * 8192 / 65536, input.mi.dy * 4096 / 65536};
+   warp.dwExtraInfo = input.mi.dwExtraInfo;
+   warp.flags = LLMHF_INJECTED;
+-  return mouseLLHook(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&warp));
++  return deliverMouse(WM_MOUSEMOVE, warp);
++}
++// 参数 position：模拟核心自身带标记的定位，绝不调用桌面 API。
++void placeCursor(POINT position) {
++  INPUT input{};
++  check(deskflow::win32::makeCursorWarp(position.x, position.y, {0, 0, 8192, 4096}, input),
++        "fixture cursor placement is representable");
++  deliverWarp(input);
+ }
+ void deliverHardwareBeforeWarp() {
+   MSLLHOOKSTRUCT hardware{};
+   hardware.pt = {physical.x + reentrantDelta.x, physical.y + reentrantDelta.y};
+-  mouseLLHook(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&hardware));
++  deliverMouse(WM_MOUSEMOVE, hardware);
+ }
+ }
+ 
+@@ -104,10 +167,11 @@
+   hook.setMode(kHOOK_WATCH_JUMP_ZONE);
+   MSLLHOOKSTRUCT mouse{};
+   mouse.pt = {969, 548};
+-  const auto move = [&] { return mouseLLHook(HC_ACTION, WM_MOUSEMOVE, reinterpret_cast<LPARAM>(&mouse)); };
++  const auto move = [&] { return deliverMouse(WM_MOUSEMOVE, mouse); };
+   check(move() == 0 && passed == 1, "normal local motion still reaches Windows");
+   hook.beginMouseHandoff();
+   posted.clear();
++  mouse.pt = {978, 556};
+   check(move() == 1 && passed == 1, "handoff consumes real movement before the parking warp");
+   check(posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_MOVE_DELTA &&
+         posted[0].w == 9 && posted[0].l == 8, "handoff keeps the actual hardware delta");
+@@ -183,7 +247,7 @@
+ 
+   hook.setMode(kHOOK_RELAY_EVENTS);
+   check(!g_mouseMotion.local.load(), "formal mode changes clear the temporary local movement override");
+-  physical = {960, 540};
++  placeCursor({960, 540});
+   mouse.pt = {965, 538};
+   postAvailable = false;
+   check(move() == 1 && g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
+@@ -242,7 +306,7 @@
+ 
+   hook.cleanup();
+   hook.setMode(kHOOK_RELAY_EVENTS);
+-  physical = {960, 540};
++  placeCursor({960, 540});
+   posted.clear();
+   sentInputs.clear();
+   reentrantMoves = 1;
+@@ -254,7 +318,7 @@
+         "return-only reentrant motion does not produce stale ordinary delta messages");
+ 
+   hook.setMode(kHOOK_RELAY_EVENTS);
+-  physical = {960, 540};
++  placeCursor({960, 540});
+   posted.clear();
+   sentInputs.clear();
+   reentrantMoves = 9;
+@@ -291,6 +355,160 @@
+   check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 3 && destination.y == 100,
+         "reverse hardware movement after an edge clamp starts at the actual cursor position");
+   reentrantDelta = {7, -3};
++
++  hook.cleanup();
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  physical = {2536, 753};
++  cursorDelivery.commit = false;
++  mouse.pt = {2559, 750};
++  move();
++  hook.beginMouseHandoff();
++  posted.clear();
++  mouse.pt = {2562, 747};
++  check(move() == 1 && posted.size() == 1 && posted.back().w == 3 && posted.back().l == -3,
++        "handoff retains the last accepted local point while the physical query is still one event behind");
++  mouse.pt = {1280, 720};
++  mouse.dwExtraInfo = deskflow::win32::kCursorWarpTag; mouse.flags = LLMHF_INJECTED;
++  const auto beforeParking = posted.size();
++  check(move() == 0 && posted.size() == beforeParking && physical.x == 2536 && physical.y == 753,
++        "an observed parking warp does not require the asynchronous physical query to catch up");
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  mouse.dwExtraInfo = 0; mouse.flags = 0;
++  mouse.pt = {1283, 717};
++  check(move() == 1 && posted.back().message == DESKFLOW_MSG_MOUSE_MOVE_DELTA &&
++        posted.back().w == 3 && posted.back().l == -3,
++        "parking at the center cannot become a screen-sized reverse hardware delta");
++  mouse.pt = {1276, 725};
++  check(move() == 1 && posted.back().w == static_cast<WPARAM>(-4) && posted.back().l == 5,
++        "consumed motion leaves the parking anchor unchanged for the next independent hardware event");
++  cursorAvailable = false;
++  mouse.pt = {1281, 722};
++  check(move() == 1 && posted.back().w == 1 && posted.back().l == 2,
++        "an observed anchor keeps relaying exact motion without another physical cursor query");
++  cursorAvailable = true;
++  cursorDelivery.blocked = true;
++  mouse.pt = {400, 300};
++  mouse.dwExtraInfo = deskflow::win32::kCursorWarpTag; mouse.flags = LLMHF_INJECTED;
++  check(move() == 1, "a downstream hook may reject a tagged warp");
++  cursorDelivery.blocked = false;
++  mouse.dwExtraInfo = 0; mouse.flags = 0;
++  mouse.pt = {1282, 719};
++  check(move() == 1 && posted.back().w == 2 && posted.back().l == -1,
++        "a rejected tagged warp cannot replace the last accepted cursor anchor");
++  mouse.pt = {1000, 700};
++  mouse.dwExtraInfo = deskflow::win32::kCursorWarpTag; mouse.flags = LLMHF_INJECTED;
++  cursorDelivery.onPass = [] { placeCursor({1200, 650}); };
++  check(move() == 0, "tagged warp dispatch permits a newer reentrant warp");
++  mouse.dwExtraInfo = 0; mouse.flags = 0;
++  mouse.pt = {1202, 648};
++  check(move() == 1 && posted.back().w == 2 && posted.back().l == -2,
++        "an outer callback returning later cannot overwrite the newer reentrant warp anchor");
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  mouse.pt = {1000, 700};
++  mouse.dwExtraInfo = deskflow::win32::kCursorWarpTag; mouse.flags = LLMHF_INJECTED;
++  cursorDelivery.onPass = [] {
++    MSLLHOOKSTRUCT local{};
++    local.pt = {1008, 697};
++    deliverMouse(WM_MOUSEMOVE, local);
++  };
++  move();
++  hook.beginMouseHandoff();
++  mouse.dwExtraInfo = 0; mouse.flags = 0;
++  mouse.pt = {1010, 695};
++  check(move() == 1 && posted.back().w == 2 && posted.back().l == -2,
++        "a newer accepted local callback also survives an older tagged callback returning afterwards");
++  cursorDelivery.commit = true;
++
++  hook.cleanup();
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  physical = {960, 540};
++  posted.clear();
++  sentInputs.clear();
++  cursorDelivery.afterWarpMoves = 1;
++  destination = {100, 200};
++  check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 107 && destination.y == 197 &&
++        sentInputs.size() == 2 && g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0,
++        "return conserves hardware motion after the warp callback even while physical queries still show the old position");
++  check(posted.size() == 1 && posted.back().message == DESKFLOW_MSG_MOUSE_MOVE,
++        "post-warp return motion is absorbed once without posting an ordinary remote delta");
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  mouse.pt = {110, 195};
++  move();
++  sendAvailable = false;
++  destination = {300, 400};
++  check(!MSWindowsHook::returnMouseToPrimary(destination), "failed return warp is reported to its caller");
++  sendAvailable = true;
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  posted.clear();
++  mouse.pt = {109, 196};
++  check(move() == 1 && posted.back().w == 2 && posted.back().l == -1,
++        "a failed SendInput leaves the accepted anchor available for the next real motion");
++  hook.uninstall();
++  g_mouseLL = reinterpret_cast<HHOOK>(1);
++  physical = {500, 400};
++  mouse.pt = {504, 398};
++  posted.clear();
++  check(move() == 1 && posted.back().w == 4 && posted.back().l == -2,
++        "a hook reinstall discards the previous desktop anchor and seeds its first delta from the current cursor");
++
++  hook.cleanup();
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  physical = {960, 540};
++  hook.beginMouseHandoff();
++  posted.clear();
++  cursorDelivery.onRead = [&] { hook.uninstall(); };
++  mouse.pt = {965, 538};
++  check(move() == 1 && posted.empty(),
++        "a cursor query reentering hook teardown cannot seed a stale desktop position afterwards");
++  g_mouseLL = reinterpret_cast<HHOOK>(1);
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  cursorDelivery.onUnhook = [] {
++    MSLLHOOKSTRUCT local{};
++    local.pt = {1200, 700};
++    deliverMouse(WM_MOUSEMOVE, local);
++  };
++  hook.uninstall();
++  g_mouseLL = reinterpret_cast<HHOOK>(1);
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  physical = {500, 400};
++  mouse.pt = {504, 398};
++  posted.clear();
++  check(move() == 1 && posted.back().w == 4 && posted.back().l == -2,
++        "a final local callback during unhook cannot leave an anchor across the unhooked interval");
++  hook.uninstall();
++  ++currentThread;
++  g_threadID = 1;
++  check(hook.install() == kHOOK_OKAY_LL, "fixture hook install binds the new desktop thread without installing an OS hook");
++  placeCursor({500, 400});
++  --currentThread;
++  cursorDelivery.commit = false;
++  placeCursor({1200, 700});
++  cursorDelivery.commit = true;
++  ++currentThread;
++  mouse.pt = {504, 398};
++  posted.clear();
++  check(move() == 1 && posted.back().w == 4 && posted.back().l == -2,
++        "a late old-desktop callback cannot replace the new desktop thread's accepted anchor");
++  hook.cleanup();
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  physical = {960, 540};
++  hook.beginMouseHandoff();
++  posted.clear();
++  cursorDelivery.onRead = [&] {
++    hook.uninstall();
++    ++currentThread;
++    hook.install();
++    placeCursor({500, 400});
++    --currentThread;
++  };
++  mouse.pt = {965, 538};
++  check(move() == 1 && posted.empty(),
++        "an old-desktop query cannot borrow the new desktop anchor installed during its callback");
++  ++currentThread;
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  mouse.pt = {504, 398};
++  check(move() == 1 && posted.back().w == 4 && posted.back().l == -2,
++        "the new desktop's accepted anchor survives an older query completing afterwards");
+ 
+   struct HeldKey { DWORD vk; DWORD scan; DWORD flags; };
+   const HeldKey heldKeys[] = {
+diff --git a/tools/test-mouse-recovery.cpp b/tools/test-mouse-recovery.cpp
+--- a/tools/test-mouse-recovery.cpp
++++ b/tools/test-mouse-recovery.cpp
+@@ -310,6 +310,41 @@
+   check(dpi.m_x==2559 && dpi.m_y==900 && dpiSource.centers==0,
+         "mixed-DPI recovery preserves the original physical pixel point");
+ 
++  // 事故实际布局：Dell 为 125%，qingxian 为 100%，两屏共享画布纵向相差 29px。
++  const QJsonObject observedDell{{"owner","A"},{"nativeX",0},{"nativeY",0},{"x",8874},{"y",1338},
++      {"width",2560},{"height",1440},{"canvasWidth",2048},{"canvasHeight",1152},{"active",true}};
++  const QJsonObject observedPeer{{"owner","B"},{"nativeX",0},{"nativeY",0},{"x",10922},{"y",1367},
++      {"width",1920},{"height",1080},{"canvasWidth",1920},{"canvasHeight",1080},{"active",true}};
++  writeLayout({observedDell,observedPeer});
++  PrimaryClient observedSource;BaseClientProxy observedRemote("B");Server observed(observedSource,observedRemote);
++  observedSource.shapeWidth=2560;observedSource.shapeHeight=1440;
++  observedRemote.shapeWidth=1920;observedRemote.shapeHeight=1080;
++  observed.m_x=2558;observed.m_y=750;
++  check(observed.onMouseMovePrimary(2560,750) && observed.m_active==&observedRemote &&
++        observed.m_x==0 && observed.m_y==571 && observedRemote.enters==1,
++        "observed mixed-DPI primary crossing enters qingxian at its actual edge coordinates");
++  check(!observed.onMouseMovePrimary(24,687) && observed.m_active==&observedRemote &&
++        observed.m_x==0 && observed.m_y==571 && observedRemote.positions.size()==1,
++        "a queued primary absolute point cannot become secondary motion after the observed crossing");
++  observed.onMouseMoveSecondary(2,0);
++  check(observed.m_active==&observedRemote && observed.m_x==2 && observed.m_y==571,
++        "genuine forward motion after the observed crossing stays on the peer without a position jump");
++  observed.onMouseMoveSecondary(-3,0);
++  check(observed.m_active==&observedSource && observed.m_x==2557 && observed.m_y==750 &&
++        observedSource.centers==0,
++        "an immediate genuine reverse crossing remains available and maps to the original local edge");
++
++  PrimaryClient largeSource;BaseClientProxy largeRemote("B");Server largeMotion(largeSource,largeRemote);
++  largeSource.shapeWidth=2560;largeSource.shapeHeight=1440;
++  largeRemote.shapeWidth=1920;largeRemote.shapeHeight=1080;
++  largeMotion.m_x=2558;largeMotion.m_y=750;
++  check(largeMotion.onMouseMovePrimary(2560,750) && largeMotion.m_x==0 && largeMotion.m_y==571,
++        "large-delta regression starts from the exact observed peer entry");
++  largeMotion.onMouseMoveSecondary(-1256,-33);
++  check(largeMotion.m_active==&largeSource && largeMotion.m_x==988 && largeMotion.m_y==708 &&
++        largeSource.centers==0,
++        "the observed bounce vector is a preserved real-motion overshoot, not a center recovery fallback");
++
+   qunsetenv("DESKFLOW_MONITOR_TOPOLOGY");
+   PrimaryClient legacySource;BaseClientProxy legacyPeer("B");Server legacy(legacySource,legacyPeer);
+   legacy.m_x=299;legacy.m_y=67;legacySource.leaveAllowed=false;
+diff --git a/doc/dev/windows-pointer-motion.md b/doc/dev/windows-pointer-motion.md
+--- a/doc/dev/windows-pointer-motion.md
++++ b/doc/dev/windows-pointer-motion.md
+@@ -101,3 +101,24 @@
+ 需要重启时通过现有 `deskflow-daemon` 管道请求 Hub 重载 server，只重启 Deskflow。
+ 回退脚本为诊断目录内的 `rollback-runtime.ps1`，可将 v25 改名为 disabled-v25 并恢复
+ v24 配置；回退后同样需要通过管道重载并确认实际进程路径。
++
++## 2026-11-13：穿到对端后立即回跳
++
++现场记录 Desktop-Lin 在 17:52:49.145 切入 qingxian，约 10ms 后正常路由回本机
++(988,708)，期间没有断线或失败归位。当前布局为本机 2560x1440、逻辑 2048x1152，
++对端 1920x1080；从对端 (0,571) 加上 (-1256,-33) 恰好得到上述本机落点。
++这个反向位移与停车坐标 (1280,720) 减旧坐标 (2536,753) 一致，指向停车与采样交错。
++日志无法单独证明每次系统回调的时序，因此增加真实生产回调的离线竞态复现。
++
++低级鼠标回调发生在输入即将投递时，SendInput 返回插入数量，不代表光标位置已完成
++更新。逐事件用 info.pt 减 GetPhysicalCursorPos() 会混用两个进度的坐标。
++修复让钩子观察到的放行移动和带标签停车共同维护基准；远端已消费移动保持基准，
++不会把每次事件误当作光标已经移动。下游吞掉的移动不提交基准，重入时较旧回调不能
++覆盖更新事件，卸载/重装清除旧基准但保留待消费位移和顺序号。
++
++回归使用模拟 Win32 边界调用真实生产回调，覆盖停车标签已到中心而系统查询仍在
++边缘、停车前硬件输入、连续拦截、下游拦截、返回重入及失败路径。没有添加禁返延时、
++丢首帧或大位移裁剪；这些回归不向用户桌面注入测试输入。
++
++参考：[LowLevelMouseProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc)、
++[SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)。
