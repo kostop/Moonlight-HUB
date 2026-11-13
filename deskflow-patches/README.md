@@ -19,6 +19,9 @@ Alt/Win 单击而误激活菜单；普通同屏菜单用法保持原样。以上
 `deskflow-windows-motion-anchor.patch` 让停车定位和真实鼠标移动共用钩子事件顺序中的
 坐标基准，避免切屏时拿新事件坐标减旧系统快照，产生上千像素的假反向移动。
 正常快速移动、立即反向穿回及尚未消费的返回位移继续保留。
+`deskflow-windows-pointer-clip.patch` 把钩子基准和回位落点按最近显示器裁剪，与 Windows
+实际光标一致：穿屏时越过边缘的放行坐标不再让首批位移反向弹回本机；回位以确定落点
+续算，不读回 SendInput 后仍可能停在停车中心的系统光标，避免被拉回屏幕中心。
 
 上游下载仅是构建输入，位于被忽略的 `artifacts/`。触摸包装器、过滤器与键盘辅助程序
 源码在本仓库的 [native/deskflow-touch](../native/deskflow-touch/README.md)。

@@ -1,0 +1,277 @@
+diff --git a/src/lib/platform/MSWindowsHook.cpp b/src/lib/platform/MSWindowsHook.cpp
+--- a/src/lib/platform/MSWindowsHook.cpp
++++ b/src/lib/platform/MSWindowsHook.cpp
+@@ -157,6 +157,19 @@
+   g_mouseMotion.local = false;
+   g_mouseMotion.returning = false;
+ }
++
++// 参数 position：物理坐标，调用方需处于每显示器 DPI 上下文；返回 Windows 裁剪后实际落到的显示器内位置。
++static POINT clipToMonitor(POINT position)
++{
++  MONITORINFO info{};
++  info.cbSize = sizeof(info);
++  const HMONITOR monitor = MonitorFromPoint(position, MONITOR_DEFAULTTONEAREST);
++  if (monitor != nullptr && GetMonitorInfo(monitor, &info)) {
++    position.x = std::clamp(position.x, info.rcMonitor.left, info.rcMonitor.right - 1);
++    position.y = std::clamp(position.y, info.rcMonitor.top, info.rcMonitor.bottom - 1);
++  }
++  return position;
++}
+ static uint32_t g_zoneSides = 0;
+ static int32_t g_zoneSize = 0;
+ static int32_t g_xScreen = 0;
+@@ -314,7 +327,7 @@
+   return true;
+ }
+ 
+-// 参数 position：本轮最近一次有效的实际光标位置；输入的目标已保存在交接状态中。
++// 参数 position：返回本轮回位的确定落点；注入失败时为实际光标位置。输入的目标已保存在交接状态中。
+ static bool finishMouseReturn(POINT &position)
+ {
+   POINT actual{};
+@@ -334,7 +347,8 @@
+     position = actual;
+   }
+   bool complete = false;
+-  // SendInput 可能重入真实硬件回调；每轮只合入新增量，最多四轮后把余量交还消息循环。
++  bool injected = true;
++  // SendInput 会重入本线程钩子并带入排队的真实移动；每轮只合入新增量，最多四轮后把余量交还消息循环。
+   for (int attempt = 0; attempt < 4 && g_mouseMotion.returning.load(); ++attempt) {
+     INPUT input{};
+     bool valid = false;
+@@ -349,25 +363,24 @@
+                                          static_cast<int64_t>(bounds.x) + bounds.width - 1);
+         const auto y = std::clamp<int64_t>(g_mouseMotion.targetY, bounds.y,
+                                          static_cast<int64_t>(bounds.y) + bounds.height - 1);
+-        valid = deskflow::win32::makeCursorWarp(static_cast<int32_t>(x), static_cast<int32_t>(y), bounds, input);
+-      }
+-    }
+-    // 不持锁调用 SendInput：系统可能在此调用本线程的低级钩子。
++        // 桌面边缘或显示器间隙会裁剪目标；保存裁剪后的落点，下一轮反向移动不会被越界余量吞掉。
++        const POINT landing = clipToMonitor({static_cast<LONG>(x), static_cast<LONG>(y)});
++        g_mouseMotion.targetX = landing.x;
++        g_mouseMotion.targetY = landing.y;
++        valid = deskflow::win32::makeCursorWarp(landing.x, landing.y, bounds, input);
++      }
++    }
++    // 不持锁调用 SendInput：系统会在此调用本线程的低级钩子。
+     const bool moved = valid && SendInput(1, &input, sizeof(input)) == 1;
+-    POINT latest{};
+-    const bool haveCursor = GetPhysicalCursorPos(&latest) != FALSE;
+-    if (haveCursor) {
+-      position = latest;
+-    }
+     std::scoped_lock lock(g_mouseMotion.mutex);
+-    if (!moved || !haveCursor) {
++    if (!moved) {
++      injected = false;
+       g_mouseMotion.local = true;
+       g_mouseMotion.returning = false;
+       break;
+     }
+-    // 桌面边缘或显示器间隙可能裁剪目标；下一轮应从实际落点继续，避免反向移动被越界余量吞掉。
+-    g_mouseMotion.targetX = position.x;
+-    g_mouseMotion.targetY = position.y;
++    // SendInput 返回时系统光标查询可能仍停在停车中心；只用本轮确定的落点，读回旧坐标会把余量叠到中心。
++    position = {static_cast<LONG>(g_mouseMotion.targetX), static_cast<LONG>(g_mouseMotion.targetY)};
+     if (g_mouseMotion.pendingX == 0 && g_mouseMotion.pendingY == 0) {
+       // 先排入校准坐标，再放行本机移动，保证后续绝对坐标不会被旧坐标覆盖。
+       PostThreadMessage(g_threadID, DESKFLOW_MSG_MOUSE_MOVE, position.x, position.y);
+@@ -376,6 +389,10 @@
+       complete = true;
+       break;
+     }
++  }
++  // 未注入时光标仍在原处，报告实际位置而不是请求的目标。
++  if (!injected && GetPhysicalCursorPos(&actual)) {
++    position = actual;
+   }
+   if (g_mouseMotion.returning.load() &&
+       !PostThreadMessage(g_hookThread, DESKFLOW_MSG_MOUSE_RETURN, 0, 0)) {
+@@ -918,39 +935,45 @@
+   return result;
+ }
+ 
+-// 参数 position：返回最近放行的物理坐标；首次安装尚无回调时才查询系统位置。
++// 参数 position：返回最近放行事件的实际落点；首次安装尚无回调时才查询系统位置。
+ static bool readMouseAnchor(POINT &position)
+ {
+   const DWORD thread = GetCurrentThreadId();
+   uint64_t version;
++  bool valid;
+   {
+     std::scoped_lock lock(g_mouseMotion.mutex);
+     if (g_mouseMotion.cursorThread != 0 && g_mouseMotion.cursorThread != thread) {
+       return false;
+     }
+     version = g_mouseMotion.cursorVersion;
+-    if (g_mouseMotion.cursorValid) {
++    valid = g_mouseMotion.cursorValid;
++    position = g_mouseMotion.cursorAnchor;
++  }
++  const auto dpiContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
++  if (!valid) {
++    POINT actual{};
++    const bool haveCursor = GetPhysicalCursorPos(&actual) != FALSE;
++    std::scoped_lock lock(g_mouseMotion.mutex);
++    if (g_mouseMotion.cursorThread == 0 || g_mouseMotion.cursorThread == thread) {
++      if (!g_mouseMotion.cursorValid && haveCursor && version == g_mouseMotion.cursorVersion) {
++        g_mouseMotion.cursorAnchor = actual;
++        g_mouseMotion.cursorValid = true;
++        ++g_mouseMotion.cursorVersion;
++      }
+       position = g_mouseMotion.cursorAnchor;
+-      return true;
+-    }
+-  }
+-  POINT actual{};
+-  const auto dpiContext = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+-  const bool haveCursor = GetPhysicalCursorPos(&actual) != FALSE;
++      valid = g_mouseMotion.cursorValid;
++    }
++  }
++  // 逻辑布局靠越过屏幕边缘的放行坐标判断穿屏，Windows 随后会把光标裁剪回显示器内；
++  // 以裁剪后的落点为基准，穿屏后首批被拦截的移动才不会被越界量抵消成反向位移而弹回。
++  if (valid) {
++    position = clipToMonitor(position);
++  }
+   if (dpiContext != nullptr) {
+     SetThreadDpiAwarenessContext(dpiContext);
+   }
+-  std::scoped_lock lock(g_mouseMotion.mutex);
+-  if (g_mouseMotion.cursorThread != 0 && g_mouseMotion.cursorThread != thread) {
+-    return false;
+-  }
+-  if (!g_mouseMotion.cursorValid && haveCursor && version == g_mouseMotion.cursorVersion) {
+-    g_mouseMotion.cursorAnchor = actual;
+-    g_mouseMotion.cursorValid = true;
+-    ++g_mouseMotion.cursorVersion;
+-  }
+-  position = g_mouseMotion.cursorAnchor;
+-  return g_mouseMotion.cursorValid;
++  return valid;
+ }
+ 
+ static LRESULT CALLBACK mouseLLHook(int code, WPARAM wParam, LPARAM lParam)
+diff --git a/tools/test-mouse-handoff.cpp b/tools/test-mouse-handoff.cpp
+--- a/tools/test-mouse-handoff.cpp
++++ b/tools/test-mouse-handoff.cpp
+@@ -31,8 +31,12 @@
+ LRESULT deliverWarp(const INPUT &input);
+ void deliverHardwareBeforeWarp();
+ LRESULT deliverMouse(WPARAM message, MSLLHOOKSTRUCT &event);
++// 实测 SendInput 返回时查询可能仍是旧坐标；开启后查询返回 laggedCursor，钩子与系统光标照常前进。
++bool queryLag = false;
++POINT laggedCursor{};
++RECT monitorRect{0, 0, 8192, 4096};
+ BOOL WINAPI readCursor(LPPOINT p) {
+-  *p = physical;
++  *p = queryLag ? laggedCursor : physical;
+   const bool available = cursorAvailable;
+   if (cursorDelivery.onRead) {
+     auto callback = std::move(cursorDelivery.onRead);
+@@ -52,6 +56,12 @@
+   if (index == SM_CXVIRTUALSCREEN) { return validBounds ? 8192 : 0; }
+   if (index == SM_CYVIRTUALSCREEN) { return 4096; }
+   return 0;
++}
++HMONITOR WINAPI monitorAt(POINT, DWORD) { return reinterpret_cast<HMONITOR>(1); }
++BOOL WINAPI monitorInfo(HMONITOR, LPMONITORINFO info) {
++  info->rcMonitor = monitorRect;
++  info->rcWork = monitorRect;
++  return TRUE;
+ }
+ UINT WINAPI sendInputs(UINT count, LPINPUT inputs, int size) {
+   if (!sendAvailable || count != 1 || size != sizeof(INPUT)) { return 0; }
+@@ -114,6 +124,9 @@
+ #define SetWindowsHookEx installHook
+ #define GetCurrentThreadId threadId
+ #define GetSystemMetrics metrics
++#define MonitorFromPoint monitorAt
++#undef GetMonitorInfo
++#define GetMonitorInfo monitorInfo
+ #define SendInput sendInputs
+ #pragma warning(push)
+ #pragma warning(disable: 4457) // 原键盘回调内的同名参数不属于本次修改。
+@@ -509,6 +522,50 @@
+   mouse.pt = {504, 398};
+   check(move() == 1 && posted.back().w == 4 && posted.back().l == -2,
+         "the new desktop's accepted anchor survives an older query completing afterwards");
++
++  // 实测：钩子线程的 SendInput 会重入本线程钩子并带入排队的真实移动，但返回时光标查询仍可能停在停车点。
++  hook.cleanup();
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  placeCursor({1280, 720});
++  posted.clear();
++  sentInputs.clear();
++  queryLag = true;
++  laggedCursor = {1280, 720};
++  reentrantMoves = 1;
++  destination = {2556, 745};
++  check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 2563 && destination.y == 742 &&
++        physical.x == 2563 && physical.y == 742 && sentInputs.size() == 2,
++        "a lagging cursor query after the return warp cannot pull the cursor back to the parking center");
++  check(posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_MOVE && posted[0].w == 2563 &&
++        posted[0].l == 742, "calibration publishes the deterministic landing instead of the lagging query");
++  queryLag = false;
++
++  // 逻辑布局靠越过屏幕边缘的放行坐标判定穿屏，Windows 随后把光标裁剪回显示器内。
++  monitorRect = {0, 0, 2560, 1440};
++  hook.cleanup();
++  hook.setMode(kHOOK_WATCH_JUMP_ZONE);
++  mouse = {};
++  mouse.pt = {2575, 702};
++  check(move() == 0, "the crossing motion beyond the monitor edge still reaches Windows and the router");
++  physical = {2559, 702};
++  hook.beginMouseHandoff();
++  posted.clear();
++  mouse.pt = {2563, 703};
++  check(move() == 1 && posted.size() == 1 && posted[0].message == DESKFLOW_MSG_MOUSE_MOVE_DELTA &&
++        posted[0].w == 4 && posted[0].l == 1,
++        "the first captured delta after crossing is measured from the clipped cursor, not the raw overshoot");
++  mouse.pt = {2559, 705};
++  check(move() == 1 && posted.back().w == 0 && posted.back().l == 3,
++        "a vertical-only event right after crossing cannot become a reverse delta that bounces back");
++  hook.setMode(kHOOK_RELAY_EVENTS);
++  reentrantDelta = {-5, 0};
++  reentrantMoves = 1;
++  destination = {2556, 745};
++  check(MSWindowsHook::returnMouseToPrimary(destination) && destination.x == 2554 && destination.y == 749 &&
++        physical.x == 2554 && physical.y == 749,
++        "a return beyond the monitor edge lands on the edge like Windows and reverse motion continues from there");
++  reentrantDelta = {7, -3};
++  monitorRect = {0, 0, 8192, 4096};
+ 
+   struct HeldKey { DWORD vk; DWORD scan; DWORD flags; };
+   const HeldKey heldKeys[] = {
+diff --git a/doc/dev/windows-pointer-motion.md b/doc/dev/windows-pointer-motion.md
+--- a/doc/dev/windows-pointer-motion.md
++++ b/doc/dev/windows-pointer-motion.md
+@@ -122,3 +122,26 @@
+ 
+ 参考：[LowLevelMouseProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelmouseproc)、
+ [SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)。
++
++## 2026-11-13：穿屏瞬间被拉回屏幕中心
++
++a59f9eb 之后本机穿向 qingxian 几乎必现回弹：日志中 21:58:33、22:11:08、22:13:10 等
++多次在切入后 6–13ms 又切回本机，随后光标停在停车中心附近；21:12:22 从 qingxian 回本机
++时也记录了 `could not confirm mouse return position; last known position 1248,721`。
++
++两个原因叠加：
++
++1. 逻辑布局要看到越过屏幕边缘的放行坐标才能判定穿屏（落点 x=0..14 即越界量），
++   Windows 随后把真实光标裁剪回 2559。钩子却把未裁剪的放行坐标当作基准，停车回位到达
++   之前被拦截的每条移动都少算 1+越界量；纯纵向或减速的一帧就变成反向位移而弹回本机。
++2. 本机实测（1px 带标签回位探针，钩子线程内 SendInput）：SendInput 会在返回前重入本线程
++   钩子，排队的真实移动也随之到达；但返回后 GetPhysicalCursorPos 仍可能是旧坐标。回位
++   逻辑把这个旧坐标（停车中心）当作下一轮起点，手还在移动时就把光标送到“中心+余量”。
++
++修复：钩子基准在使用时按最近显示器裁剪（MonitorFromPoint + rcMonitor，与 Windows 裁剪
++一致）；回位每轮先把目标收进显示器，再以这个确定落点作为下一轮起点和校准坐标，不再读回
++系统光标。只有注入失败时才报告实际光标位置。网络协议、停车与按键时序不变。
++
++离线回归新增三项（共 619 项生产钩子检查）：查询滞后时回位不被拉回中心、穿屏越界后首批
++位移按裁剪后的光标计算、越界回位落在边缘且反向移动从边缘继续。把新测试套在上一版钩子上，
++前两项分别失败，证明测试能复现两种旧行为。其余键盘、菜单、长按、返回与定位回归均通过。
