@@ -106,6 +106,28 @@ function Test-SourceReceipt([string]$Source, [IO.FileInfo[]]$Patches) {
     } catch { return $false }
 }
 
+# Source/Patches：验证旧缓存记录是当前有序补丁列表的完整前缀；内容变化时禁止重放或覆盖已有源码。
+function Get-CachedPatchPrefixLength([string]$Source, [IO.FileInfo[]]$Patches) {
+    $path = Join-Path $Source '.moonlight-hub-patches.json'
+    try { $receipt = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { throw 'Invalid cached patch receipt; use a separate clean generated source directory.' }
+    $count = @($receipt.patches.PSObject.Properties).Count
+    if ($receipt.format -ne 1 -or $count -gt $Patches.Count) {
+        throw 'Cached patch prefix changed; refusing to overwrite the generated source.'
+    }
+    $prefix = @($Patches | Select-Object -First $count)
+    foreach ($patch in $prefix) {
+        $entry = $receipt.patches.PSObject.Properties[$patch.Name]
+        if (!$entry -or $entry.Value -ne (Get-FileHash -LiteralPath $patch.FullName).Hash) {
+            throw "Cached patch prefix changed: $($patch.Name); refusing to overwrite the generated source."
+        }
+    }
+    if (!(Test-SourceReceipt -Source $Source -Patches $prefix)) {
+        throw 'Cached patched source changed; refusing to apply additional patches over local edits.'
+    }
+    return $count
+}
+
 # Source/Patches：应用完成后的生成缓存及补丁；记录内容哈希，只有内容未变时才允许跳过整组补丁。
 function Write-SourceReceipt([string]$Source, [IO.FileInfo[]]$Patches) {
     $patchesByName = @{}
@@ -152,9 +174,13 @@ if (!$PreparedSource) {
     $actualBase = $revision.Output[-1].Trim()
     if ($actualBase -ne $base) { throw 'Unexpected upstream revision; use a clean v1.26.0 source.' }
     $patches = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.patch' -File | Sort-Object Name)
-    if (!(Test-SourceReceipt -Source $PreparedSource -Patches $patches)) {
-        if (!(Test-SourcePatchSeries -Source $PreparedSource -Patches $patches)) {
-            foreach ($patch in $patches) {
+    $receiptPath = Join-Path $PreparedSource '.moonlight-hub-patches.json'
+    $prefixLength = 0
+    $haveReceipt = Test-Path -LiteralPath $receiptPath -PathType Leaf
+    if ($haveReceipt) { $prefixLength = Get-CachedPatchPrefixLength -Source $PreparedSource -Patches $patches }
+    if (!$haveReceipt -or $prefixLength -lt $patches.Count) {
+        if ($haveReceipt -or !(Test-SourcePatchSeries -Source $PreparedSource -Patches $patches)) {
+            foreach ($patch in @($patches | Select-Object -Skip $prefixLength)) {
                 if (Test-SourcePatch -Source $PreparedSource -Patch $patch.FullName -Reverse) { continue }
                 if (!(Test-SourcePatch -Source $PreparedSource -Patch $patch.FullName)) {
                     throw "Patch does not apply: $($patch.Name)"
@@ -215,7 +241,7 @@ Get-ChildItem -LiteralPath $dependencyLicenses -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $runtimeLicenses $_.Name) -Force
 }
 if ($Test) {
-    foreach ($name in @('test-cursor-warp', 'test-local-key-release', 'test-mouse-return', 'test-key-handoff')) {
+    foreach ($name in @('test-cursor-warp', 'test-local-key-release', 'test-mouse-return', 'test-key-handoff', 'test-desktop-focus')) {
         & (Join-Path $PreparedSource "tools\$name.ps1")
         if (!$?) { throw "Offline regression failed: $name" }
     }

@@ -108,8 +108,10 @@ try {
     $fixturePatchDir = Join-Path $fixtureHub 'deskflow-patches'
     New-Item -ItemType Directory -Force -Path $fixturePatchDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $hubRoot 'deskflow-patches\build.ps1') -Destination $fixturePatchDir
-    Write-Fixture (Join-Path $fixturePatchDir 'component.patch') "diff --git a/component.txt b/component.txt`n--- a/component.txt`n+++ b/component.txt`n"
-    $fakeGitState = @{Clones=0; Notices=0; LfClone=$false; Applies=0; ForwardValid=$true; Base='760e3b99b00053647a96b405276bf614bd860075'}
+    $fixturePatch = "diff --git a/component.txt b/component.txt`n--- a/component.txt`n+++ b/component.txt`n"
+    Write-Fixture (Join-Path $fixturePatchDir '01-core.patch') $fixturePatch
+    Write-Fixture (Join-Path $fixturePatchDir '02-key.patch') $fixturePatch
+    $fakeGitState = @{Clones=0; Notices=0; LfClone=$false; Applies=0; AppliedNames=[Collections.Generic.List[string]]::new(); ForwardValid=$true; Base='760e3b99b00053647a96b405276bf614bd860075'}
     function git {
         $arguments = @($args)
         $global:LASTEXITCODE = 0
@@ -124,7 +126,8 @@ try {
         if ($arguments[2] -eq 'rev-parse') { $fakeGitState.Base; return }
         if ($arguments[2] -eq 'read-tree') { $global:LASTEXITCODE = 1; return }
         if ($arguments[2] -ne 'apply') { throw 'Unexpected fixture git command' }
-        $marker = Join-Path $arguments[1] '.patch-applied'
+        $patchName = [IO.Path]::GetFileName($arguments[-1])
+        $marker = Join-Path $arguments[1] ('.applied-' + $patchName)
         if ($arguments -contains '--reverse') {
             if (!(Test-Path -LiteralPath $marker)) {
                 Write-Error 'Expected reverse check failure on pristine source'
@@ -137,8 +140,9 @@ try {
             return
         }
         $fakeGitState.Applies++
+        $fakeGitState.AppliedNames.Add($patchName)
         Write-Fixture $marker 'applied'
-        Write-Fixture (Join-Path $arguments[1] 'component.txt') 'patched component source'
+        Write-Fixture (Join-Path $arguments[1] 'component.txt') ('source after ' + $patchName)
     }
     $buildScript = Join-Path $fixturePatchDir 'build.ps1'
     & $buildScript -QtRoot 'unused' -OpenSslRoot 'unused' -DependencySource 'unused' -PrepareOnly | Out-Null
@@ -146,14 +150,33 @@ try {
     Assert-Package ($fakeGitState.Clones -eq 1) 'Repeated preparation clones only once'
     Assert-Package ($fakeGitState.Notices -eq 1) 'Normal clone stderr does not terminate WinPS preparation'
     Assert-Package $fakeGitState.LfClone 'Pinned clone disables autocrlf so both patches use LF context'
-    Assert-Package ($fakeGitState.Applies -eq 1) 'Repeated preparation applies each patch only once'
+    Assert-Package ($fakeGitState.Applies -eq 2) 'Repeated preparation applies each initial patch only once'
     $receiptPath = Join-Path $fixtureHub 'artifacts\deskflow-upstream\.moonlight-hub-patches.json'
     $receipt = Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-Package ($receipt.files.'component.txt' -eq (Get-FileHash -LiteralPath (Join-Path $fixtureHub 'artifacts\deskflow-upstream\component.txt')).Hash) 'Preparation receipt records actual patched source bytes'
+    Write-Fixture (Join-Path $fixturePatchDir '03-modifier.patch') $fixturePatch
+    $componentPath = Join-Path $fixtureHub 'artifacts\deskflow-upstream\component.txt'
+    $prefixContent = [IO.File]::ReadAllText($componentPath)
+    Write-Fixture $componentPath 'local source edit must survive'
+    Expect-PackageFailure { & $buildScript -QtRoot 'unused' -OpenSslRoot 'unused' -DependencySource 'unused' -PrepareOnly } 'Cached patched source changed'
+    Assert-Package ($fakeGitState.Applies -eq 2 -and [IO.File]::ReadAllText($componentPath) -eq 'local source edit must survive') 'A changed prefix source is not overwritten or patched'
+    Write-Fixture $componentPath $prefixContent
+    Write-Fixture (Join-Path $fixturePatchDir '01-core.patch') ($fixturePatch + '# changed prefix hash')
+    Expect-PackageFailure { & $buildScript -QtRoot 'unused' -OpenSslRoot 'unused' -DependencySource 'unused' -PrepareOnly } 'Cached patch prefix changed'
+    Assert-Package ($fakeGitState.Applies -eq 2) 'A changed prior patch hash cannot replay the full patch sequence'
+    Write-Fixture (Join-Path $fixturePatchDir '01-core.patch') $fixturePatch
+    & $buildScript -QtRoot 'unused' -OpenSslRoot 'unused' -DependencySource 'unused' -PrepareOnly | Out-Null
+    & $buildScript -QtRoot 'unused' -OpenSslRoot 'unused' -DependencySource 'unused' -PrepareOnly | Out-Null
+    Assert-Package (($fakeGitState.AppliedNames -join ',') -eq '01-core.patch,02-key.patch,03-modifier.patch') 'Append upgrade applies only the new suffix and never replays the prior patches'
+    Assert-Package ($fakeGitState.Applies -eq 3) 'Repeated preparation after an append upgrade does not reapply the new patch'
+    $receipt = Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Package (@($receipt.patches.PSObject.Properties).Count -eq 3 -and
+        $receipt.files.'component.txt' -eq (Get-FileHash -LiteralPath $componentPath).Hash) 'Append upgrade writes the complete new receipt and final source hash'
     $fakeGitState.Base = 'unexpected-commit'
     Expect-PackageFailure { & $buildScript -QtRoot 'unused' -OpenSslRoot 'unused' -DependencySource 'unused' -PrepareOnly } 'Unexpected upstream revision'
     $fakeGitState.Base = '760e3b99b00053647a96b405276bf614bd860075'
-    Remove-Item -LiteralPath (Join-Path $fixtureHub 'artifacts\deskflow-upstream\.patch-applied')
+    Get-ChildItem -LiteralPath (Join-Path $fixtureHub 'artifacts\deskflow-upstream') -Filter '.applied-*' -File |
+        ForEach-Object {Remove-Item -LiteralPath $_.FullName}
     Remove-Item -LiteralPath $receiptPath
     $fakeGitState.ForwardValid = $false
     Expect-PackageFailure { & $buildScript -QtRoot 'unused' -OpenSslRoot 'unused' -DependencySource 'unused' -PrepareOnly } 'Patch does not apply'

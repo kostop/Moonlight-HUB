@@ -1,0 +1,528 @@
+diff --git a/src/lib/platform/MSWindowsScreen.cpp b/src/lib/platform/MSWindowsScreen.cpp
+--- a/src/lib/platform/MSWindowsScreen.cpp
++++ b/src/lib/platform/MSWindowsScreen.cpp
+@@ -1077,6 +1077,14 @@
+   // get event info
+   KeyButton button = (KeyButton)((lParam & 0x01ff0000) >> 16);
+   bool down = ((lParam & 0x80000000u) == 0x00000000u);
++  const UINT virtualKey = (wParam >> 16) & 0xffu;
++  const bool modifierKey =
++      (virtualKey == VK_SHIFT || virtualKey == VK_LSHIFT || virtualKey == VK_RSHIFT ||
++       virtualKey == VK_CONTROL || virtualKey == VK_LCONTROL || virtualKey == VK_RCONTROL ||
++       virtualKey == VK_MENU || virtualKey == VK_LMENU || virtualKey == VK_RMENU ||
++       virtualKey == VK_LWIN || virtualKey == VK_RWIN);
++  // 真实修饰键松开必须到达远端；左右同类键的总 mask 可能没有变化。
++  const bool modifierRelease = !down && modifierKey;
+   bool wasDown = isKeyDown(button);
+   KeyModifierMask oldState = pollActiveModifiers();
+ 
+@@ -1128,26 +1136,32 @@
+   KeyModifierMask state = pollActiveModifiers();
+   m_keyState->onKey(button, down, state);
+ 
++  // 只记录修饰键首次按下和全部松开，避免记录普通字符或重复按下。
++  if (modifierKey && (!down || !wasDown)) {
++    LOG_INFO("modifier source vk=0x%02x scan=0x%03x down=%d mask=0x%04x->0x%04x mark=%u/%u onScreen=%d nativeUp=%d",
++             virtualKey, button, down, oldState, state, m_mark, m_markReceived, m_isOnScreen, localReleasePassed);
++  }
++
+   // check for hot keys
+   if (oldState != state) {
+     // modifier key was pressed/released
+-    if (onHotKey(0, lParam)) {
++    if (onHotKey(0, lParam) && !modifierRelease) {
+       return true;
+     }
+   } else {
+     // non-modifier was pressed/released
+-    if (onHotKey(wParam, lParam)) {
++    if (onHotKey(wParam, lParam) && !modifierRelease) {
+       return true;
+     }
+   }
+ 
+   // stop sending modifier keys over and over again
+-  if (isModifierRepeat(oldState, state, wParam)) {
++  if (!modifierRelease && isModifierRepeat(oldState, state, wParam)) {
+     return true;
+   }
+ 
+   // ignore message if posted prior to last mark change
+-  if (!ignore()) {
++  if (!ignore() || modifierRelease) {
+     // check for ctrl+alt+del.  we do not want to pass that to the
+     // client.  the user can use ctrl+alt+pause to emulate it.
+     UINT virtKey = ((wParam >> 16) & 0xffu);
+diff --git a/src/lib/platform/MSWindowsDesks.cpp b/src/lib/platform/MSWindowsDesks.cpp
+--- a/src/lib/platform/MSWindowsDesks.cpp
++++ b/src/lib/platform/MSWindowsDesks.cpp
+@@ -513,11 +513,14 @@
+   // (mouse over activation) but i've no idea how to do that.
+   // the obvious workaround of using SetWindowPos() to move it back
+   // after being raised doesn't work.
+-  DWORD thisThread = GetWindowThreadProcessId(desk->m_window, nullptr);
+-  DWORD thatThread = GetWindowThreadProcessId(desk->m_foregroundWindow, nullptr);
+-  AttachThreadInput(thatThread, thisThread, TRUE);
+-  SetForegroundWindow(desk->m_foregroundWindow);
+-  AttachThreadInput(thatThread, thisThread, FALSE);
++  // 保留原前台时没有接管过焦点；不能为 nullptr 附加输入队列或重置它的键态。
++  if (desk->m_foregroundWindow != nullptr) {
++    DWORD thisThread = GetWindowThreadProcessId(desk->m_window, nullptr);
++    DWORD thatThread = GetWindowThreadProcessId(desk->m_foregroundWindow, nullptr);
++    AttachThreadInput(thatThread, thisThread, TRUE);
++    SetForegroundWindow(desk->m_foregroundWindow);
++    AttachThreadInput(thatThread, thisThread, FALSE);
++  }
+   EnableWindow(desk->m_window, desk->m_lowLevel ? FALSE : TRUE);
+   desk->m_foregroundWindow = nullptr;
+ }
+diff --git a/src/lib/server/Server.cpp b/src/lib/server/Server.cpp
+--- a/src/lib/server/Server.cpp
++++ b/src/lib/server/Server.cpp
+@@ -13,6 +13,7 @@
+ #include "deskflow/AppUtil.h"
+ #include "deskflow/DeskflowException.h"
+ #include "deskflow/IPlatformScreen.h"
++#include "deskflow/ModifierKeyRelease.h"
+ #include "deskflow/OptionTypes.h"
+ #include "deskflow/PacketStreamFilter.h"
+ #include "deskflow/ProtocolTypes.h"
+@@ -1533,6 +1534,10 @@
+ 
+   // relay
+   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
++    if (deskflow::releasedModifierMask(id) != 0) {
++      LOG_INFO("modifier route target=\"%s\" down=1 id=0x%04x scan=0x%03x mask=0x%04x",
++               getName(m_active).c_str(), id, button, mask);
++    }
+     m_active->keyDown(id, mask, button, lang);
+   } else {
+     if (!screens && m_keyboardBroadcasting) {
+@@ -1543,6 +1548,10 @@
+     }
+     for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
+       if (IKeyState::KeyInfo::contains(screens, index->first)) {
++        if (deskflow::releasedModifierMask(id) != 0) {
++          LOG_INFO("modifier route target=\"%s\" down=1 id=0x%04x scan=0x%03x mask=0x%04x",
++                   getName(index->second).c_str(), id, button, mask);
++        }
+         index->second->keyDown(id, mask, button, lang);
+       }
+     }
+@@ -1556,6 +1565,10 @@
+ 
+   // relay
+   if (!m_keyboardBroadcasting && IKeyState::KeyInfo::isDefault(screens)) {
++    if (deskflow::releasedModifierMask(id) != 0) {
++      LOG_INFO("modifier route target=\"%s\" down=0 id=0x%04x scan=0x%03x mask=0x%04x",
++               getName(m_active).c_str(), id, button, mask);
++    }
+     m_active->keyUp(id, mask, button);
+   } else {
+     if (!screens && m_keyboardBroadcasting) {
+@@ -1566,6 +1579,10 @@
+     }
+     for (ClientList::const_iterator index = m_clients.begin(); index != m_clients.end(); ++index) {
+       if (IKeyState::KeyInfo::contains(screens, index->first)) {
++        if (deskflow::releasedModifierMask(id) != 0) {
++          LOG_INFO("modifier route target=\"%s\" down=0 id=0x%04x scan=0x%03x mask=0x%04x",
++                   getName(index->second).c_str(), id, button, mask);
++        }
+         index->second->keyUp(id, mask, button);
+       }
+     }
+diff --git a/tools/test-key-handoff.cpp b/tools/test-key-handoff.cpp
+--- a/tools/test-key-handoff.cpp
++++ b/tools/test-key-handoff.cpp
+@@ -7,19 +7,26 @@
+ using KeyButton = uint16_t;
+ using KeyID = uint32_t;
+ using KeyModifierMask = uint32_t;
+-constexpr KeyModifierMask KeyModifierControl = 2, KeyModifierAlt = 4;
++constexpr KeyModifierMask KeyModifierShift = 1, KeyModifierControl = 2, KeyModifierAlt = 4, KeyModifierSuper = 8;
+ constexpr KeyID kKeyNone = 0, kKeyDelete = 0xffff;
+ #define LOG_DEBUG(...) ((void)0)
+ #define LOG_DEBUG1(...) ((void)0)
++#define LOG_INFO(...) recordModifierLog(__VA_ARGS__)
+ 
+ namespace {
+ int checks = 0;
+ int syntheticReleases = 0;
+ int forwardedUps = 0;
++int forwardedDowns = 0;
++int hotkeyCalls = 0;
++int modifierLogs = 0;
++KeyModifierMask forwardedMask = 0;
+ bool releaseSucceeded = true;
+ bool hotkey = false;
+ WPARAM mappedKey = 0;
+ WPARAM hotkeyKey = 0;
++// 参数 format/其余参数：生产修饰键诊断，只计数，不输出按键信息。
++void recordModifierLog(const char *, ...) { ++modifierLogs; }
+ void check(bool success, const char *message)
+ {
+   ++checks;
+@@ -27,13 +34,16 @@
+ }
+ struct KeyState {
+   bool down = false;
++  KeyModifierMask activeMask = 0;
+   bool testAutoRepeat(bool, bool, KeyButton) { return false; }
+   KeyButton virtualKeyToButton(UINT) { return 0x1e; }
+-  void onKey(KeyButton, bool press, KeyModifierMask) { down = press; }
+-  KeyID mapKeyFromEvent(WPARAM key, LPARAM, KeyModifierMask *mask) { mappedKey = key; *mask = 0; return 'a'; }
+-  void sendKeyEvent(void *, bool press, bool, KeyID, KeyModifierMask, int32_t, KeyButton)
++  void onKey(KeyButton, bool press, KeyModifierMask state) { down = press; activeMask = state; }
++  KeyID mapKeyFromEvent(WPARAM key, LPARAM, KeyModifierMask *mask) { mappedKey = key; *mask = activeMask; return 'a'; }
++  void sendKeyEvent(void *, bool press, bool, KeyID, KeyModifierMask mask, int32_t, KeyButton)
+   {
+-    if (!press) ++forwardedUps;
++    if (press) ++forwardedDowns;
++    else ++forwardedUps;
++    forwardedMask = mask;
+   }
+ };
+ }
+@@ -41,14 +51,18 @@
+ class MSWindowsScreen {
+ public:
+   bool m_isPrimary = true;
++  bool m_isOnScreen = false;
+   bool ignored = false;
++  uint32_t m_mark = 7, m_markReceived = 6;
+   KeyState *m_keyState;
++  KeyModifierMask beforeMask = 0, afterMask = 0;
++  mutable unsigned modifierPolls = 0;
+   deskflow::win32::LocalKeyReleaseState m_primaryKeyReleases;
+   bool onKey(WPARAM wParam, LPARAM lParam);
+   bool isKeyDown(KeyButton) const { return m_keyState->down; }
+-  KeyModifierMask pollActiveModifiers() const { return 0; }
+-  bool onHotKey(WPARAM key, LPARAM) const { hotkeyKey = key; return hotkey; }
+-  bool isModifierRepeat(KeyModifierMask, KeyModifierMask, WPARAM) const { return false; }
++  KeyModifierMask pollActiveModifiers() const { return (modifierPolls++ % 2) == 0 ? beforeMask : afterMask; }
++  bool onHotKey(WPARAM key, LPARAM) const { ++hotkeyCalls; hotkeyKey = key; return hotkey; }
++  bool isModifierRepeat(KeyModifierMask oldState, KeyModifierMask state, WPARAM key) const;
+   bool ignore() const { return ignored; }
+   void *getEventTarget() { return this; }
+   bool releaseLocalKey(KeyButton) const { ++syntheticReleases; return releaseSucceeded; }
+@@ -105,6 +119,71 @@
+   screen.onKey(noAltGr | deskflow::win32::kLocalKeyReleasePassed, up);
+   check(mappedKey == noAltGr && hotkeyKey == noAltGr,
+         "removing native release metadata preserves the original no-AltGr flag");
++  check(modifierLogs == 0, "ordinary key down and up never enter modifier INFO diagnostics");
++
++  struct ModifierCase { UINT virtualKey; KeyButton scan; KeyModifierMask mask; };
++  const ModifierCase modifiers[] = {
++      {VK_LSHIFT, 0x2a, KeyModifierShift}, {VK_RSHIFT, 0x36, KeyModifierShift},
++      {VK_LCONTROL, 0x1d, KeyModifierControl}, {VK_RCONTROL, 0x11d, KeyModifierControl},
++      {VK_LMENU, 0x38, KeyModifierAlt}, {VK_RMENU, 0x138, KeyModifierAlt},
++      {VK_LWIN, 0x15b, KeyModifierSuper}, {VK_RWIN, 0x15c, KeyModifierSuper}};
++  for (const auto &modifier : modifiers) {
++    const WPARAM key = static_cast<WPARAM>(modifier.virtualKey) << 16;
++    const LPARAM modifierUp = 1 | (static_cast<LPARAM>(modifier.scan) << 16) |
++                              static_cast<LPARAM>(0x80000000u);
++    for (int stateCase : {0, 1, 2}) {
++      for (bool ignored : {false, true}) {
++        for (bool consumedByHotkey : {false, true}) {
++          screen.ignored = ignored; hotkey = consumedByHotkey;
++          screen.beforeMask = stateCase == 2 ? 0 : modifier.mask;
++          screen.afterMask = stateCase == 0 ? modifier.mask : 0;
++          screen.modifierPolls = 0;
++          keys.down = stateCase != 2;
++          screen.m_primaryKeyReleases.capture(modifier.scan);
++          const int upsBefore = forwardedUps, hotkeysBefore = hotkeyCalls, releasesBefore = syntheticReleases;
++          const int logsBefore = modifierLogs;
++          screen.onKey(key | deskflow::win32::kLocalKeyReleasePassed, modifierUp);
++          check(forwardedUps == upsBefore + 1,
++                "modifier up is relayed across mark, hotkey, unchanged-mask and already-up shadow states");
++          check(hotkeyCalls == hotkeysBefore + 1, "forwarding modifier up still executes the original hotkey check");
++          check(!keys.down && forwardedMask == screen.afterMask,
++                "modifier release updates the shadow and preserves any still-held opposite-side modifier");
++          check(syntheticReleases == releasesBefore && mappedKey == key,
++                "modifier release metadata is stripped without a duplicate native release");
++          check(modifierLogs == logsBefore + 1, "every modifier release has exactly one source diagnostic");
++        }
++      }
++    }
++
++    screen.beforeMask = screen.afterMask = modifier.mask;
++    check(screen.isModifierRepeat(modifier.mask, modifier.mask, key),
++          "the actual production repeat filter recognizes the unchanged-mask regression fixture");
++    for (bool ignored : {false, true}) {
++      for (bool consumedByHotkey : {false, true}) {
++        screen.ignored = ignored; hotkey = consumedByHotkey; screen.modifierPolls = 0;
++        keys.down = true;
++        const int downsBefore = forwardedDowns;
++        const int logsBefore = modifierLogs;
++        screen.onKey(key, modifierUp & static_cast<LPARAM>(0x7fffffffu));
++        check(forwardedDowns == downsBefore && keys.down,
++              "modifier down still obeys mark, hotkey and autorepeat filtering");
++        check(modifierLogs == logsBefore, "held modifier repeats produce no INFO diagnostic spam");
++      }
++    }
++    screen.ignored = false; hotkey = false; screen.modifierPolls = 0;
++    screen.beforeMask = 0; screen.afterMask = modifier.mask; keys.down = false;
++    const int logsBefore = modifierLogs, downsBefore = forwardedDowns;
++    screen.onKey(key, modifierUp & static_cast<LPARAM>(0x7fffffffu));
++    check(modifierLogs == logsBefore + 1 && forwardedDowns == downsBefore + 1,
++          "first modifier down is diagnosed while preserving its original forwarding");
++  }
++  screen.beforeMask = screen.afterMask = 0; screen.ignored = true; hotkey = true;
++  for (UINT lockKey : {VK_CAPITAL, VK_NUMLOCK, VK_SCROLL}) {
++    screen.modifierPolls = 0;
++    const int upsBefore = forwardedUps;
++    screen.onKey(static_cast<WPARAM>(lockKey) << 16, up);
++    check(forwardedUps == upsBefore, "lock-key releases retain the original mark and hotkey behavior");
++  }
+ 
+   std::printf("PASS: %d extracted production key handoff checks; no desktop input injected.\n", checks);
+ }
+diff --git a/tools/test-key-handoff.ps1 b/tools/test-key-handoff.ps1
+--- a/tools/test-key-handoff.ps1
++++ b/tools/test-key-handoff.ps1
+@@ -21,7 +21,21 @@
+ $start = $source.IndexOf('bool MSWindowsScreen::onKey(WPARAM wParam, LPARAM lParam)', [StringComparison]::Ordinal)
+ $end = $source.IndexOf('bool MSWindowsScreen::onHotKey(', $start, [StringComparison]::Ordinal)
+ if ($start -lt 0 -or $end -lt 0) { throw 'Production keyboard handler not found.' }
+-[IO.File]::WriteAllText((Join-Path $BuildDir 'key-handoff-production.inc'), $source.Substring($start, $end - $start), [Text.UTF8Encoding]::new($false))
++$production = $source.Substring($start, $end - $start)
++$repeat = $source.IndexOf('bool MSWindowsScreen::isModifierRepeat(', [StringComparison]::Ordinal)
++if ($repeat -lt 0) { throw 'Production modifier repeat filter not found.' }
++$brace = $source.IndexOf('{', $repeat)
++$depth = 0
++for ($cursor = $brace; $cursor -lt $source.Length; ++$cursor) {
++    if ($source[$cursor] -eq '{') { ++$depth }
++    elseif ($source[$cursor] -eq '}') {
++        --$depth
++        if ($depth -eq 0) { break }
++    }
++}
++if ($depth -ne 0) { throw 'Production modifier repeat filter is incomplete.' }
++$production += "`n" + $source.Substring($repeat, $cursor - $repeat + 1)
++[IO.File]::WriteAllText((Join-Path $BuildDir 'key-handoff-production.inc'), $production, [Text.UTF8Encoding]::new($false))
+ 
+ & "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /permissive- /MD `
+     "/I$sourceRoot\src\lib" "/I$BuildDir" "$PSScriptRoot\test-key-handoff.cpp" `
+diff --git a/tools/test-desktop-focus.cpp b/tools/test-desktop-focus.cpp
+new file mode 100644
+--- /dev/null
++++ b/tools/test-desktop-focus.cpp
+@@ -0,0 +1,166 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#define WIN32_LEAN_AND_MEAN
++#include <Windows.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++// 编译当前生产桌面交接方法体，只模拟 Win32 边界；不接触真实前台、输入队列或键盘。
++namespace {
++struct WindowPlacement {
++  HWND window;
++  HWND insertAfter;
++  int x, y, width, height;
++  UINT flags;
++};
++struct Fixture {
++  HWND application = reinterpret_cast<HWND>(1);
++  HWND foreground = application;
++  int activations = 0;
++  int foregroundChanges = 0;
++  int attachments = 0;
++  int threadQueries = 0;
++  int foregroundQueries = 0;
++  int enabled = 0;
++  int disabled = 0;
++  int capture = 0;
++  int releases = 0;
++  int moves = 0;
++  int layoutChanges = 0;
++  int sleeps = 0;
++  HKL layout = nullptr;
++  std::vector<bool> visibility;
++  std::vector<WindowPlacement> placements;
++} f;
++int checks = 0;
++
++// success/message：断言结果与对应行为说明。
++void check(bool success, const char *message)
++{
++  ++checks;
++  if (!success) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
++}
++
++// Win32 调用只记录参数，不调用 user32。
++BOOL WINAPI place(HWND window, HWND after, int x, int y, int width, int height, UINT flags)
++{
++  f.placements.push_back({window, after, x, y, width, height, flags});
++  return TRUE;
++}
++DWORD WINAPI threadOf(HWND window, LPDWORD)
++{
++  ++f.threadQueries;
++  return window == nullptr ? 0 : (window == f.application ? 11 : 12);
++}
++BOOL WINAPI attach(DWORD, DWORD, BOOL) { ++f.attachments; return TRUE; }
++BOOL WINAPI foreground(HWND window) { ++f.foregroundChanges; f.foreground = window; return TRUE; }
++HWND WINAPI active(HWND window) { ++f.activations; return window; }
++BOOL WINAPI enable(HWND, BOOL enabled) { enabled ? ++f.enabled : ++f.disabled; return TRUE; }
++HKL WINAPI layout(HKL value, UINT) { ++f.layoutChanges; f.layout = value; return value; }
++HWND WINAPI getForeground() { ++f.foregroundQueries; return f.foreground; }
++HWND WINAPI capture(HWND window) { ++f.capture; return window; }
++BOOL WINAPI release() { ++f.releases; return TRUE; }
++}
++
++#define LOG_DEBUG1(...) ((void)0)
++#define SetWindowPos place
++#define GetWindowThreadProcessId threadOf
++#define AttachThreadInput attach
++#define SetForegroundWindow foreground
++#define SetActiveWindow active
++#define EnableWindow enable
++#define ActivateKeyboardLayout layout
++#define GetForegroundWindow getForeground
++#define SetCapture capture
++#define ReleaseCapture release
++
++void setCursorVisibility(bool visible) { f.visibility.push_back(visible); }
++struct Arch { void sleep(double) { ++f.sleeps; } } arch;
++#define ARCH (&arch)
++
++class MSWindowsDesks {
++public:
++  struct Desk {
++    HWND m_window = reinterpret_cast<HWND>(2);
++    HWND m_foregroundWindow = nullptr;
++    bool m_lowLevel = true;
++  };
++  bool m_isPrimary = true;
++  bool m_leaveForegroundOption = true;
++  int m_xCenter = 960, m_yCenter = 540;
++  int m_x = -1280, m_y = 0, m_w = 3840, m_h = 1440;
++  void deskEnter(Desk *desk);
++  void deskLeave(Desk *desk, HKL keyLayout);
++  HWND getForegroundWindow() const;
++  void deskMouseMove(int, int) const { ++f.moves; }
++};
++
++// 由测试脚本从当前生产源提取，禁止手工维护待测方法的副本。
++#include "desktop-focus-production.inc"
++
++int main()
++{
++  MSWindowsDesks desks;
++  MSWindowsDesks::Desk desk;
++  const auto keyboardLayout = reinterpret_cast<HKL>(0x4090409);
++  desks.deskLeave(&desk, keyboardLayout);
++  check(f.placements.size() == 1 && f.placements[0].width == 1 && f.placements[0].height == 1,
++        "low-level handoff retains its one-pixel parking window");
++  check(f.placements[0].x == 960 && f.placements[0].y == 540 &&
++        (f.placements[0].flags & (SWP_NOACTIVATE | SWP_SHOWWINDOW)) == (SWP_NOACTIVATE | SWP_SHOWWINDOW),
++        "parking window remains at the cursor center and never requests activation");
++  check(f.foreground == f.application && desk.m_foregroundWindow == nullptr,
++        "the application that received the original key-down keeps keyboard focus");
++  check(f.layoutChanges == 1 && f.layout == keyboardLayout,
++        "keeping the foreground preserves hook-thread keyboard layout selection");
++  check(f.activations == 0 && f.foregroundChanges == 0 && f.attachments == 0 && f.threadQueries == 0,
++        "kept foreground does not activate a window or join input queues on leave");
++  check(f.foregroundQueries == 0 && f.enabled == 0,
++        "kept foreground leaves the disabled hider disabled without querying another application");
++  desks.deskEnter(&desk);
++  check(f.foreground == f.application && f.activations == 0 && f.foregroundChanges == 0,
++        "return does not restore a foreground window that was never taken");
++  check(f.attachments == 0 && f.threadQueries == 0,
++        "return with no saved window does not call AttachThreadInput with a zero thread");
++  check(f.disabled == 1 && (f.placements.back().flags & (SWP_NOACTIVATE | SWP_HIDEWINDOW)) ==
++        (SWP_NOACTIVATE | SWP_HIDEWINDOW), "return still hides and disables the one-pixel window");
++  check(f.visibility.empty() && f.moves == 0 && f.sleeps == 0,
++        "primary handoff does not change cursor visibility, inject movement, or wait");
++
++  f = {};
++  desks.m_leaveForegroundOption = false;
++  desks.deskLeave(&desk, keyboardLayout);
++  check(desk.m_foregroundWindow == f.application && f.foreground == desk.m_window,
++        "explicit legacy foreground-grab option still saves and activates the hider");
++  check(f.enabled == 1 && f.activations == 1 && f.attachments == 2 && f.foregroundChanges == 1,
++        "legacy foreground-grab handoff retains its established Win32 calls");
++  desks.deskEnter(&desk);
++  check(f.foreground == f.application && desk.m_foregroundWindow == nullptr,
++        "a genuinely saved foreground is restored and then forgotten");
++  check(f.attachments == 4 && f.foregroundChanges == 2 && f.disabled == 1,
++        "saved foreground restoration keeps the original input attachment pair");
++
++  f = {};
++  desk.m_lowLevel = false;
++  desks.deskLeave(&desk, keyboardLayout);
++  check(f.placements[0].x == -1280 && f.placements[0].width == 3840 && f.placements[0].height == 1440,
++        "non-low-level mode retains its desktop-sized parking window");
++  check(f.activations == 1 && f.layoutChanges == 1 && f.attachments == 0,
++        "non-low-level mode still activates its window and selects the keyboard layout");
++  desks.deskEnter(&desk);
++  check(f.enabled == 1 && f.attachments == 0 && f.foregroundChanges == 0,
++        "non-low-level return still enables its window without restoring an absent saved focus");
++
++  f = {};
++  desks.m_isPrimary = false;
++  desks.deskLeave(&desk, keyboardLayout);
++  check(f.visibility == std::vector<bool>{false} && f.capture == 1 && f.moves == 1 && f.sleeps == 1,
++        "secondary leave retains cursor hiding, capture, and its legacy parking wait");
++  desks.deskEnter(&desk);
++  check(f.visibility == std::vector<bool>({false, true}) && f.releases == 1,
++        "secondary enter still restores visibility and releases capture");
++  check(f.foregroundChanges == 0 && f.attachments == 0 && f.activations == 0,
++        "secondary screens with no saved foreground do not steal another application's focus");
++  std::printf("PASS: %d extracted desktop focus checks; no real foreground or input operation.\n", checks);
++}
+diff --git a/tools/test-desktop-focus.ps1 b/tools/test-desktop-focus.ps1
+new file mode 100644
+--- /dev/null
++++ b/tools/test-desktop-focus.ps1
+@@ -0,0 +1,47 @@
++﻿[CmdletBinding()]
++param(
++    # BuildDir：离线测试输出目录，不访问真实前台或输入队列。
++    [string]$BuildDir = "$env:TEMP\moonlight-desktop-focus-tests"
++)
++$ErrorActionPreference = 'Stop'
++$sourceRoot = Split-Path -Parent $PSScriptRoot
++$vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
++$msvcRoot = (Get-ChildItem -LiteralPath "$vsRoot\VC\Tools\MSVC" -Directory |
++    Sort-Object Name -Descending | Select-Object -First 1).FullName
++$sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
++$sdkVersion = (Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory |
++    Where-Object { Test-Path -LiteralPath "$($_.FullName)\um\Windows.h" } |
++    Sort-Object Name -Descending | Select-Object -First 1).Name
++if (!$msvcRoot -or !$sdkVersion) { throw 'MSVC or Windows SDK is missing.' }
++$env:INCLUDE = "$msvcRoot\include;$sdkRoot\Include\$sdkVersion\ucrt;$sdkRoot\Include\$sdkVersion\shared;$sdkRoot\Include\$sdkVersion\um"
++$env:LIB = "$msvcRoot\lib\x64;$sdkRoot\Lib\$sdkVersion\ucrt\x64;$sdkRoot\Lib\$sdkVersion\um\x64"
++New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
++
++# Text/Signature：当前生产源码及精确签名，抽取整个函数而不复制待测逻辑。
++function Get-ProductionMethod([string]$Text, [string]$Signature) {
++    $offset = $Text.IndexOf($Signature + "`n{", [StringComparison]::Ordinal)
++    if ($offset -lt 0) { throw "Production method not found: $Signature" }
++    $brace = $Text.IndexOf('{', $offset)
++    $depth = 0
++    for ($i = $brace; $i -lt $Text.Length; ++$i) {
++        if ($Text[$i] -eq '{') { ++$depth }
++        elseif ($Text[$i] -eq '}') {
++            --$depth
++            if ($depth -eq 0) { return $Text.Substring($offset, $i - $offset + 1) }
++        }
++    }
++    throw "Unclosed production method: $Signature"
++}
++$desks = [IO.File]::ReadAllText((Join-Path $sourceRoot 'src\lib\platform\MSWindowsDesks.cpp')).Replace("`r`n", "`n")
++$methods = @(
++    Get-ProductionMethod $desks 'void MSWindowsDesks::deskEnter(Desk *desk)'
++    Get-ProductionMethod $desks 'void MSWindowsDesks::deskLeave(Desk *desk, HKL keyLayout)'
++    Get-ProductionMethod $desks 'HWND MSWindowsDesks::getForegroundWindow() const'
++)
++[IO.File]::WriteAllText((Join-Path $BuildDir 'desktop-focus-production.inc'), ($methods -join "`n`n"), [Text.UTF8Encoding]::new($false))
++& "$msvcRoot\bin\Hostx64\x64\cl.exe" /nologo /utf-8 /W4 /WX /EHsc /std:c++20 /permissive- /MD `
++    "/I$BuildDir" "$PSScriptRoot\test-desktop-focus.cpp" `
++    "/Fe:$BuildDir\test-desktop-focus.exe" "/Fo:$BuildDir\test-desktop-focus.obj"
++if ($LASTEXITCODE -ne 0) { throw 'Desktop focus tests did not compile.' }
++& "$BuildDir\test-desktop-focus.exe"
++if ($LASTEXITCODE -ne 0) { throw 'Desktop focus tests failed.' }

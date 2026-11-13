@@ -129,6 +129,62 @@ bool add_f24_local_release_rule(std::string &content) {
   return true;
 }
 
+// line：配置行或键名；只移除语法外的空白，不改动配置值。
+std::string_view trim_config_line(std::string_view line) {
+  const auto first = line.find_first_not_of(" \t\r\n");
+  if (first == std::string_view::npos) {
+    return {};
+  }
+  const auto last = line.find_last_not_of(" \t\r\n");
+  return line.substr(first, last - first + 1);
+}
+
+// content：已经读入内存的服务器私有副本；不读取或写入共享布局文件。
+bool keep_private_foreground(std::string &content) {
+  constexpr std::string_view option = "\twin32KeepForeground = true";
+  const auto newline = content.find("\r\n") == std::string::npos ? "\n" : "\r\n";
+  std::string updated;
+  updated.reserve(content.size() + option.size() + 2);
+  bool in_options = false;
+  bool found = false;
+  bool complete = false;
+  for (std::size_t position = 0; position < content.size();) {
+    const auto end = content.find('\n', position);
+    const auto next = end == std::string::npos ? content.size() : end + 1;
+    const auto raw = std::string_view(content).substr(position, next - position);
+    const auto line = trim_config_line(raw.substr(0, raw.find('#')));
+    if (!complete && line == "section: options") {
+      in_options = true;
+    } else if (in_options && line == "end") {
+      if (!found) {
+        updated.append(option);
+        updated.append(newline);
+      }
+      in_options = false;
+      complete = true;
+    }
+    const auto equals = line.find('=');
+    if (in_options && equals != std::string_view::npos &&
+        trim_config_line(line.substr(0, equals)) == "win32KeepForeground") {
+      updated.append(option);
+      if (raw.size() >= 2 && raw.substr(raw.size() - 2) == "\r\n") {
+        updated.append("\r\n");
+      } else if (!raw.empty() && raw.back() == '\n') {
+        updated.push_back('\n');
+      }
+      found = true;
+    } else {
+      updated.append(raw);
+    }
+    position = next;
+  }
+  if (!complete) {
+    return false;
+  }
+  content.swap(updated);
+  return true;
+}
+
 // config_path: 仅用于验证或维护的服务器配置文件路径。
 bool ensure_f24_local_release_rule(const std::wstring &config_path) {
   const std::filesystem::path path(config_path);
@@ -221,6 +277,7 @@ bool prepare_private_core_settings(
   if (!read_binary_file(arguments[settings_index], settings) ||
       !read_binary_file(kDeskflowServerConfig, server) ||
       !add_f24_local_release_rule(server) ||
+      !keep_private_foreground(server) ||
       !replace_external_config_path(settings, private_server) ||
       !write_binary_file(private_server, server) ||
       !write_binary_file(private_settings, settings)) {
@@ -336,6 +393,46 @@ int print_status() {
   return 0;
 }
 
+// 只校验内存中的配置副本，不访问真实配置或前台窗口。
+bool foreground_config_self_test() {
+  int checks = 0;
+  const auto check = [&checks](bool value) {
+    ++checks;
+    return value;
+  };
+  bool passed = true;
+  for (const auto *newline : {"\n", "\r\n"}) {
+    for (const auto *existing : {"", "win32KeepForeground=false", " win32KeepForeground = false # old value",
+                                 "win32KeepForeground = true"}) {
+      const std::string shared = std::string("section: options") + newline +
+          (std::strlen(existing) == 0 ? "" : std::string(existing) + newline) +
+          "\tclipboardSharing = false" + newline + "end" + newline;
+      auto private_copy = shared;
+      passed = check(keep_private_foreground(private_copy)) && passed;
+      passed = check(private_copy.find("\twin32KeepForeground = true" + std::string(newline)) != std::string::npos) && passed;
+      passed = check(private_copy.find("false # old value") == std::string::npos) && passed;
+      passed = check(private_copy.find("\tclipboardSharing = false" + std::string(newline)) != std::string::npos) && passed;
+      const auto once = private_copy;
+      passed = check(keep_private_foreground(private_copy) && private_copy == once) && passed;
+    }
+  }
+  std::string duplicates = "section: options\nwin32KeepForeground=false\nwin32KeepForeground=false\nend\n";
+  passed = check(keep_private_foreground(duplicates) && duplicates.find("false") == std::string::npos) && passed;
+  std::string no_options = "section: screens\nDesktop-Lin:\nqingxian:\nend\n";
+  const auto unchanged = no_options;
+  passed = check(!keep_private_foreground(no_options) && no_options == unchanged) && passed;
+  std::string without_final_newline = "section: options\nend";
+  passed = check(keep_private_foreground(without_final_newline) &&
+                 without_final_newline == "section: options\n\twin32KeepForeground = true\nend") && passed;
+  const std::string prefix = "# win32KeepForeground = false\nsection: screens\nDesktop-Lin:\nend\n";
+  std::string scoped = prefix + "section: options\n# win32KeepForeground = false\nend\n";
+  passed = check(keep_private_foreground(scoped) && scoped.substr(0, prefix.size()) == prefix) && passed;
+  passed = check(scoped.find("section: options\n# win32KeepForeground = false\n") != std::string::npos) && passed;
+  std::wcout << L"foreground-config-self-test=" << (passed ? L"passed" : L"failed")
+             << L" checks=" << checks << L'\n';
+  return passed;
+}
+
 int self_test() {
   const bool passed =
        deskflow_touch_filter::is_promoted_touch(
@@ -345,7 +442,8 @@ int self_test() {
            deskflow_touch_filter::kPointerSignature) &&
        !deskflow_touch_filter::is_promoted_pen_or_touch(0) &&
        deskflow_touch_filter::kStateVersion == 4 &&
-       deskflow_touch_filter::kTouchRouteVersion == 1;
+       deskflow_touch_filter::kTouchRouteVersion == 1 &&
+       foreground_config_self_test();
   std::wcout << L"self-test=" << (passed ? L"passed" : L"failed")
               << L" mode=native-touch+compat-mouse-bridged+local-keyboard-bypass\n";
   return passed ? 0 : 3;
