@@ -1,0 +1,299 @@
+diff --git a/src/lib/platform/MSWindowsInjectedModifiers.h b/src/lib/platform/MSWindowsInjectedModifiers.h
+new file mode 100644
+--- /dev/null
++++ b/src/lib/platform/MSWindowsInjectedModifiers.h
+@@ -0,0 +1,79 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#pragma once
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <Windows.h>
++
++#include <array>
++#include <cstdint>
++
++namespace deskflow::win32 {
++
++// 接收端修饰键兜底：只记账本核心注入的修饰键最后一次是按下还是松开，与 KeyState 的记账互相独立。
++class InjectedModifiers
++{
++public:
++  struct Key
++  {
++    WORD virtualKey;
++    uint16_t button; // 低 8 位扫描码，0x100 为扩展键
++  };
++  // 槽位依次为左右 Shift、Ctrl、Alt、Win。
++  static constexpr std::array<Key, 8> kKeys{{{VK_LSHIFT, 0x2a}, {VK_RSHIFT, 0x36}, {VK_LCONTROL, 0x1d},
++                                             {VK_RCONTROL, 0x11d}, {VK_LMENU, 0x38}, {VK_RMENU, 0x138},
++                                             {VK_LWIN, 0x15b}, {VK_RWIN, 0x15c}}};
++
++  // 参数 virtualKey/scan/flags：一次注入的键盘事件；返回修饰键槽位，非修饰键为 -1。
++  static int slot(WORD virtualKey, WORD scan, DWORD flags)
++  {
++    switch (virtualKey) {
++    case VK_LSHIFT: return 0;
++    case VK_RSHIFT: return 1;
++    case VK_LCONTROL: return 2;
++    case VK_RCONTROL: return 3;
++    case VK_LMENU: return 4;
++    case VK_RMENU: return 5;
++    case VK_LWIN: return 6;
++    case VK_RWIN: return 7;
++    default: break;
++    }
++    const bool extended = (flags & KEYEVENTF_EXTENDEDKEY) != 0 || (scan & 0x100u) != 0;
++    switch (scan & 0xffu) {
++    case 0x2a: return 0;
++    case 0x36: return 1;
++    case 0x1d: return extended ? 3 : 2;
++    case 0x38: return extended ? 5 : 4;
++    case 0x5b: return 6;
++    case 0x5c: return 7;
++    default: return -1;
++    }
++  }
++
++  // 参数 virtualKey/scan/flags：系统已接受的一次注入；Unicode 字符注入不是修饰键。
++  void record(WORD virtualKey, WORD scan, DWORD flags)
++  {
++    if ((flags & KEYEVENTF_UNICODE) != 0) return;
++    if (const int index = slot(virtualKey, scan, flags); index >= 0) {
++      m_down[index] = (flags & KEYEVENTF_KEYUP) == 0;
++    }
++  }
++
++  // 参数 osDown：查询系统是否仍按着某个左右独立虚拟键。
++  // 返回“最后注入的是按下且系统仍按着”的槽位位图，并清空全部记账。
++  template <typename Query> uint32_t takeStranded(Query osDown)
++  {
++    uint32_t stranded = 0;
++    for (size_t index = 0; index < kKeys.size(); ++index) {
++      if (m_down[index] && osDown(kKeys[index].virtualKey)) stranded |= 1u << index;
++      m_down[index] = false;
++    }
++    return stranded;
++  }
++
++private:
++  std::array<bool, 8> m_down{};
++};
++
++} // namespace deskflow::win32
+diff --git a/src/lib/platform/MSWindowsDesks.cpp b/src/lib/platform/MSWindowsDesks.cpp
+--- a/src/lib/platform/MSWindowsDesks.cpp
++++ b/src/lib/platform/MSWindowsDesks.cpp
+@@ -19,6 +19,8 @@
+ #include "mt/Lock.h"
+ #include "mt/Thread.h"
+ #include "platform/MSWindowsHook.h"
++#include "platform/MSWindowsInjectedModifiers.h"
++#include "platform/MSWindowsLocalKeyRelease.h"
+ #include "platform/MSWindowsMenuMask.h"
+ #include "platform/MSWindowsScreen.h"
+ 
+@@ -84,6 +86,25 @@
+ // <unused>; <unused>
+ #define DESKFLOW_MSG_MENU_MASK DESKFLOW_HOOK_LAST_MSG + 13
+ 
++// 仅由桌面线程注入键盘事件时更新。
++static deskflow::win32::InjectedModifiers g_injectedModifiers;
++
++// 接收端离屏时调用：KeyState 记账出错时，本核心按下过、系统仍按着的修饰键会一直卡住；
++// 先注入 E8 掩码再补发松开，补发的 Alt/Win 不会变成一次菜单单击。
++static void releaseStrandedModifiers()
++{
++  const uint32_t stranded =
++      g_injectedModifiers.takeStranded([](WORD virtualKey) { return (GetAsyncKeyState(virtualKey) & 0x8000) != 0; });
++  for (size_t index = 0; index < deskflow::win32::InjectedModifiers::kKeys.size(); ++index) {
++    if ((stranded & (1u << index)) == 0) continue;
++    const auto &key = deskflow::win32::InjectedModifiers::kKeys[index];
++    INPUT inputs[3]{deskflow::win32::makeMenuMaskKey(true), deskflow::win32::makeMenuMaskKey(false),
++                    deskflow::win32::makeLocalKeyRelease(key.virtualKey, key.button)};
++    const UINT inserted = SendInput(3, inputs, sizeof(INPUT));
++    LOG_INFO("released stranded modifier vk=0x%02x on leave inserted=%u", key.virtualKey, inserted);
++  }
++}
++
+ // 参数 wVk/wScan/dwFlags：虚拟键、扫描码与注入标志；仅为失败的修饰键记录诊断。
+ static void send_keyboard_input(WORD wVk, WORD wScan, DWORD dwFlags)
+ {
+@@ -97,6 +118,9 @@
+   SetLastError(ERROR_SUCCESS);
+   const auto inserted = SendInput(1, &inp, sizeof(inp));
+   const auto error = GetLastError();
++  if (inserted == 1) {
++    g_injectedModifiers.record(wVk, wScan, dwFlags);
++  }
+   if (inserted != 1 &&
+       (wVk == VK_SHIFT || wVk == VK_LSHIFT || wVk == VK_RSHIFT ||
+        wVk == VK_CONTROL || wVk == VK_LCONTROL || wVk == VK_RCONTROL ||
+@@ -548,6 +572,8 @@
+ {
+   if (!m_isPrimary) {
+     setCursorVisibility(false);
++    // 离屏批量松开之后再兜底一次，只处理本核心按下过、系统仍按着的修饰键。
++    releaseStrandedModifiers();
+   }
+ 
+   if (m_isPrimary) {
+diff --git a/src/lib/platform/MSWindowsHook.cpp b/src/lib/platform/MSWindowsHook.cpp
+--- a/src/lib/platform/MSWindowsHook.cpp
++++ b/src/lib/platform/MSWindowsHook.cpp
+@@ -114,6 +114,19 @@
+     SendInput(1, &inputs[1], sizeof(INPUT));
+   }
+   return false;
++}
++// 参数 info/button：即将被拦截的物理松开。手指已经抬起，本机系统却仍按着该键时，
++// 说明本机收到过按下而归属记账丢失；补发本机松开（Alt/Win 带菜单掩码），不让它卡在本机。
++static void releaseStrandedLocalKey(const KBDLLHOOKSTRUCT &info, uint16_t button)
++{
++  const WORD virtualKey = static_cast<WORD>(info.vkCode);
++  if ((GetAsyncKeyState(virtualKey) & 0x8000) == 0) return;
++  if (MenuKeyOwnership::index(virtualKey, button) >= 0) {
++    sendMenuMaskedRelease(virtualKey, button);
++    return;
++  }
++  INPUT input = deskflow::win32::makeLocalKeyRelease(virtualKey, button);
++  SendInput(1, &input, sizeof(input));
+ }
+ struct MouseMotionState
+ {
+@@ -783,12 +796,18 @@
+     if (physicalPrimary && down) {
+       g_menuKeyOwnership.capture(static_cast<UINT>(info->vkCode), button, !suppress, menuEpoch);
+     }
+-    if (remoteMenuRelease) return 1;
++    if (remoteMenuRelease) {
++      releaseStrandedLocalKey(*info, button);
++      return 1;
++    }
+     if (localRelease && menuRelease.origin == MenuKeyOwnership::Local && menuRelease.crossed &&
+         sendMenuMaskedRelease(static_cast<WORD>(info->vkCode), button)) {
+       return 1;
+     }
+     if (suppress && !localRelease) {
++      if (physicalPrimary && !down) {
++        releaseStrandedLocalKey(*info, button);
++      }
+       return 1;
+     }
+   }
+diff --git a/tools/test-desktop-focus.cpp b/tools/test-desktop-focus.cpp
+--- a/tools/test-desktop-focus.cpp
++++ b/tools/test-desktop-focus.cpp
+@@ -5,6 +5,8 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <vector>
++
++#include "../src/lib/platform/MSWindowsInjectedModifiers.h"
+ 
+ // 编译当前生产桌面交接方法体，只模拟 Win32 边界；不接触真实前台、输入队列或键盘。
+ namespace {
+@@ -79,6 +81,8 @@
+ #define GetCursorPos cursorAt
+ 
+ void setCursorVisibility(bool visible) { f.visibility.push_back(visible); }
++int strandedReleases = 0;
++void releaseStrandedModifiers() { ++strandedReleases; }
+ struct Arch { void sleep(double) { ++f.sleeps; } } arch;
+ #define ARCH (&arch)
+ 
+@@ -155,9 +159,11 @@
+   check(f.enabled == 1 && f.attachments == 0 && f.foregroundChanges == 0,
+         "non-low-level return still enables its window without restoring an absent saved focus");
+ 
++  check(strandedReleases == 0, "the source never runs the receiver stranded-modifier release");
+   f = {};
+   desks.m_isPrimary = false;
+   desks.deskLeave(&desk, keyboardLayout);
++  check(strandedReleases == 1, "receiver leave runs the stranded-modifier release once after its key cleanup");
+   check(f.visibility == std::vector<bool>{false} && f.capture == 1,
+         "secondary leave retains cursor hiding and capture");
+   check(f.moves == 0 && f.sleeps == 0 && f.placements.size() == 1 && f.placements[0].x == 12 &&
+@@ -168,5 +174,29 @@
+         "secondary enter still restores visibility and releases capture");
+   check(f.foregroundChanges == 0 && f.attachments == 0 && f.activations == 0,
+         "secondary screens with no saved foreground do not steal another application's focus");
++
++  using deskflow::win32::InjectedModifiers;
++  check(InjectedModifiers::slot(VK_MENU, 0x38, 0) == 4 && InjectedModifiers::slot(VK_MENU, 0x138, 0) == 5 &&
++        InjectedModifiers::slot(VK_CONTROL, 0x1d, KEYEVENTF_EXTENDEDKEY) == 3 &&
++        InjectedModifiers::slot(0, 0x5c, KEYEVENTF_EXTENDEDKEY) == 7 && InjectedModifiers::slot(VK_SHIFT, 0x36, 0) == 1 &&
++        InjectedModifiers::slot('A', 0x1e, 0) == -1,
++        "receiver modifier slots follow the left/right side from the virtual key or the scan code");
++  InjectedModifiers injected;
++  injected.record(VK_MENU, 0x38, 0);
++  injected.record(VK_CONTROL, 0x1d, KEYEVENTF_EXTENDEDKEY);
++  injected.record(VK_CONTROL, 0x1d, 0);
++  injected.record(VK_CONTROL, 0x1d, KEYEVENTF_KEYUP);
++  injected.record(VK_LWIN, 0x15b, KEYEVENTF_EXTENDEDKEY);
++  injected.record('A', 0x1e, 0);
++  injected.record(0, 0x38, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
++  std::vector<WORD> queried;
++  const uint32_t stranded = injected.takeStranded([&](WORD virtualKey) {
++    queried.push_back(virtualKey);
++    return virtualKey != VK_LWIN;
++  });
++  check(stranded == ((1u << 4) | (1u << 3)) && queried.size() == 3,
++        "only modifiers last injected down and still held by the OS are released; released or OS-up keys are left alone");
++  check(injected.takeStranded([](WORD) { return true; }) == 0,
++        "taking stranded modifiers clears the record so one leave never releases twice");
+   std::printf("PASS: %d extracted desktop focus checks; no real foreground or input operation.\n", checks);
+ }
+diff --git a/tools/test-menu-handoff.cpp b/tools/test-menu-handoff.cpp
+--- a/tools/test-menu-handoff.cpp
++++ b/tools/test-menu-handoff.cpp
+@@ -232,6 +232,21 @@
+     check(physical(key.vk,key.scan,false)==0 && nativeUps(key.vk)==1 && attempts.empty(),
+           "menu masking does not alter Ctrl or Shift handoff release behavior");
+   }
++  // 归属记账无论因何丢失，被拦截的物理松开都不能让本机系统一直按着这个键。
++  for(const Case key:std::vector<Case>{{VK_LMENU,0x38},{VK_RMENU,0x138},{VK_LWIN,0x15b},{VK_RWIN,0x15c},
++                                       {VK_LCONTROL,0x1d},{VK_RCONTROL,0x11d},{VK_LSHIFT,0x2a},{VK_RSHIFT,0x36}}) {
++    reset(hook,kHOOK_WATCH_JUMP_ZONE);
++    physical(key.vk,key.scan,true);
++    g_localKeyOwnership.clear();g_menuKeyOwnership.clear();
++    hook.setMode(kHOOK_RELAY_EVENTS);
++    check(physical(key.vk,key.scan,false)==1 && !nativeDown[key.vk] && nativeUps(key.vk)==1 && menuActivations==0,
++          "a physical up whose local ownership was lost still releases the held native key without a menu tap");
++    check(attempts.size()==1 && attempts[0].size()==(menuKey(key.vk)?3u:1u) &&
++          nativeKeys.back().tag==deskflow::win32::kLocalKeyReleaseTag,
++          "the stranded release is one tagged local release, masked by E8 only for Alt/Win");
++    check(physical(key.vk,key.scan,false)==1 && attempts.size()==1,
++          "a further remote up with nothing held natively injects nothing");
++  }
+   reset(hook,kHOOK_RELAY_EVENTS);
+   for(bool down:{false,true}) {
+     auto input=deskflow::win32::makeMenuMaskKey(down);
+diff --git a/doc/dev/windows-pointer-motion.md b/doc/dev/windows-pointer-motion.md
+--- a/doc/dev/windows-pointer-motion.md
++++ b/doc/dev/windows-pointer-motion.md
+@@ -158,3 +158,23 @@
+ 因此：服务端离开时不再回中，只记录离开时的实际位置；仅在钩子回退路径收到绝对坐标时
+ 放回这个停车点。客户端离开时把隐藏窗口放到当前光标下，不再移动光标，也去掉为回中
+ 防闪烁而加的 30ms 等待。进入时仍由服务端坐标定位，显示器变化时的回中保持不变。
++
++## 2026-11-18：按住 Alt 穿屏后按键被锁住的兜底
++
++现场（11-18 14:50:53、18:05:37）：光标在 qingxian 时按下左 Alt（按下发往 qingxian），按住
++穿回本机后松开。本机钩子把这个远端起源的松开吞掉并标记已处理，松开转发给本机而不是
++qingxian；qingxian 只能靠离屏时 `fakeAllKeysUp()` 释放，而它依赖 KeyState 的注入记账，
++日志里看不出那次是否真的松开。用户反映手动难以复现，因此不再追单一路径，改为两端兜底：
++
++1. 接收端：所有键盘注入都经过桌面线程的 `send_keyboard_input`，在此独立记录本核心
++   注入的左右 Shift/Ctrl/Alt/Win 最后一次是按下还是松开（`MSWindowsInjectedModifiers.h`）。
++   离屏时在原有批量松开之后，凡是本核心按下过、系统 `GetAsyncKeyState` 仍按着的修饰键，
++   先注入带标签的 E8 再补发松开，不会变成一次菜单单击；记账随即清空，不重复释放。
++   用户在接收端自己键盘上按住的键不是本核心注入的，不受影响。
++2. 源端：钩子准备吞掉一个物理松开时，若本机系统仍按着该键，说明本机收到过按下而
++   归属记账已丢失；手指已经抬起，直接补发本机松开（Alt/Win 带 E8 掩码）。
++   系统没按着时不做任何事，远端起源的松开保持原样。
++
++离线回归：源端新增 8 个修饰键 × 3 项（记账丢失后本机必须松开且不激活菜单、只补发一次、
++本机未按着时不注入）；当前部署版本在第一项即失败。接收端新增槽位映射与“只释放最后注入
++为按下且系统仍按着的键、取出后清空”检查，以及离屏只在接收端执行一次。

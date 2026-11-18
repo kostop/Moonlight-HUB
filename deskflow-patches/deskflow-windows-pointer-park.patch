@@ -1,0 +1,130 @@
+diff --git a/src/lib/platform/MSWindowsScreen.cpp b/src/lib/platform/MSWindowsScreen.cpp
+--- a/src/lib/platform/MSWindowsScreen.cpp
++++ b/src/lib/platform/MSWindowsScreen.cpp
+@@ -307,8 +307,11 @@
+   m_desks->leave(m_keyLayout);
+ 
+   if (m_isPrimary) {
+-    LOG_DEBUG1("centering cursor on leave: %+d, %+d", m_xCenter, m_yCenter);
+-    warpCursor(m_xCenter, m_yCenter);
++    // 光标留在离开时的位置，不再跳到屏幕中心；钩子吞掉移动并以裁剪后的落点计算位移，停在哪里都不影响。
++    if (POINT exit{}; GetPhysicalCursorPos(&exit)) {
++      LOG_DEBUG1("parking cursor at exit: %+d, %+d", exit.x, exit.y);
++      saveMousePosition(exit.x, exit.y);
++    }
+ 
+     // disable special key sequences on win95 family
+     enableSpecialKeys(false);
+@@ -1311,12 +1314,10 @@
+     // motion on primary screen
+     sendEvent(EventTypes::PrimaryScreenMotionOnPrimary, MotionInfo::alloc(m_xCursor, m_yCursor));
+   } else {
+-    // the motion is on the secondary screen, so we warp mouse back to
+-    // center on the server screen. if we don't do this, then the mouse
+-    // will always try to return to the original entry point on the
+-    // secondary screen.
+-    LOG_DEBUG2("centering cursor on motion: %+d,%+d", m_xCenter, m_yCenter);
+-    warpCursorNoFlush(m_xCenter, m_yCenter);
++    // 远端控制时光标停在离开时的位置；放回这个停车点而不是屏幕中心，
++    // 否则后续移动会从错误起点计算。钩子已吞掉移动，通常不会真正移动光标。
++    LOG_DEBUG2("returning cursor to park point: %+d,%+d", mx - x, my - y);
++    warpCursorNoFlush(mx - x, my - y);
+ 
+     // examine the motion.  if it's about the distance
+     // from the center of the screen to an edge then
+diff --git a/src/lib/platform/MSWindowsDesks.cpp b/src/lib/platform/MSWindowsDesks.cpp
+--- a/src/lib/platform/MSWindowsDesks.cpp
++++ b/src/lib/platform/MSWindowsDesks.cpp
+@@ -605,26 +605,17 @@
+       }
+     }
+   } else {
+-    // move hider window under the cursor center, raise, and show it
+-    SetWindowPos(desk->m_window, HWND_TOP, m_xCenter, m_yCenter, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
++    // 隐藏窗口放到离开时的光标下，光标不再挪到屏幕中心：隐藏窗口被前台窗口压住时，
++    // 光标只会留在离开的边缘，而不是露在屏幕正中。下次进入由服务端坐标定位。
++    POINT cursor{m_xCenter, m_yCenter};
++    GetCursorPos(&cursor);
++    SetWindowPos(desk->m_window, HWND_TOP, cursor.x, cursor.y, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+ 
+     // watch for mouse motion.  if we see any then we hide the
+     // hider window so the user can use the physically attached
+     // mouse if desired.  we'd rather not capture the mouse but
+     // we aren't notified when the mouse leaves our window.
+     SetCapture(desk->m_window);
+-
+-    // windows can take a while to hide the cursor, so wait a few milliseconds to ensure the cursor
+-    // is hidden before centering. this doesn't seem to affect the fluidity of the transition.
+-    // without this, the cursor appears to flicker in the center of the screen which is annoying.
+-    // a slightly more elegant but complex solution could be to use a timed event.
+-    // 30 ms seems to work well enough without making the transition feel janky; a lower number
+-    // would be better but 10 ms doesn't seem to be quite long enough, as we get noticeable flicker.
+-    // this is largely a balance and out of our control, since windows can be unpredictable...
+-    // maybe another approach would be to repeatedly check the cursor visibility until it is hidden.
+-    LOG_DEBUG1("centering cursor on leave: %+d,%+d", m_xCenter, m_yCenter);
+-    ARCH->sleep(0.03);
+-    deskMouseMove(m_xCenter, m_yCenter);
+   }
+ }
+ 
+diff --git a/tools/test-desktop-focus.cpp b/tools/test-desktop-focus.cpp
+--- a/tools/test-desktop-focus.cpp
++++ b/tools/test-desktop-focus.cpp
+@@ -29,6 +29,7 @@
+   int moves = 0;
+   int layoutChanges = 0;
+   int sleeps = 0;
++  POINT cursor{12, 700};
+   HKL layout = nullptr;
+   std::vector<bool> visibility;
+   std::vector<WindowPlacement> placements;
+@@ -61,6 +62,7 @@
+ HWND WINAPI getForeground() { ++f.foregroundQueries; return f.foreground; }
+ HWND WINAPI capture(HWND window) { ++f.capture; return window; }
+ BOOL WINAPI release() { ++f.releases; return TRUE; }
++BOOL WINAPI cursorAt(LPPOINT point) { *point = f.cursor; return TRUE; }
+ }
+ 
+ #define LOG_DEBUG1(...) ((void)0)
+@@ -74,6 +76,7 @@
+ #define GetForegroundWindow getForeground
+ #define SetCapture capture
+ #define ReleaseCapture release
++#define GetCursorPos cursorAt
+ 
+ void setCursorVisibility(bool visible) { f.visibility.push_back(visible); }
+ struct Arch { void sleep(double) { ++f.sleeps; } } arch;
+@@ -155,8 +158,11 @@
+   f = {};
+   desks.m_isPrimary = false;
+   desks.deskLeave(&desk, keyboardLayout);
+-  check(f.visibility == std::vector<bool>{false} && f.capture == 1 && f.moves == 1 && f.sleeps == 1,
+-        "secondary leave retains cursor hiding, capture, and its legacy parking wait");
++  check(f.visibility == std::vector<bool>{false} && f.capture == 1,
++        "secondary leave retains cursor hiding and capture");
++  check(f.moves == 0 && f.sleeps == 0 && f.placements.size() == 1 && f.placements[0].x == 12 &&
++        f.placements[0].y == 700 && f.placements[0].width == 1 && f.placements[0].height == 1,
++        "secondary leave keeps the cursor at its exit edge and puts the hider under it instead of the screen center");
+   desks.deskEnter(&desk);
+   check(f.visibility == std::vector<bool>({false, true}) && f.releases == 1,
+         "secondary enter still restores visibility and releases capture");
+diff --git a/doc/dev/windows-pointer-motion.md b/doc/dev/windows-pointer-motion.md
+--- a/doc/dev/windows-pointer-motion.md
++++ b/doc/dev/windows-pointer-motion.md
+@@ -145,3 +145,16 @@
+ 离线回归新增三项（共 619 项生产钩子检查）：查询滞后时回位不被拉回中心、穿屏越界后首批
+ 位移按裁剪后的光标计算、越界回位落在边缘且反向移动从边缘继续。把新测试套在上一版钩子上，
+ 前两项分别失败，证明测试能复现两种旧行为。其余键盘、菜单、长按、返回与定位回归均通过。
++
++## 2026-11-13：离开时光标不再跳到屏幕中心
++
++修复回弹与回位后，真机录制（只观察的低级钩子 + 1ms 光标采样）显示回本机落点正确
++（22:35:55 回位 2546,692 后真实移动从此继续）。用户仍看到“被拉到中心”，并确认包括
++“离开 qingxian 时它的光标跳到自己屏幕中间”。原因是两端在交出鼠标时都把自己的光标
++挪到屏幕中心：服务端回中后光标保持可见（10-21 用户取消隐藏）；客户端依赖一个不置顶
++的 1×1 隐藏窗口遮住中心光标，被前台窗口压住时光标就露在正中。
++
++低级钩子吞掉远端控制期间的全部移动并用裁剪后的落点计算位移，停车位置不影响位移，
++因此：服务端离开时不再回中，只记录离开时的实际位置；仅在钩子回退路径收到绝对坐标时
++放回这个停车点。客户端离开时把隐藏窗口放到当前光标下，不再移动光标，也去掉为回中
++防闪烁而加的 30ms 等待。进入时仍由服务端坐标定位，显示器变化时的回中保持不变。

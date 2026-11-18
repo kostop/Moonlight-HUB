@@ -1,0 +1,156 @@
+diff --git a/src/lib/platform/MSWindowsKeySnapshot.h b/src/lib/platform/MSWindowsKeySnapshot.h
+new file mode 100644
+--- /dev/null
++++ b/src/lib/platform/MSWindowsKeySnapshot.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception */
++#pragma once
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <Windows.h>
++
++namespace deskflow::win32 {
++
++// 源端按键快照：主线程不接收键盘消息，GetKeyboardState 的同步状态会残留早已松开的
++// Alt/Ctrl/Win，每次离开本机重建记账时就变成“远端一直按着修饰键”。改按实时状态逐键查询。
++// 参数 isDown：查询某虚拟键当前是否按下；toButton：虚拟键到按钮的映射，0 表示无对应按钮；
++// insert：接收按下的按钮。
++template <typename IsDown, typename ToButton, typename Insert>
++void pollRealtimePressedKeys(IsDown isDown, ToButton toButton, Insert insert)
++{
++  for (UINT virtualKey = 1; virtualKey < 256; ++virtualKey) {
++    // 通用 Shift/Ctrl/Alt 由左右键分别查询，避免只按右键时把左键也记成按下。
++    if (virtualKey == VK_SHIFT || virtualKey == VK_CONTROL || virtualKey == VK_MENU) continue;
++    if (!isDown(virtualKey)) continue;
++    if (const auto button = toButton(virtualKey); button != 0) insert(button);
++  }
++}
++
++} // namespace deskflow::win32
+diff --git a/src/lib/platform/MSWindowsKeyState.h b/src/lib/platform/MSWindowsKeyState.h
+--- a/src/lib/platform/MSWindowsKeyState.h
++++ b/src/lib/platform/MSWindowsKeyState.h
+@@ -140,6 +140,12 @@
+   int32_t pollActiveGroup() const override;
+   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
+ 
++  // 参数 enable：源端置真，刷新按键记账时读实时按键状态而不是本线程的同步键盘状态。
++  void pollRealtimeKeys(bool enable)
++  {
++    m_pollRealtimeKeys = enable;
++  }
++
+   // KeyState overrides
+   void onKey(KeyButton button, bool down, KeyModifierMask newState) override;
+   void sendKeyEvent(
+@@ -217,6 +223,7 @@
+   bool m_useSavedModifiers;
+   KeyModifierMask m_savedModifiers;
+   KeyModifierMask m_originalSavedModifiers;
++  bool m_pollRealtimeKeys = false;
+ 
+   // pointer to ToUnicodeEx.  on win95 family this will be nullptr.
+   typedef int(WINAPI *ToUnicodeEx_t)(
+diff --git a/src/lib/platform/MSWindowsKeyState.cpp b/src/lib/platform/MSWindowsKeyState.cpp
+--- a/src/lib/platform/MSWindowsKeyState.cpp
++++ b/src/lib/platform/MSWindowsKeyState.cpp
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include "platform/MSWindowsKeyState.h"
++#include "platform/MSWindowsKeySnapshot.h"
+ 
+ #include "arch/win32/XArchWindows.h"
+ #include "base/IEventQueue.h"
+@@ -866,6 +867,14 @@
+ 
+ void MSWindowsKeyState::pollPressedKeys(KeyButtonSet &pressedKeys) const
+ {
++  if (m_pollRealtimeKeys) {
++    deskflow::win32::pollRealtimePressedKeys(
++        [](UINT virtualKey) { return (GetAsyncKeyState(static_cast<int>(virtualKey)) & 0x8000) != 0; },
++        [this](UINT virtualKey) { return virtualKeyToButton(virtualKey); },
++        [&pressedKeys](KeyButton button) { pressedKeys.insert(button); }
++    );
++    return;
++  }
+   BYTE keyState[256];
+   if (!GetKeyboardState(keyState)) {
+     LOG_WARN("keyboard state is unexpected");
+diff --git a/src/lib/platform/MSWindowsScreen.cpp b/src/lib/platform/MSWindowsScreen.cpp
+--- a/src/lib/platform/MSWindowsScreen.cpp
++++ b/src/lib/platform/MSWindowsScreen.cpp
+@@ -107,6 +107,8 @@
+     m_keyState = new MSWindowsKeyState(
+         m_desks, getEventTarget(), m_events, AppUtil::instance().getKeyboardLayoutList(), enableLangSync
+     );
++    // 源端每次离开本机都会重建按键记账；同步键盘状态残留的修饰键会被当成一直按着发给远端。
++    m_keyState->pollRealtimeKeys(m_isPrimary);
+ 
+     updateScreenShape();
+     m_class = createWindowClass();
+diff --git a/tools/test-desktop-focus.cpp b/tools/test-desktop-focus.cpp
+--- a/tools/test-desktop-focus.cpp
++++ b/tools/test-desktop-focus.cpp
+@@ -7,6 +7,7 @@
+ #include <vector>
+ 
+ #include "../src/lib/platform/MSWindowsInjectedModifiers.h"
++#include "../src/lib/platform/MSWindowsKeySnapshot.h"
+ 
+ // 编译当前生产桌面交接方法体，只模拟 Win32 边界；不接触真实前台、输入队列或键盘。
+ namespace {
+@@ -198,5 +199,26 @@
+         "only modifiers last injected down and still held by the OS are released; released or OS-up keys are left alone");
+   check(injected.takeStranded([](WORD) { return true; }) == 0,
+         "taking stranded modifiers clears the record so one leave never releases twice");
++
++  // 源端快照：同步状态里残留的 Alt 不参与，只看实时按下；通用修饰键不重复映射到左键。
++  std::vector<UINT> realtimeDown{VK_RMENU, VK_MENU, VK_SHIFT, 'A', VK_F24};
++  std::vector<unsigned> pressed;
++  deskflow::win32::pollRealtimePressedKeys(
++      [&](UINT virtualKey) {
++        for (UINT down : realtimeDown) if (down == virtualKey) return true;
++        return false;
++      },
++      [](UINT virtualKey) -> unsigned {
++        switch (virtualKey) {
++        case VK_LMENU: case VK_MENU: return 0x38;
++        case VK_RMENU: return 0x138;
++        case VK_LSHIFT: case VK_SHIFT: return 0x2a;
++        case 'A': return 0x1e;
++        default: return 0;
++        }
++      },
++      [&](unsigned button) { pressed.push_back(button); });
++  check(pressed == std::vector<unsigned>({0x1e, 0x138}),
++        "realtime snapshot returns only keys down now, skips generic Shift/Ctrl/Alt aliases and unmapped keys");
+   std::printf("PASS: %d extracted desktop focus checks; no real foreground or input operation.\n", checks);
+ }
+diff --git a/doc/dev/windows-pointer-motion.md b/doc/dev/windows-pointer-motion.md
+--- a/doc/dev/windows-pointer-motion.md
++++ b/doc/dev/windows-pointer-motion.md
+@@ -178,3 +178,21 @@
+ 离线回归：源端新增 8 个修饰键 × 3 项（记账丢失后本机必须松开且不激活菜单、只补发一次、
+ 本机未按着时不注入）；当前部署版本在第一项即失败。接收端新增槽位映射与“只释放最后注入
+ 为按下且系统仍按着的键、取出后清空”检查，以及离屏只在接收端执行一次。
++
++## 2026-11-18：根因——离开本机时服务端凭空“按住”修饰键
++
++源端日志只记录修饰键的首次按下。统计 11-17 至 11-18 的日志，共 21 次出现“只有松开、
++没有按下，松开前掩码已含该修饰键”，涉及左 Alt、左 Ctrl、左 Win；除日志开头 1 次外，
++其余 20 次之前都刚发生过一次“离开本机”。也就是说，服务端在离开时自己把一个早已松开的
++修饰键记成了按住，并在之后每个发往 qingxian 的按键里带上它：打字变成 Alt/Ctrl/Win 组合、
++菜单被激活，直到用户再按一次该键才清除。11-18 18:28 部署的两端兜底之后仍出现 3 次，
++说明问题不在注入记账，而在源端自己的状态。
++
++`Screen::leavePrimary()` 每次离开都调用 `updateKeyState()`：清空记账，再用
++`GetKeyboardState` 重建。这是调用线程的同步键盘状态；源端主线程并不接收键盘消息，
++其中残留的修饰键就被当成仍然按住。
++
++修复：源端（`MSWindowsScreen` 为主屏时）刷新改读 `GetAsyncKeyState` 的实时状态，
++左右修饰键分别查询，跳过通用 Shift/Ctrl/Alt 别名（`MSWindowsKeySnapshot.h`）。离开时钩子
++仍处于放行模式，实时状态就是真实按键（含 Sunshine 等其他程序的注入），用户真正按住的
++键照常带到远端。接收端仍用原来的同步状态，行为不变。

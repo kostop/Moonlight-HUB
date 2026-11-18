@@ -22,6 +22,13 @@ Alt/Win 单击而误激活菜单；普通同屏菜单用法保持原样。以上
 `deskflow-windows-pointer-clip.patch` 把钩子基准和回位落点按最近显示器裁剪，与 Windows
 实际光标一致：穿屏时越过边缘的放行坐标不再让首批位移反向弹回本机；回位以确定落点
 续算，不读回 SendInput 后仍可能停在停车中心的系统光标，避免被拉回屏幕中心。
+`deskflow-windows-pointer-park.patch` 让两端交出鼠标时光标停在离开的边缘：服务端不再回中，
+客户端把隐藏窗口放到当前光标下而不是把光标挪到屏幕中心再遮住。
+`deskflow-windows-stranded-modifiers.patch` 为按住修饰键穿屏后的卡键加两端兜底：接收端离屏时
+补发本核心按下过、系统仍按着的修饰键松开（先注入 E8）；源端吞掉物理松开时若本机系统
+仍按着该键，就补发本机松开。两处都只在系统确实仍按着时动作。
+`deskflow-windows-sync-keys.patch` 修复根因：源端每次离开本机都会用主线程的同步键盘状态
+重建按键记账，残留的 Alt/Ctrl/Win 会被当成一直按住发给远端；改为读实时按键状态。
 
 上游下载仅是构建输入，位于被忽略的 `artifacts/`。触摸包装器、过滤器与键盘辅助程序
 源码在本仓库的 [native/deskflow-touch](../native/deskflow-touch/README.md)。
