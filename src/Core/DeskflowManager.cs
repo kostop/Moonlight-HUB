@@ -172,6 +172,14 @@ public sealed class DeskflowManager : IDisposable
     /// (a client retrying a server that never completes the handshake opens a new short-lived connection every few seconds).</summary>
     private readonly Dictionary<string, DateTime> _connectionSeen = new();
     private static readonly TimeSpan PeerConfirmAge = TimeSpan.FromSeconds(4);
+    /// <summary>Server only: since when the peer hub has reported "client, not connected" while no core connection arrived.</summary>
+    private DateTime _peerStrandedSinceUtc = DateTime.MinValue;
+    private DateTime _lastRelinkUtc = DateTime.MinValue;
+    private TimeSpan _relinkBackoff = RelinkFirstBackoff;
+    private int _relinking;
+    /// <summary>A client that lost the server over a Wi-Fi roam reconnects by itself within a few seconds; only longer gaps are relinked.</summary>
+    private static readonly TimeSpan RelinkAfter = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan RelinkFirstBackoff = TimeSpan.FromSeconds(15);
 
     public DeskflowStatus Status { get; private set; } = new();
     /// <summary>Last shared layout fetched from the layout service (null until the first successful fetch).</summary>
@@ -613,6 +621,7 @@ public sealed class DeskflowManager : IDisposable
                 st = Refresh();
             }
             _host.Tick(s, st);
+            RelinkStrandedPeer(s, st);
 
             if (IsHealthy(s, st) && ConfMatches(s, st))
             {
@@ -649,6 +658,49 @@ public sealed class DeskflowManager : IDisposable
         if (st.ConfiguredRole != s.Role) return false;
         if (!st.SecurityOff) return false; // rewritten (and the core restarted) by the repair below
         return s.Role != DeskflowRole.Client || string.Equals(st.RemoteHost, s.RemoteHost, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A client keeps retrying the server address it was given, and both hubs only check that their core runs. On 2026-11-19
+    /// 13:07 the Wi-Fi DHCP server refused the laptop's lease 10.11.12.140 and handed out 10.10.7.33; qingxian retried the old
+    /// address for an hour. The server sees the peer hub report "client, not connected" while no connection arrives, so it
+    /// asks the peer again to become a client: the peer connects to the address that request came from.
+    /// </summary>
+    /// <param name="s">本机 Deskflow 设置（角色、对端地址、是否联动）</param>
+    /// <param name="st">本次巡检的状态快照（监听、已连上的对端）</param>
+    private void RelinkStrandedPeer(DeskflowSettings s, DeskflowStatus st)
+    {
+        var peer = PeerHub;
+        var stranded = s.Role == DeskflowRole.Server && st.RunningRole == DeskflowRole.Server && st.Listening && st.Peers.Count == 0
+                       && s.LinkPeer && DeskflowPeer.IsValidHost(s.RemoteHost)
+                       && peer is { Role: DeskflowRole.Client, Running: DeskflowRole.Client, Peers.Count: 0 };
+        var now = DateTime.UtcNow;
+        if (!stranded)
+        {
+            _peerStrandedSinceUtc = DateTime.MinValue;
+            if (st.Peers.Count > 0) _relinkBackoff = RelinkFirstBackoff;
+            return;
+        }
+        if (_peerStrandedSinceUtc == DateTime.MinValue) _peerStrandedSinceUtc = now;
+        if (now - _peerStrandedSinceUtc < RelinkAfter || now - _lastRelinkUtc < _relinkBackoff) return;
+        if (Interlocked.Exchange(ref _relinking, 1) == 1) return;
+        _lastRelinkUtc = now;
+        var waited = now - _peerStrandedSinceUtc;
+        var host = s.RemoteHost;
+        _relinkBackoff = TimeSpan.FromSeconds(Math.Min(_relinkBackoff.TotalSeconds * 2, 300));
+        Log.Warn($"Deskflow: {peer!.Screen} 是客户端但已 {waited.TotalSeconds:0}s 没有连上本机，重新通知它连接本机当前地址（下次重试间隔 {_relinkBackoff.TotalSeconds:0}s）");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var (ok, message) = await PeerLink.RequestRoleAsync(host, DeskflowRole.Client).ConfigureAwait(false);
+                Log.Info($"Deskflow: 重新联动 {host} {(ok ? "成功" : "失败")}：{message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _relinking, 0);
+            }
+        });
     }
 
     private bool IsHealthy(DeskflowSettings s, DeskflowStatus st)
