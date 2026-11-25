@@ -11,7 +11,7 @@ namespace MoonlightHub.Core;
 /// <summary>What the other computer's hub reports about itself.</summary>
 public sealed record PeerHubInfo(string Screen, string Os, string Version, DeskflowRole Role, DeskflowRole Running, List<string> Peers,
     double DpiScale = 0, int DesktopWidth = 0, int DesktopHeight = 0, List<SharedMonitor>? Monitors = null, bool DisplayBusy = false,
-    bool FileClipboard = false)
+    bool FileClipboard = false, bool ProtectCore = true)
 {
     public string Text => $"{Screen} ({Os}, v{Version}) · {DeskflowManager.RoleName(Running)}" + (Peers.Count > 0 ? " · 已连接 " + string.Join(", ", Peers) : string.Empty);
 }
@@ -181,10 +181,21 @@ public sealed class PeerLink : IDisposable
                 }
                 // a client connects to the hub that asked, unless it named another server
                 var host = body["remoteHost"]?.GetValue<string>();
+                var caller = body["caller"]?.GetValue<string>();
                 if (string.IsNullOrWhiteSpace(host)) host = request.RemoteEndPoint?.Address is { } a ? (a.IsIPv4MappedToIPv6 ? a.MapToIPv4() : a).ToString() : null;
-                Log.Info($"Deskflow 联动: {request.RemoteEndPoint?.Address} 请求本机切换为{DeskflowManager.RoleName(role.Value)}" + (role == DeskflowRole.Client ? $"（服务端 {host}）" : string.Empty));
                 // requests from the other hub never cascade back; the local command line may ask this hub to switch both computers
                 var fromHere = request.RemoteEndPoint?.Address is { } from && IPAddress.IsLoopback(from);
+                if (role.Value == DeskflowRole.Off)
+                {
+                    var source = fromHere ? "本机 CLI/API (127.0.0.1)" : $"远程接口 ({request.RemoteEndPoint?.Address})";
+                    var guard = _deskflow.EvaluateExternalStop("/api/hub/role (off)", source, caller);
+                    if (!guard.Allowed)
+                    {
+                        await Reply(response, 403, new { ok = false, blocked = true, error = guard.WarningMessage, message = guard.WarningMessage, status = StatusPayload() }).ConfigureAwait(false);
+                        return;
+                    }
+                }
+                Log.Info($"Deskflow 联动: {request.RemoteEndPoint?.Address} 请求本机切换为{DeskflowManager.RoleName(role.Value)}" + (role == DeskflowRole.Client ? $"（服务端 {host}）" : string.Empty));
                 var cascade = fromHere && body["cascade"]?.GetValue<bool>() == true;
                 if (fromHere && role == DeskflowRole.Client && string.IsNullOrWhiteSpace(body["remoteHost"]?.GetValue<string>())) host = null;
                 var (ok, message) = await _deskflow.SetRoleAsync(role.Value, role == DeskflowRole.Client ? host : null, cascade).ConfigureAwait(false);
@@ -220,6 +231,7 @@ public sealed class PeerLink : IDisposable
             monitors = OperatingSystem.IsWindows() && Hub.Current is { } hub ? SharedDisplayLayout.LocalMonitors(hub) : null,
             // this hub takes copied files as SMB paths (POST /api/hub/file-clipboard)
             fileClipboard = OperatingSystem.IsWindows() && Hub.Current?.FileClipboard != null && _deskflow.Settings.SmbFileClipboard,
+            protectCore = _deskflow.Settings.ProtectCoreFromExternalStop,
         };
     }
 
@@ -283,13 +295,18 @@ public sealed class PeerLink : IDisposable
     }
 
     /// <summary>Asks the other hub to take a role; returns its answer (it only replies once its core is up).</summary>
-    public static async Task<(bool Ok, string Message)> RequestRoleAsync(string host, DeskflowRole role, string? remoteHost = null, bool cascade = false)
+    /// <param name="host">目标 Hub 主机地址。</param>
+    /// <param name="role">期望切换的 Deskflow 角色。</param>
+    /// <param name="remoteHost">客户端模式要连接的服务端地址。</param>
+    /// <param name="cascade">是否联动切换对端角色。</param>
+    /// <param name="caller">可选的本机调用方进程链路描述，用于审计告警。</param>
+    public static async Task<(bool Ok, string Message)> RequestRoleAsync(string host, DeskflowRole role, string? remoteHost = null, bool cascade = false, string? caller = null)
     {
         try
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(cascade ? 90 : 40));
             using var response = await Http.SendAsync(Request(HttpMethod.Post, host, "/api/hub/role",
-                new { role = role.ToString().ToLowerInvariant(), remoteHost, cascade }), cts.Token).ConfigureAwait(false);
+                new { role = role.ToString().ToLowerInvariant(), remoteHost, cascade, caller }), cts.Token).ConfigureAwait(false);
             var node = JsonNode.Parse(await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false)) as JsonObject;
             var message = node?["message"]?.GetValue<string>() ?? node?["error"]?.GetValue<string>() ?? ((int)response.StatusCode).ToString();
             return (response.IsSuccessStatusCode && node?["ok"]?.GetValue<bool>() == true, message);
@@ -366,7 +383,8 @@ public sealed class PeerLink : IDisposable
             o["desktopWidth"] is JsonValue dw && dw.TryGetValue<int>(out var w) ? w : 0,
             o["desktopHeight"] is JsonValue dh && dh.TryGetValue<int>(out var h) ? h : 0,
             o["monitors"]?.Deserialize<List<SharedMonitor>>(Json), o["displayBusy"]?.GetValue<bool>() == true,
-            o["fileClipboard"]?.GetValue<bool>() == true);
+            o["fileClipboard"]?.GetValue<bool>() == true,
+            o["protectCore"] is JsonValue pc && pc.TryGetValue<bool>(out var protect) ? protect : true);
     }
 
     public void Dispose()

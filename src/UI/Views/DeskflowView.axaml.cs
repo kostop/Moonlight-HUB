@@ -41,6 +41,7 @@ public partial class DeskflowView : UserControl, IRefreshable
         _loadingOptions = true;
         var s = Df.Settings;
         ManagedBox.IsChecked = s.Managed;
+        ProtectCoreBox.IsChecked = s.ProtectCoreFromExternalStop;
         LinkBox.IsChecked = s.LinkPeer;
         FilterBox.IsChecked = s.UseTouchFilter;
         MonitorBox.IsChecked = s.KeyboardReleaseMonitor;
@@ -173,6 +174,7 @@ public partial class DeskflowView : UserControl, IRefreshable
                 : string.Join("、", s.Sidecars.Select(x => x.Name.Replace("Deskflow ", string.Empty))) + " · 由 Hub 托管"));
         }
         rows.Add(("运行方式", s.Managed ? "Moonlight Hub 直接运行 deskflow-core" : "未托管（Hub 不启动也不守护 core）"));
+        rows.Add(("核心保护", s.ProtectCoreFromExternalStop ? "已开启（拦截外部命令行/接口关闭与配置篡改）" : "已关闭"));
         rows.Add(("Deskflow 位置", Df.InstallLocation));
         rows.Add(("配置文件", Df.ConfigPath));
 
@@ -293,6 +295,7 @@ public partial class DeskflowView : UserControl, IRefreshable
         Df.UpdateSettings(s =>
         {
             s.Managed = ManagedBox.IsChecked == true;
+            s.ProtectCoreFromExternalStop = ProtectCoreBox.IsChecked == true;
             s.LinkPeer = LinkBox.IsChecked == true;
             s.UseTouchFilter = filter;
             s.KeyboardReleaseMonitor = MonitorBox.IsChecked == true;

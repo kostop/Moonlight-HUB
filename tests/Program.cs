@@ -50,6 +50,7 @@ internal static class Program
         DisplayReconnectTests.AddTo(tests);
         SunshineLogTests.AddTo(tests);
         DeskflowRuntimeTests.AddTo(tests);
+        DeskflowCoreGuardTests.AddTo(tests);
 
         var failed = 0;
         foreach (var (name, run) in tests)

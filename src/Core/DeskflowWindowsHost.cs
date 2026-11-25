@@ -742,7 +742,7 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
                     return "ok";
                 }
             case "stop":
-                Log.Info("Deskflow: 收到服务管道停止请求（忽略：角色由 Hub 管理）");
+                Log.Warn("Deskflow 核心保护: 已拦截服务管道 deskflow-daemon 的停止请求（角色由 Hub 管理，忽略外部停止）");
                 return "ok";
             default:
                 return "ok"; // noop, elevate, logLevel, configFile, clearSettings

@@ -40,6 +40,8 @@ public sealed class DeskflowSettings
 {
     /// <summary>The hub runs deskflow-core itself and keeps it in <see cref="Role"/> (Deskflow's own autostart is switched off).</summary>
     public bool Managed { get; set; } = true;
+    /// <summary>拦截外部命令行、本地接口和直接修改 deskflow.json 关闭 deskflow-core，并在核心被外部终止时立即告警并恢复。</summary>
+    public bool ProtectCoreFromExternalStop { get; set; } = true;
     public DeskflowRole Role { get; set; } = DeskflowRole.Server;
     /// <summary>The other computer (IP, typed in by the user): server address in client mode, peer hub, layout service, side channel.</summary>
     public string RemoteHost { get; set; } = string.Empty;
@@ -189,6 +191,9 @@ public sealed class DeskflowManager : IDisposable
     /// <summary>A client that lost the server over a Wi-Fi roam reconnects by itself within a few seconds; only longer gaps are relinked.</summary>
     private static readonly TimeSpan RelinkAfter = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan RelinkFirstBackoff = TimeSpan.FromSeconds(15);
+    /// <summary>最近一次观测到的与期望角色一致的运行状态，用于识别 deskflow-core 是否被外部强杀。</summary>
+    private DeskflowRole _observedRunningRole = DeskflowRole.Off;
+    private DateTime _lastUnexpectedRecoveryUtc = DateTime.MinValue;
 
     public DeskflowStatus Status { get; private set; } = new();
     /// <summary>Last shared layout fetched from the layout service (null until the first successful fetch).</summary>
@@ -208,6 +213,8 @@ public sealed class DeskflowManager : IDisposable
     public IDeskflowHost Host => _host;
     public PeerLink Link => _link;
     public event Action? Changed;
+    /// <summary>核心保护拦截外部关闭/篡改配置或检测到核心被外部强杀时触发的非阻塞告警事件。</summary>
+    public event Action<string>? GuardAlert;
 
     public DeskflowManager()
     {
@@ -328,13 +335,53 @@ public sealed class DeskflowManager : IDisposable
     {
         var stamp = SettingsStamp();
         if (stamp == _settingsStamp) return;
+        DeskflowExternalEditResult? editResult = null;
+        DeskflowRole roleAfter;
         lock (_gate)
         {
-            _settings = DeskflowSettings.Load();
-            _settingsStamp = stamp;
+            var loaded = DeskflowSettings.Load();
+            editResult = DeskflowCoreGuard.EvaluateExternalSettingsChange(_settings, loaded);
+            _settings = editResult.Effective;
+            if (editResult.Blocked)
+            {
+                SaveLocked();
+            }
+            else
+            {
+                _settingsStamp = stamp;
+            }
+            roleAfter = _settings.Role;
         }
         _badTicks = 0;
-        Log.Info($"Deskflow: 设置已在外部修改，角色={RoleName(_settings.Role)}");
+        if (editResult.Blocked)
+        {
+            LastAction = editResult.WarningMessage;
+            if (GuardAlert != null) { try { GuardAlert.Invoke(editResult.WarningMessage); } catch { } }
+            else Log.Warn("Deskflow 核心保护: " + editResult.WarningMessage);
+            try { Changed?.Invoke(); } catch { }
+            return;
+        }
+        Log.Info($"Deskflow: 设置已在外部修改，角色={RoleName(roleAfter)}");
+    }
+
+    /// <summary>评估并记录一次来自外部（CLI / 本地 API / 远程请求）的停止 Deskflow 核心请求。</summary>
+    /// <param name="action">请求动作标识，例如 deskflow off 或 deskflow restore。</param>
+    /// <param name="source">请求来源描述，例如本机 CLI/API。</param>
+    /// <param name="caller">可选的调用进程链路信息。</param>
+    public DeskflowGuardDecision EvaluateExternalStop(string action, string source, string? caller = null)
+    {
+        var decision = DeskflowCoreGuard.EvaluateExternalStop(Settings, Status, new DeskflowStopRequest(action, source, caller));
+        if (!decision.Allowed)
+        {
+            LastAction = decision.WarningMessage;
+            var body = decision.LogMessage.StartsWith("Deskflow 核心保护: ", StringComparison.Ordinal)
+                ? decision.LogMessage["Deskflow 核心保护: ".Length..]
+                : decision.LogMessage;
+            if (GuardAlert != null) { try { GuardAlert.Invoke(body); } catch { } }
+            else Log.Warn(decision.LogMessage);
+            try { Changed?.Invoke(); } catch { }
+        }
+        return decision;
     }
 
     // ------------------------------------------------------------------ legacy autostart pieces
@@ -353,6 +400,7 @@ public sealed class DeskflowManager : IDisposable
     /// <summary>Rollback: stops the hub's core and gives Deskflow its own autostart pieces back.</summary>
     public List<string> RestoreLegacy()
     {
+        _observedRunningRole = DeskflowRole.Off;
         UpdateSettingsSilently(s => s.Managed = false);
         var cores = _host.FindCores();
         if (cores.Count > 0) _host.Stop(cores);
@@ -506,6 +554,7 @@ public sealed class DeskflowManager : IDisposable
         }
 
         var cores = _host.FindCores();
+        _observedRunningRole = DeskflowRole.Off;
         // no gap: the stand-alone touch isolator takes over before the filtered core goes away
         _host.PrepareForCoreRestart(s);
         if (cores.Count > 0) _host.Stop(cores);
@@ -641,6 +690,25 @@ public sealed class DeskflowManager : IDisposable
                 _badTicks = 0;
                 _repairBackoff = TimeSpan.FromSeconds(15);
                 return;
+            }
+
+            if (DeskflowCoreGuard.ShouldRecoverUnexpectedStop(s, st, _observedRunningRole))
+            {
+                _observedRunningRole = DeskflowRole.Off;
+                var alert = DeskflowCoreGuard.UnexpectedStopMessage(s.Role);
+                LastAction = alert;
+                if (GuardAlert != null) { try { GuardAlert.Invoke(alert); } catch { } }
+                else Log.Warn("Deskflow 核心保护: " + alert);
+                if ((DateTime.UtcNow - _lastUnexpectedRecoveryUtc) >= TimeSpan.FromSeconds(15))
+                {
+                    _lastUnexpectedRecoveryUtc = DateTime.UtcNow;
+                    _lastRepairUtc = DateTime.UtcNow;
+                    _badTicks = 0;
+                    _switchLock.Wait();
+                    try { ApplyLocalAsync(s).GetAwaiter().GetResult(); }
+                    finally { _switchLock.Release(); }
+                    return;
+                }
             }
 
             _badTicks++;
@@ -822,6 +890,8 @@ public sealed class DeskflowManager : IDisposable
                           && string.Equals(IniGet(conf, "security", "checkPeerFingerprints"), "false", StringComparison.OrdinalIgnoreCase),
         };
         Status = st;
+        var wantedRole = Settings.Role;
+        if (st.RunningRole == wantedRole && wantedRole != DeskflowRole.Off) _observedRunningRole = st.RunningRole;
         return st;
     }
 

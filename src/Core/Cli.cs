@@ -349,7 +349,7 @@ public static class Cli
                     df.Refresh();
                     Thread.Sleep(4500); // a peer only counts once its connection has lasted a few seconds
                     var st = df.Refresh();
-                    P($"期望角色: {DeskflowManager.RoleName(s.Role)}{(s.Role == DeskflowRole.Client ? " → " + s.RemoteHost : string.Empty)}  托管: {(s.Managed ? "Hub" : "关闭")}  联动对端: {(s.LinkPeer ? "开" : "关")}  已接管自启组件: {s.LegacyTakenOver}");
+                    P($"期望角色: {DeskflowManager.RoleName(s.Role)}{(s.Role == DeskflowRole.Client ? " → " + s.RemoteHost : string.Empty)}  托管: {(s.Managed ? "Hub" : "关闭")}  核心保护: {(s.ProtectCoreFromExternalStop ? "开" : "关")}  联动对端: {(s.LinkPeer ? "开" : "关")}  已接管自启组件: {s.LegacyTakenOver}");
                     P($"运行状态: {st.Summary}");
                     P($"core pid={st.CorePid} core数={st.MainCores} 触摸过滤={st.Filtered} 过滤健康={st.FilterHealthy?.ToString() ?? "-"} F24规则={st.F24Rule} 监视器={st.MonitorRunning}");
                     P($"Deskflow.conf: coreMode={DeskflowManager.RoleName(st.ConfiguredRole)} remoteHost={st.RemoteHost} 屏幕名={st.ScreenName} 端口={st.Port} TLS={st.Tls}");
@@ -376,15 +376,26 @@ public static class Cli
                     var role = sub == "server" ? DeskflowRole.Server : sub == "client" ? DeskflowRole.Client : DeskflowRole.Off;
                     var local = rest.Contains("--local");
                     var host = rest.Skip(1).FirstOrDefault(a => !a.StartsWith("--"));
+                    var caller = role == DeskflowRole.Off ? ProcessUtil.DescribeParentProcess() : null;
                     // a running hub owns the core: let it do the switch instead of racing its guard
-                    var (ok, msg) = PeerLink.RequestRoleAsync("127.0.0.1", role, host, cascade: !local).GetAwaiter().GetResult();
+                    var (ok, msg) = PeerLink.RequestRoleAsync("127.0.0.1", role, host, cascade: !local, caller: caller).GetAwaiter().GetResult();
                     if (!ok && msg.StartsWith("对端 Hub 无法连接", StringComparison.Ordinal))
                     {
+                        if (role == DeskflowRole.Off)
+                        {
+                            df.Refresh();
+                            var guard = df.EvaluateExternalStop("CLI deskflow off", "本机 CLI（Hub 未运行）", caller);
+                            if (!guard.Allowed)
+                            {
+                                P(guard.WarningMessage);
+                                return 3;
+                            }
+                        }
                         // no hub running here: switch in this process
                         (ok, msg) = df.SetRoleAsync(role, host, cascade: !local).GetAwaiter().GetResult();
                     }
                     P(msg);
-                    return ok ? 0 : 2;
+                    return ok ? 0 : (role == DeskflowRole.Off && msg.StartsWith("[警告]", StringComparison.Ordinal) ? 3 : 2);
                 }
             case "peer":
                 {
@@ -410,8 +421,26 @@ public static class Cli
                 foreach (var n in df.TakeOverLegacy()) P(n);
                 return 0;
             case "restore":
-                foreach (var n in df.RestoreLegacy()) P(n);
-                return 0;
+                {
+                    var caller = ProcessUtil.DescribeParentProcess();
+                    df.Refresh();
+                    var effectiveSettings = df.Settings;
+                    try
+                    {
+                        var live = PeerLink.GetStatusAsync("127.0.0.1", TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+                        if (live != null && live.ProtectCore) effectiveSettings.ProtectCoreFromExternalStop = true;
+                    }
+                    catch { }
+                    var guard = DeskflowCoreGuard.EvaluateExternalStop(effectiveSettings, df.Status, new DeskflowStopRequest("CLI deskflow restore", "本机 CLI", caller));
+                    if (!guard.Allowed)
+                    {
+                        Log.Warn(guard.LogMessage);
+                        P(guard.WarningMessage);
+                        return 3;
+                    }
+                    foreach (var n in df.RestoreLegacy()) P(n);
+                    return 0;
+                }
             case "link":
                 {
                     var arg = rest.Count > 1 ? rest[1].ToLowerInvariant() : string.Empty;

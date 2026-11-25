@@ -235,6 +235,86 @@ public static class ProcessUtil
     [DllImport("advapi32.dll", SetLastError = true)] private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll, ref TOKEN_PRIVILEGES newState, int length, IntPtr previous, IntPtr returnLength);
     [DllImport("advapi32.dll", SetLastError = true)] private static extern bool GetTokenInformation(IntPtr token, int infoClass, IntPtr info, int length, out int returned);
     [DllImport("advapi32.dll", SetLastError = true)] private static extern bool IsWellKnownSid(IntPtr sid, int type);
+    [DllImport("ntdll.dll")] private static extern int NtQueryInformationProcess(IntPtr process, int infoClass, ref PROCESS_BASIC_INFORMATION info, int length, out int returned);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_BASIC_INFORMATION
+    {
+        public IntPtr ExitStatus;
+        public IntPtr PebBaseAddress;
+        public IntPtr AffinityMask;
+        public IntPtr BasePriority;
+        public UIntPtr UniqueProcessId;
+        public UIntPtr InheritedFromUniqueProcessId;
+    }
+
+    /// <summary>获取当前进程的父进程名称与 PID（仅用于诊断与安全审计，失败返回 null）。</summary>
+    public static string? DescribeParentProcess()
+    {
+        try
+        {
+            var ppid = GetParentProcessId(Environment.ProcessId);
+            if (ppid <= 0) return null;
+            string? parentName = null;
+            try
+            {
+                using var parent = Process.GetProcessById(ppid);
+                parentName = parent.ProcessName;
+            }
+            catch { }
+            var gppid = GetParentProcessId(ppid);
+            string? grandName = null;
+            if (gppid > 0)
+            {
+                try
+                {
+                    using var grand = Process.GetProcessById(gppid);
+                    grandName = grand.ProcessName;
+                }
+                catch { }
+            }
+            var parentPart = string.IsNullOrEmpty(parentName) ? $"pid={ppid}" : $"{parentName}(pid={ppid})";
+            if (string.IsNullOrEmpty(grandName)) return parentPart;
+            return $"{grandName}(pid={gppid}) -> {parentPart}";
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>读取指定进程的父进程 PID，读取失败时返回 0。</summary>
+    /// <param name="pid">目标进程 PID。</param>
+    private static int GetParentProcessId(int pid)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var handle = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, (uint)pid);
+            if (handle == IntPtr.Zero) return 0;
+            try
+            {
+                var pbi = new PROCESS_BASIC_INFORMATION();
+                if (NtQueryInformationProcess(handle, 0, ref pbi, Marshal.SizeOf<PROCESS_BASIC_INFORMATION>(), out _) != 0) return 0;
+                return unchecked((int)pbi.InheritedFromUniqueProcessId.ToUInt64());
+            }
+            finally
+            {
+                CloseHandle(handle);
+            }
+        }
+        try
+        {
+            var stat = File.ReadAllText($"/proc/{pid}/stat");
+            var end = stat.LastIndexOf(')');
+            if (end < 0) return 0;
+            var fields = stat[(end + 2)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            return fields.Length >= 2 && int.TryParse(fields[1], out var ppid) ? ppid : 0;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
 
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct TOKEN_PRIVILEGES

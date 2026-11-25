@@ -46,6 +46,7 @@ public partial class App : Application
 
             if (OperatingSystem.IsWindows() && _hub.FileClipboard is { } files)
                 files.Notice += (message, warning) => Dispatcher.UIThread.Post(() => _tray?.Notify("文件快传", message, warning));
+            _hub.Deskflow.GuardAlert += message => Dispatcher.UIThread.Post(() => _tray?.Notify("Deskflow 核心保护", message, warning: true));
             _hub.Standby.Requested += prompt => Dispatcher.UIThread.Post(() => ShowStandbyPrompt(prompt));
             _hub.Standby.Resolved += (id, reason) => Dispatcher.UIThread.Post(() =>
             {
