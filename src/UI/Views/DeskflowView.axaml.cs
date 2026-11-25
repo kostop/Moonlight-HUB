@@ -26,7 +26,7 @@ public partial class DeskflowView : UserControl, IRefreshable
         InitializeComponent();
         RemoteHostBox.TextChanged += (_, _) => _hostEdited = RemoteHostBox.IsKeyboardFocusWithin || _hostEdited;
         // touch filter and keyboard-release monitor only exist in the Windows setup
-        FilterBox.IsVisible = MonitorBox.IsVisible = TouchIsolationBox.IsVisible = OperatingSystem.IsWindows();
+        FilterBox.IsVisible = MonitorBox.IsVisible = TouchIsolationBox.IsVisible = FileCard.IsVisible = OperatingSystem.IsWindows();
         if (!OperatingSystem.IsWindows())
         {
             PeerHint.Text = "保存后，本机的客户端连接和对端 Hub 联动都改用这个地址（共享屏幕布局服务就运行在本机）。";
@@ -45,8 +45,40 @@ public partial class DeskflowView : UserControl, IRefreshable
         FilterBox.IsChecked = s.UseTouchFilter;
         MonitorBox.IsChecked = s.KeyboardReleaseMonitor;
         TouchIsolationBox.IsChecked = s.TouchIsolation;
+        SmbFileBox.IsChecked = s.SmbFileClipboard;
         if (!_hostEdited) RemoteHostBox.Text = s.RemoteHost;
         _loadingOptions = false;
+    }
+
+    private void RefreshFileClipboard(DeskflowSettings s)
+    {
+        var peer = Df.PeerHub?.Screen ?? (string.IsNullOrWhiteSpace(s.RemoteHost) ? "对端" : s.RemoteHost);
+        FileModeText.Text = !OperatingSystem.IsWindows() ? "Linux 上沿用旁路文件传输。"
+            : _window.Hub.FileClipboard == null ? "文件快传没有运行（Hub 以无界面模式启动）。"
+            : Df.FileClipboardViaSmb ? $"当前：SMB 直连（与 {peer} 之间复制的文件不再先传到下载文件夹）。"
+            : !s.SmbFileClipboard ? "当前：旁路传输（已关闭 SMB 直连）。"
+            : Df.PeerHub == null ? $"当前：旁路传输（{peer} 的 Hub 暂时连不上）。"
+            : $"当前：旁路传输（{peer} 的 Hub 是 {Df.PeerHub.Os} v{Df.PeerHub.Version}，不支持 SMB 直连）。";
+        var account = string.IsNullOrWhiteSpace(s.PeerShareUser) ? "访问对端共享用 Windows 已保存的凭据" : $"访问对端共享的账户：{s.PeerShareUser}";
+        FileStatusText.Text = (OperatingSystem.IsWindows() && _window.Hub.FileClipboard is { } bridge ? bridge.LastStatus + "\n" : string.Empty) + account;
+    }
+
+    private async void PeerShareAccount_Click(object? sender, RoutedEventArgs e)
+    {
+        var s = Df.Settings;
+        var peer = Df.PeerHub?.Screen ?? "对端";
+        var result = await Dialogs.Credentials(_window, $"访问 {peer} 的共享",
+            $"在这台电脑上粘贴 {peer} 复制的文件时，用这个 {peer} 的 Windows 账户打开它的共享（写成「电脑名\\用户名」，例如 QINGXIAN-WIN\\linzhenxiong）。" +
+            "密码用 Windows DPAPI 加密保存在本机，只在访问被拒绝时写入 Windows 凭据。留空并确定则清除。",
+            s.PeerShareUser);
+        if (result is not { } account) return;
+        Df.UpdateSettings(x =>
+        {
+            x.PeerShareUser = account.User;
+            x.PeerSharePassword = account.User.Length == 0 || account.Password.Length == 0 ? string.Empty : Dpapi.Protect(account.Password);
+        });
+        ActionText.Text = account.User.Length == 0 ? "已清除访问对端共享的账户" : $"已保存访问 {peer} 共享的账户 {account.User}";
+        RefreshFileClipboard(Df.Settings);
     }
 
     public void Refresh()
@@ -84,6 +116,7 @@ public partial class DeskflowView : UserControl, IRefreshable
         RestoreBtn.IsEnabled = s.LegacyTakenOver;
 
         BuildInfo(s, st);
+        RefreshFileClipboard(s);
 
         if ((DateTime.UtcNow - _lastLegacy) > TimeSpan.FromSeconds(30))
         {
@@ -264,6 +297,7 @@ public partial class DeskflowView : UserControl, IRefreshable
             s.UseTouchFilter = filter;
             s.KeyboardReleaseMonitor = MonitorBox.IsChecked == true;
             s.TouchIsolation = TouchIsolationBox.IsChecked == true;
+            s.SmbFileClipboard = SmbFileBox.IsChecked == true;
         });
         if (filterChanged && Df.Settings.Role == DeskflowRole.Server) Reapply_Click(sender, e);
     }

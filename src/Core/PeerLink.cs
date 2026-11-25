@@ -10,7 +10,8 @@ namespace MoonlightHub.Core;
 
 /// <summary>What the other computer's hub reports about itself.</summary>
 public sealed record PeerHubInfo(string Screen, string Os, string Version, DeskflowRole Role, DeskflowRole Running, List<string> Peers,
-    double DpiScale = 0, int DesktopWidth = 0, int DesktopHeight = 0, List<SharedMonitor>? Monitors = null, bool DisplayBusy = false)
+    double DpiScale = 0, int DesktopWidth = 0, int DesktopHeight = 0, List<SharedMonitor>? Monitors = null, bool DisplayBusy = false,
+    bool FileClipboard = false)
 {
     public string Text => $"{Screen} ({Os}, v{Version}) · {DeskflowManager.RoleName(Running)}" + (Peers.Count > 0 ? " · 已连接 " + string.Join(", ", Peers) : string.Empty);
 }
@@ -153,6 +154,21 @@ public sealed class PeerLink : IDisposable
                 await Reply(response, ok ? 200 : 400, new { ok, message }).ConfigureAwait(false);
                 return;
             }
+            if (request.HttpMethod == "POST" && path == "/api/hub/file-clipboard")
+            {
+                if (!OperatingSystem.IsWindows() || Hub.Current?.FileClipboard is not { } bridge)
+                {
+                    await Reply(response, 409, new { ok = false, message = "本机 Hub 没有运行文件快传" }).ConfigureAwait(false);
+                    return;
+                }
+                using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
+                var payload = JsonSerializer.Deserialize<FileClipboardPayload>(await reader.ReadToEndAsync().ConfigureAwait(false), Json)
+                              ?? throw new InvalidDataException("File list missing");
+                var source = request.RemoteEndPoint?.Address is { } a ? (a.IsIPv4MappedToIPv6 ? a.MapToIPv4() : a) : IPAddress.None;
+                var (ok, message) = await bridge.ApplyRemoteAsync(source, payload).ConfigureAwait(false);
+                await Reply(response, ok ? 200 : 409, new { ok, message }).ConfigureAwait(false);
+                return;
+            }
             if (request.HttpMethod == "POST" && path == "/api/hub/role")
             {
                 using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
@@ -202,6 +218,8 @@ public sealed class PeerLink : IDisposable
             desktopWidth = PointerSpeedManager.DesktopSize().Width,
             desktopHeight = PointerSpeedManager.DesktopSize().Height,
             monitors = OperatingSystem.IsWindows() && Hub.Current is { } hub ? SharedDisplayLayout.LocalMonitors(hub) : null,
+            // this hub takes copied files as SMB paths (POST /api/hub/file-clipboard)
+            fileClipboard = OperatingSystem.IsWindows() && Hub.Current?.FileClipboard != null && _deskflow.Settings.SmbFileClipboard,
         };
     }
 
@@ -242,6 +260,26 @@ public sealed class PeerLink : IDisposable
         using var response = await Http.SendAsync(Request(HttpMethod.Get, host, "/api/hub/status"), cts.Token).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"对端 Hub 返回 {(int)response.StatusCode}");
         return ParseInfo(JsonNode.Parse(await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false)) as JsonObject);
+    }
+
+    /// <summary>Hands the files copied here to the other hub, which puts their SMB paths on its clipboard.</summary>
+    /// <param name="host">对端 Hub 地址</param>
+    /// <param name="payload">复制的文件及其所在的本机共享</param>
+    public static async Task<(bool Ok, string Message)> SendFileClipboardAsync(string host, FileClipboardPayload payload)
+    {
+        try
+        {
+            // the other hub first checks that it can open our shares (up to 8 s per unreachable share)
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            using var response = await Http.SendAsync(Request(HttpMethod.Post, host, "/api/hub/file-clipboard", payload), cts.Token).ConfigureAwait(false);
+            var node = JsonNode.Parse(await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false)) as JsonObject;
+            var message = node?["message"]?.GetValue<string>() ?? node?["error"]?.GetValue<string>() ?? ((int)response.StatusCode).ToString();
+            return (response.IsSuccessStatusCode && node?["ok"]?.GetValue<bool>() == true, message);
+        }
+        catch (Exception ex)
+        {
+            return (false, $"{host}:{Port} 没有响应（{ex.GetBaseException().Message}）");
+        }
     }
 
     /// <summary>Asks the other hub to take a role; returns its answer (it only replies once its core is up).</summary>
@@ -327,7 +365,8 @@ public sealed class PeerLink : IDisposable
             o["dpiScale"] is JsonValue scale && scale.TryGetValue<double>(out var dpi) ? dpi : 0,
             o["desktopWidth"] is JsonValue dw && dw.TryGetValue<int>(out var w) ? w : 0,
             o["desktopHeight"] is JsonValue dh && dh.TryGetValue<int>(out var h) ? h : 0,
-            o["monitors"]?.Deserialize<List<SharedMonitor>>(Json), o["displayBusy"]?.GetValue<bool>() == true);
+            o["monitors"]?.Deserialize<List<SharedMonitor>>(Json), o["displayBusy"]?.GetValue<bool>() == true,
+            o["fileClipboard"]?.GetValue<bool>() == true);
     }
 
     public void Dispose()

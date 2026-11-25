@@ -44,6 +44,8 @@ public partial class App : Application
                 if (_hub.Settings.AutoPairingPrompt) ShowPairingWindow(req);
             });
 
+            if (OperatingSystem.IsWindows() && _hub.FileClipboard is { } files)
+                files.Notice += (message, warning) => Dispatcher.UIThread.Post(() => _tray?.Notify("文件快传", message, warning));
             _hub.Standby.Requested += prompt => Dispatcher.UIThread.Post(() => ShowStandbyPrompt(prompt));
             _hub.Standby.Resolved += (id, reason) => Dispatcher.UIThread.Post(() =>
             {

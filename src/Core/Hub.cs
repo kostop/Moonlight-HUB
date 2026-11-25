@@ -21,6 +21,8 @@ public sealed class Hub : IDisposable
     public StandbyPrompter Standby { get; }
     /// <summary>Switches the pointer speed per screen (Windows).</summary>
     public PointerSpeedManager PointerSpeed { get; }
+    /// <summary>Windows UI hub: copied files reach the other computer as SMB paths (null headless / on Linux).</summary>
+    public FileClipboardBridge? FileClipboard { get; }
 
     public event Action? Changed;
     /// <summary>A Moonlight client started pairing with an instance and Sunshine is waiting for the PIN.</summary>
@@ -51,6 +53,7 @@ public sealed class Hub : IDisposable
         Deskflow.Changed += () => Changed?.Invoke();
         if (!headless && OperatingSystem.IsWindows())
         {
+            FileClipboard = new FileClipboardBridge(Deskflow);
             // monitors and their scale may have changed: the per-screen pointer speeds are recomputed
             try { Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged; }
             catch (Exception ex) { Log.Warn("注册显示变化事件失败: " + ex.Message); }
@@ -164,6 +167,7 @@ public sealed class Hub : IDisposable
         if (!Headless) Pairing.Start();
         if (!Headless) Deskflow.Start();
         if (!Headless) PointerSpeed.Start();
+        if (OperatingSystem.IsWindows()) FileClipboard?.Start();
         Changed?.Invoke();
     }
 
@@ -245,6 +249,7 @@ public sealed class Hub : IDisposable
         {
             try { Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged; } catch { }
         }
+        if (OperatingSystem.IsWindows()) FileClipboard?.Dispose();
         Standby.Dispose();
         PointerSpeed.Dispose();
         Deskflow.Dispose();

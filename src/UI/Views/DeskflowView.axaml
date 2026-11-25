@@ -92,6 +92,20 @@
                 </StackPanel>
             </Border>
 
+            <Border x:Name="FileCard" Classes="card">
+                <StackPanel>
+                    <TextBlock Text="文件快传" Classes="h2" Margin="0,0,0,10" />
+                    <CheckBox x:Name="SmbFileBox" Click="Option_Click">
+                        <TextBlock TextWrapping="Wrap" Text="复制文件时直接通过 SMB 共享粘贴：对端剪贴板里放的是本机共享路径，在对端粘贴时由资源管理器直接从本机拷贝（两台都是 Windows 时生效；对端是 Ubuntu 时仍先传到下载文件夹）" />
+                    </CheckBox>
+                    <TextBlock x:Name="FileModeText" Classes="muted" TextWrapping="Wrap" Text="—" Margin="0,6,0,0" />
+                    <TextBlock x:Name="FileStatusText" Classes="muted" TextWrapping="Wrap" Text="—" Margin="0,4,0,8" />
+                    <WrapPanel>
+                        <Button Content="访问对端共享的账户…" Click="PeerShareAccount_Click" Classes="ghost" Margin="0,0,8,0" />
+                    </WrapPanel>
+                </StackPanel>
+            </Border>
+
             <Border Classes="card">
                 <StackPanel>
                     <DockPanel Margin="0,0,0,10">

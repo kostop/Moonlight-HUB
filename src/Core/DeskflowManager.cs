@@ -62,6 +62,15 @@ public sealed class DeskflowSettings
     public bool LegacyTakenOver { get; set; }
     /// <summary>Windows: side-channel programs formerly started by scheduled tasks, now run by the hub.</summary>
     public List<SidecarSpec> Sidecars { get; set; } = new();
+    /// <summary>
+    /// Windows ↔ Windows: copied files reach the other computer's clipboard as SMB paths and are copied from here when pasted
+    /// (hub file clipboard bridge), instead of the side-channel file agent pushing them into a download folder first.
+    /// </summary>
+    public bool SmbFileClipboard { get; set; } = true;
+    /// <summary>Windows account on the other computer used to open its shares (e.g. QINGXIAN-WIN\linzhenxiong); empty = whatever Windows has saved.</summary>
+    public string PeerShareUser { get; set; } = string.Empty;
+    /// <summary>Password of <see cref="PeerShareUser"/>, DPAPI-protected ("dpapi:…").</summary>
+    public string PeerSharePassword { get; set; } = string.Empty;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -192,6 +201,8 @@ public sealed class DeskflowManager : IDisposable
     /// <summary>Last answer of the other computer's hub (null when unknown or unreachable).</summary>
     public PeerHubInfo? PeerHub { get; private set; }
     public string PeerHubError { get; private set; } = string.Empty;
+    /// <summary>Copied files go to the peer as SMB paths (both hubs are Windows and support it); false = the side-channel file agent pushes them.</summary>
+    public bool FileClipboardViaSmb { get; private set; }
     public string LastAction { get; private set; } = string.Empty;
     public bool IsSwitching => _switchLock.CurrentCount == 0;
     public IDeskflowHost Host => _host;
@@ -611,6 +622,7 @@ public sealed class DeskflowManager : IDisposable
             if (OperatingSystem.IsWindows() && (DateTime.UtcNow - _lastSharedDisplayUtc).TotalSeconds > 3) _ = RefreshSharedDisplaysAsync();
             if ((DateTime.UtcNow - _lastLayoutFetchUtc) > TimeSpan.FromSeconds(15)) _ = RefreshLayoutAsync();
             if ((DateTime.UtcNow - _lastPeerStatusUtc) > TimeSpan.FromSeconds(1)) _ = RefreshPeerHubAsync();
+            UpdateFileClipboardMode(s);
             if (!s.Managed || IsSwitching || !st.Installed) return;
 
             if (!s.LegacyTakenOver && !_takeOverAttempted)
@@ -658,6 +670,24 @@ public sealed class DeskflowManager : IDisposable
         if (st.ConfiguredRole != s.Role) return false;
         if (!st.SecurityOff) return false; // rewritten (and the core restarted) by the repair below
         return s.Role != DeskflowRole.Client || string.Equals(st.RemoteHost, s.RemoteHost, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Copied files travel as SMB paths only while the other hub is Windows and runs the file clipboard bridge (qingxian also
+    /// boots Ubuntu, and an older hub has no endpoint for it); otherwise the side-channel file agent keeps pushing them.
+    /// The side-channel clipboard agent loses its --file-recipient while SMB is used, so a copy is never sent twice.
+    /// </summary>
+    /// <param name="s">本机 Deskflow 设置（开关、是否联动）</param>
+    private void UpdateFileClipboardMode(DeskflowSettings s)
+    {
+        bool smb;
+        if (!OperatingSystem.IsWindows() || !s.SmbFileClipboard || !s.LinkPeer || Hub.Current?.FileClipboard == null) smb = false;
+        else if (PeerHub is { } peer) smb = peer.Os == "Windows" && peer.FileClipboard;
+        else return; // other hub not reachable right now: keep the last mode
+        if (_host is DeskflowWindowsHost win) win.FileClipboardViaSmb = smb;
+        if (smb == FileClipboardViaSmb) return;
+        FileClipboardViaSmb = smb;
+        Log.Info(smb ? "文件快传: 对端 Hub 支持 SMB 直连，复制的文件改为直接放共享路径" : "文件快传: 使用旁路文件传输（先传到对端下载文件夹）");
     }
 
     /// <summary>

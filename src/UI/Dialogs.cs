@@ -79,4 +79,57 @@ internal static class Dialogs
         }
         return result;
     }
+
+    /// <summary>Asks for a user name and password; null when cancelled. An empty user name means "clear".</summary>
+    /// <param name="owner">父窗口</param>
+    /// <param name="title">标题</param>
+    /// <param name="message">说明文字</param>
+    /// <param name="user">预填的用户名</param>
+    public static async Task<(string User, string Password)?> Credentials(Window? owner, string title, string message, string? user)
+    {
+        (string, string)? result = null;
+        var userBox = new TextBox { Text = user ?? string.Empty, Watermark = "电脑名\\用户名", Margin = new Thickness(0, 12, 0, 0) };
+        var passBox = new TextBox { PasswordChar = '•', Watermark = "密码", Margin = new Thickness(0, 8, 0, 0) };
+        var window = new Window
+        {
+            Title = title,
+            Width = 480,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            ShowInTaskbar = owner == null || !owner.IsVisible,
+            WindowStartupLocation = owner is { IsVisible: true } ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen,
+        };
+        if (owner?.Icon != null) window.Icon = owner.Icon;
+        var ok = new Button { Content = "确定", MinWidth = 76, IsDefault = true };
+        ok.Classes.Add("primary");
+        ok.Click += (_, _) => { result = ((userBox.Text ?? string.Empty).Trim(), passBox.Text ?? string.Empty); window.Close(); };
+        var cancel = new Button { Content = "取消", MinWidth = 76, IsCancel = true, Margin = new Thickness(0, 0, 8, 0) };
+        cancel.Classes.Add("ghost");
+        cancel.Click += (_, _) => window.Close();
+        window.Content = new Border
+        {
+            Padding = new Thickness(22, 18),
+            Child = new StackPanel
+            {
+                Children =
+                {
+                    new TextBlock { Text = title, FontSize = 15, FontWeight = FontWeight.SemiBold, Foreground = Ui.Res("TextBrush") },
+                    new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 0), LineHeight = 20 },
+                    userBox,
+                    passBox,
+                    new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0), Children = { cancel, ok } },
+                }
+            }
+        };
+        if (owner is { IsVisible: true }) await window.ShowDialog(owner);
+        else
+        {
+            var closed = new TaskCompletionSource();
+            window.Closed += (_, _) => closed.TrySetResult();
+            window.Show();
+            window.Activate();
+            await closed.Task;
+        }
+        return result;
+    }
 }

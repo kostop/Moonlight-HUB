@@ -370,9 +370,27 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
     }
 
     /// <summary>Running processes per side-channel spec name.</summary>
-    public Dictionary<string, int> RunningSidecars(IEnumerable<SidecarSpec> specs)
+    public Dictionary<string, int> RunningSidecars(IEnumerable<SidecarSpec> specs) =>
+        RunningSidecarProcesses(specs).ToDictionary(kv => kv.Key, kv => kv.Value.Pid);
+
+    /// <summary>
+    /// Set by the manager once the other hub is known: true = copied files go as SMB paths (hub bridge), so the clipboard agent
+    /// runs without --file-recipient and ignores file clipboards; null = not known yet, leave running agents alone.
+    /// </summary>
+    public bool? FileClipboardViaSmb { get; set; }
+
+    private static readonly Regex FileRecipientArg = new(@"\s--file-recipient\s+(""[^""]*""|\S+)", RegexOptions.Compiled);
+
+    /// <summary>Arguments a side-channel process is started with in the current file clipboard mode.</summary>
+    /// <param name="spec">旁路进程的配置</param>
+    private string EffectiveArguments(SidecarSpec spec) =>
+        FileClipboardViaSmb == true ? FileRecipientArg.Replace(spec.Arguments, string.Empty) : spec.Arguments;
+
+    /// <summary>Running processes and their command lines per side-channel spec name.</summary>
+    /// <param name="specs">要查找的旁路进程配置</param>
+    private Dictionary<string, (int Pid, string Cmd)> RunningSidecarProcesses(IEnumerable<SidecarSpec> specs)
     {
-        var result = new Dictionary<string, int>();
+        var result = new Dictionary<string, (int Pid, string Cmd)>();
         var candidates = new List<(int Pid, string Cmd)>();
         foreach (var p in Process.GetProcesses())
         {
@@ -388,7 +406,7 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
         foreach (var spec in specs)
         {
             var hit = candidates.FirstOrDefault(c => Matches(spec, c.Cmd));
-            if (hit.Pid != 0) result[spec.Name] = hit.Pid;
+            if (hit.Pid != 0) result[spec.Name] = hit;
         }
         return result;
     }
@@ -412,15 +430,23 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
         // enumerating every process to find the scripts is the most expensive part of the tick: every 15 s is enough
         if ((DateTime.UtcNow - _lastSidecarScanUtc) < TimeSpan.FromSeconds(15)) return;
         _lastSidecarScanUtc = DateTime.UtcNow;
-        var running = RunningSidecars(specs);
+        var running = RunningSidecarProcesses(specs);
         // what the "Deskflow Low Latency Keepalive" task did: an agent that is up but no longer connected / looping gets restarted
         var checkHealth = (DateTime.UtcNow - _lastSidecarHealthUtc) >= TimeSpan.FromSeconds(14);
         if (checkHealth) _lastSidecarHealthUtc = DateTime.UtcNow;
         foreach (var spec in specs)
         {
-            if (running.TryGetValue(spec.Name, out var pid))
+            if (running.TryGetValue(spec.Name, out var process))
             {
+                var pid = process.Pid;
                 _sidecarPids[spec.Name] = pid;
+                // the clipboard agent hands copied files to the file agent only while SMB paths are not used
+                if (FileClipboardViaSmb is { } smb && FileRecipientArg.IsMatch(spec.Arguments) && FileRecipientArg.IsMatch(" " + process.Cmd) == smb)
+                {
+                    Log.Info($"Deskflow 旁路: {spec.Name} {(smb ? "去掉" : "恢复")} --file-recipient（文件快传{(smb ? "改走 SMB 共享路径" : "回到旁路传输")}），重启");
+                    RestartSidecar(spec);
+                    continue;
+                }
                 var (port, fileAgent) = ControlPort(spec);
                 if (checkHealth && port > 0)
                 {
@@ -435,7 +461,7 @@ internal sealed class DeskflowWindowsHost : IDeskflowHost
             }
             if (_sidecarStarts.TryGetValue(spec.Name, out var last) && (DateTime.UtcNow - last) < TimeSpan.FromSeconds(30)) continue;
             _sidecarStarts[spec.Name] = DateTime.UtcNow;
-            var started = ProcessUtil.StartAsShellUserPid(spec.Exe, spec.Arguments, hidden: true);
+            var started = ProcessUtil.StartAsShellUserPid(spec.Exe, EffectiveArguments(spec), hidden: true);
             _sidecarPids[spec.Name] = started;
             Log.Info($"Deskflow 旁路: {(started > 0 ? "已启动" : "启动失败")} {spec.Name}{(started > 0 ? $" (pid {started})" : string.Empty)}");
         }
